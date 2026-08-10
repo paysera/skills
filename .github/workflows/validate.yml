@@ -1,0 +1,23 @@
+name: validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Validate marketplace and plugin manifests
+        run: python3 scripts/validate.py
+      - name: Run skill script tests
+        run: |
+          pip install pytest
+          if [ -d plugins ]; then
+            pytest plugins -q || [ $? -eq 5 ]   # 5 = no tests collected yet
+          fi

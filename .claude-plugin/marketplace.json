@@ -1,0 +1,13 @@
+{
+  "name": "paysera-skills",
+  "owner": {
+    "name": "Paysera",
+    "url": "https://www.paysera.com"
+  },
+  "metadata": {
+    "description": "Official Paysera AI agent skills — install them into Claude Code and other Agent Skills compatible assistants.",
+    "version": "1.0.0",
+    "pluginRoot": "./plugins"
+  },
+  "plugins": []
+}
