@@ -9,9 +9,14 @@ Only client-facing skills. A skill qualifies when all of the following hold:
 
 - It uses **publicly documented Paysera APIs** (`api.paysera.com`, `auth-api.paysera.com`)
   that a client can call with their own credentials.
-- It contains **no internal hostnames** (`*.paysera.net`, internal GitLab/Jira/Confluence
-  links), no internal database or service names, and no references to internal-only tooling
-  or skills.
+- It references **only publicly reachable Paysera hosts**. Any Paysera hostname that a
+  client outside the company network cannot resolve does not belong here, and neither do
+  links to internal source control, issue trackers, or wikis. `scripts/validate.py`
+  enforces this with an allowlist of public hosts.
+- It contains **no internal database, service, or infrastructure names**, and no references
+  to internal-only tooling or skills.
+- It contains **no internal issue-tracker keys or ticket references**, in files, commit
+  messages, or pull request descriptions.
 - It contains **no credentials, tokens, real account numbers, real IBANs, or personal data**
   — examples must use obvious placeholders (`EVP0000000000001`, `LT000000000000000000`).
 - Any operation that moves money is **gated**: dry-run by default, explicit `--confirm`, and

@@ -8,7 +8,22 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 FRONTMATTER = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
-FORBIDDEN = re.compile(r"gitlab\.paysera\.net|jira\.paysera\.net|intranet|\.paysera\.net")
+
+# Published skills may only reference Paysera hosts a client can actually reach.
+# This is an allowlist on purpose: naming the hosts that are *not* public would
+# put them in this repository, which is exactly what the check exists to prevent.
+HOSTNAME = re.compile(r"\b(?:[a-z0-9-]+\.)+[a-z]{2,}\b", re.IGNORECASE)
+PAYSERA_HOST = re.compile(r"(?:^|\.)paysera\.[a-z]{2,}$", re.IGNORECASE)
+PUBLIC_PAYSERA_HOSTS = frozenset(
+    {
+        "paysera.com",
+        "www.paysera.com",
+        "bank.paysera.com",
+        "api.paysera.com",
+        "auth-api.paysera.com",
+        "developers.paysera.com",
+    }
+)
 
 
 def read_frontmatter(skill_file: Path) -> dict:
@@ -66,8 +81,14 @@ def validate() -> list:
     for path in sorted(plugins_root.rglob("*")) if plugins_root.is_dir() else []:
         if path.is_file() and path.suffix in {".md", ".py", ".json"}:
             for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-                if FORBIDDEN.search(line):
-                    errors.append(f"{path.relative_to(ROOT)}:{number}: internal reference in public content")
+                for host in HOSTNAME.findall(line):
+                    host = host.lower()
+                    if PAYSERA_HOST.search(host) and host not in PUBLIC_PAYSERA_HOSTS:
+                        errors.append(
+                            f"{path.relative_to(ROOT)}:{number}: '{host}' is not a public "
+                            f"Paysera host — published skills may only reference "
+                            f"{', '.join(sorted(PUBLIC_PAYSERA_HOSTS))}"
+                        )
 
     return errors
 
