@@ -61,16 +61,68 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import unicodedata
 import time
 from decimal import Decimal, InvalidOperation
+
+
+class _VilniusFallback(datetime.tzinfo):
+    """Europe/Vilnius for hosts without tzdata (Python < 3.9, or a slim container).
+
+    Vilnius is EET (UTC+2) in winter and EEST (UTC+3) in summer, switching on the EU
+    rule: DST starts the last Sunday of March at 01:00 UTC and ends the last Sunday of
+    October at 01:00 UTC. Hard-coding that is correct for as long as the EU keeps the
+    rule; falling back to plain UTC is wrong by 2-3 hours all year, which silently moves
+    a transfer's operation_date to the next day (see _end_of_today_epoch).
+    """
+
+    _STD = datetime.timedelta(hours=2)
+    _DST = datetime.timedelta(hours=3)
+
+    @staticmethod
+    def _last_sunday(year, month):
+        d = datetime.date(year, month, 31)
+        return d - datetime.timedelta(days=(d.weekday() + 1) % 7)
+
+    def _is_dst(self, dt):
+        if dt is None:
+            return False
+        # Transition instants expressed in LOCAL time: 01:00 UTC is 03:00 EET going in,
+        # and 04:00 EEST coming out.
+        start = datetime.datetime.combine(self._last_sunday(dt.year, 3), datetime.time(3))
+        end = datetime.datetime.combine(self._last_sunday(dt.year, 10), datetime.time(4))
+        return start <= dt.replace(tzinfo=None) < end
+
+    def utcoffset(self, dt):
+        return self._DST if self._is_dst(dt) else self._STD
+
+    def dst(self, dt):
+        return datetime.timedelta(hours=1) if self._is_dst(dt) else datetime.timedelta(0)
+
+    def tzname(self, dt):
+        return "EEST" if self._is_dst(dt) else "EET"
+
 
 try:
     from zoneinfo import ZoneInfo
 
     _VILNIUS = ZoneInfo("Europe/Vilnius")
-except Exception:  # no tzdata — degrade gracefully (see _end_of_today_epoch)
-    _VILNIUS = None
+    _VILNIUS_IS_FALLBACK = False
+except Exception:  # no zoneinfo/tzdata — use the hard-coded EU rule, never bare UTC
+    _VILNIUS = _VilniusFallback()
+    _VILNIUS_IS_FALLBACK = True
+
+
+def _warn_tz_once():
+    """Tell the operator when the timezone is being approximated rather than read from
+    tzdata — the schedule printout depends on it."""
+    if _VILNIUS_IS_FALLBACK:
+        print(
+            "NOTE: no tzdata on this host — using a built-in Europe/Vilnius rule "
+            "(EET/EEST). Install tzdata (or Python 3.9+) for authoritative times.",
+            file=sys.stderr,
+        )
 
 # Accounts the PAT is scoped to. The token will reject any other payer account.
 # ── CONFIGURE THIS ─ replace the placeholders with the EVP account_number(s) your
@@ -184,41 +236,100 @@ def beneficiary_country(iban: str, bic: str | None) -> str | None:
 
 
 def _clip_purpose(text: str, limit: int = PURPOSE_MAX) -> str:
+    """Trim the purpose to the SEPA limit on a word boundary.
+
+    Clipping is LOUD on purpose: the payee usually reconciles on an exact string, and the
+    invoice reference is typically at the END of the purpose — precisely what a silent
+    trim would drop. See SKILL.md "Payment purpose".
+    """
     text = (text or "").strip()
     if len(text) <= limit:
         return text
     cut = text[:limit]
     sp = cut.rfind(" ")
-    return (cut[:sp] if sp > limit * 0.6 else cut).rstrip()
+    kept = (cut[:sp] if sp > limit * 0.6 else cut).rstrip()
+    print(
+        f"WARNING: purpose is {len(text)} chars, over the {limit}-char SEPA limit — "
+        f"trimmed to {len(kept)}.\n"
+        f"         DROPPED: {text[len(kept):].strip()!r}\n"
+        f"         If the invoice reference was in the dropped tail, the payee may not "
+        f"match this payment. Shorten --purpose yourself so the reference survives.",
+        file=sys.stderr,
+    )
+    return kept
+
+
+HTTP_TIMEOUT = 30  # seconds per request — an unanswered API must not hang a cron run
+
+
+class HttpError(RuntimeError):
+    """A transport-level failure (curl missing, timed out, or non-zero exit) — as
+    opposed to an HTTP error status, which comes back as a code."""
+
+
+def _validate_token(token):
+    """The token is passed to curl through a config file, where it is delimited by
+    double quotes. Refuse anything that could break out of that quoting."""
+    if not token:
+        sys.exit("ERROR: empty PAT.")
+    if any(c in token for c in '"\\\r\n'):
+        sys.exit("ERROR: PAT contains a quote, backslash or newline — refusing to use it.")
+    return token
 
 
 def read_token(path):
     tok = os.environ.get("PAYSERA_PAT")
     if tok:
-        return tok.strip()
+        return _validate_token(tok.strip())
     try:
         with open(path) as f:
-            return f.read().strip()
+            return _validate_token(f.read().strip())
     except OSError as e:
         sys.exit(f"ERROR: cannot read PAT ({e}). Set PAYSERA_PAT or pass --token-file.")
 
 
-def http_json(method, url, token):
-    out = subprocess.run(
-        [
-            "curl",
-            "-s",
-            "-X",
-            method,
-            url,
-            "-H",
-            f"Authorization: Bearer {token}",
-            "-w",
-            "\nHTTP:%{http_code}",
-        ],
-        capture_output=True,
-        text=True,
-    )
+def _curl(method, url, token, payload=None, timeout=HTTP_TIMEOUT):
+    """Run one curl request and return (http_code, parsed_body).
+
+    The Authorization header is fed to curl on STDIN as a config file (`-K -`), never as
+    a command-line argument: argv is world-readable on Linux via `ps auxww` and
+    /proc/<pid>/cmdline, so a token in argv is exposed to every local user for the
+    lifetime of the call. A JSON body goes through a 0600 temp file for the same reason
+    stdin is already taken.
+
+    Raises HttpError on a transport failure so the caller can report it rather than
+    mistaking it for an empty API response.
+    """
+    cmd = ["curl", "-sS", "-X", method, url, "-K", "-", "-w", "\nHTTP:%{http_code}"]
+    tmp = None
+    try:
+        if payload is not None:
+            fd, tmp = tempfile.mkstemp(prefix="paysera-payload-", suffix=".json")
+            with os.fdopen(fd, "w") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            cmd += ["-H", "Content-Type: application/json", "--data-binary", "@" + tmp]
+        try:
+            out = subprocess.run(
+                cmd,
+                input=f'header = "Authorization: Bearer {token}"\n',
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except FileNotFoundError:
+            raise HttpError("curl is not installed or not on PATH")
+        except subprocess.TimeoutExpired:
+            raise HttpError(f"no response within {timeout}s")
+        if out.returncode != 0:
+            raise HttpError(
+                f"curl exited {out.returncode}: {(out.stderr or '').strip()[:200] or 'no stderr'}"
+            )
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
     txt = out.stdout
     code = txt.split("\nHTTP:")[-1].strip()
     body = txt.split("\nHTTP:")[0]
@@ -226,6 +337,16 @@ def http_json(method, url, token):
         return code, json.loads(body)
     except json.JSONDecodeError:
         return code, body
+
+
+def http_json(method, url, token, payload=None):
+    """_curl, with transport failures reported and reduced to the code "ERR" so callers
+    can treat them as "did not get an answer" rather than "the API said no"."""
+    try:
+        return _curl(method, url, token, payload)
+    except HttpError as e:
+        print(f"WARNING: {method} {url.split('?')[0]} failed — {e}", file=sys.stderr)
+        return "ERR", {"error": str(e)}
 
 
 def load_ledger():
@@ -239,15 +360,15 @@ def load_ledger():
 def append_ledger(entry):
     data = load_ledger()
     data.append(entry)
-    os.makedirs(os.path.dirname(LEDGER_FILE), exist_ok=True)
+    # The ledger holds IBANs, amounts and invoice numbers. Create the directory 0700 and
+    # set 0600 on the TEMP file before it is renamed into place — setting the mode after
+    # os.replace() leaves a window where the finished file is world-readable.
+    os.makedirs(os.path.dirname(LEDGER_FILE), mode=0o700, exist_ok=True)
     tmp = LEDGER_FILE + ".tmp"
-    with open(tmp, "w") as f:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     os.replace(tmp, LEDGER_FILE)
-    try:
-        os.chmod(LEDGER_FILE, 0o600)
-    except OSError:
-        pass
 
 
 def _transfer_items(doc):
@@ -304,6 +425,14 @@ def list_transfers(token, payer_account, created_from, max_pages=50):
     for page in range(max_pages):
         code, doc = http_json("GET", f"{base}&offset={page * page_size}", token)
         if code != "200":
+            # Say so: an incomplete live list silently weakens the duplicate check, and
+            # the caller falls back to the ledger (which cannot see app-made payments).
+            print(
+                f"WARNING: live duplicate check INCOMPLETE (page {page + 1} returned "
+                f"{code}) — falling back to the ledger only. A duplicate made in the "
+                f"Paysera app may not be detected. Re-run, or verify manually.",
+                file=sys.stderr,
+            )
             break
         page_items = _transfer_items(doc)
         if not page_items:
@@ -351,6 +480,8 @@ def select_beneficiary_iban(primary, also):
         if n and n not in seen:
             seen.add(n)
             ordered.append(ib)
+    if not ordered:
+        sys.exit("ERROR: no beneficiary IBAN given — --iban must be a real IBAN, not empty.")
     paysera = [ib for ib in ordered if is_paysera_iban(ib)]
     if paysera:
         chosen, reason = (
@@ -429,8 +560,10 @@ def find_blocking(invoice_id, token, payer=None, ibans=None, amount=None, invoic
                 if isinstance(t.get("amount"), dict)
                 else None
             )
+            # `or ""` not a .get default: the key can be present with a null value, and
+            # the default only applies when the key is absent.
             purpose = (
-                (t.get("purpose") or {}).get("details", "")
+                ((t.get("purpose") or {}).get("details") or "")
                 if isinstance(t.get("purpose"), dict)
                 else ""
             )
@@ -459,20 +592,23 @@ def find_blocking(invoice_id, token, payer=None, ibans=None, amount=None, invoic
 def _vilnius_today():
     """Today's date in Europe/Vilnius (the timezone Paysera uses for operation_date /
     the day boundary that decides mobile visibility)."""
-    tz = _VILNIUS or datetime.timezone.utc
-    return datetime.datetime.now(tz).date()
+    return datetime.datetime.now(_VILNIUS).date()
 
 
 def _end_of_today_epoch():
-    """Latest SAME-DAY signing deadline: today 23:00 Europe/Vilnius. Still 'today' for
-    operation_date (so the transfer stays mobile-visible) while giving the longest intraday
-    window. Falls back to a short window if it's already late or tzdata is unavailable."""
+    """Latest SAME-DAY signing deadline: today 23:00 Europe/Vilnius, or None if that has
+    effectively passed.
+
+    Keeping the deadline inside today is the whole point — operation_date must stay on
+    today's Vilnius date for the transfer to appear in the mobile app. Late in the
+    evening there is no same-day window left to give, so this returns None and the caller
+    falls back to ASAP (which also has operation_date = today) rather than handing back a
+    timestamp that has silently rolled into tomorrow.
+    """
     now = int(time.time())
-    if _VILNIUS is None:  # no tzdata: a safe ~4-hour same-day window
-        return now + 4 * 3600
     end = datetime.datetime.now(_VILNIUS).replace(hour=23, minute=0, second=0, microsecond=0)
     epoch = int(end.timestamp())
-    return epoch if epoch > now + 600 else now + 1800  # already past 23:00 -> 30-min window
+    return epoch if epoch > now + 600 else None
 
 
 def parse_perform_at(spec):
@@ -501,15 +637,16 @@ def parse_perform_at(spec):
         if d < today:
             sys.exit(f"ERROR: --perform-at {d} is in the past. Pick today or a future date.")
         # Today's date -> latest same-day deadline; a future day -> noon UTC inside it.
-        epoch = (
-            _end_of_today_epoch()
-            if d == today
-            else int(
-                datetime.datetime(
-                    d.year, d.month, d.day, 12, tzinfo=datetime.timezone.utc
-                ).timestamp()
-            )
-        )
+        if d == today:
+            epoch = _end_of_today_epoch()
+            if epoch is None:
+                sys.exit(
+                    f"ERROR: --perform-at {d} is today, but it is past 23:00 in Vilnius — "
+                    f"there is no same-day signing window left. Use --advance to sign right "
+                    f"now, or pick tomorrow."
+                )
+        else:
+            epoch = _noon_epoch(d)
     if epoch <= now + 60:
         sys.exit(
             "ERROR: --perform-at resolves to a past/near-instant time. perform_at is the signing "
@@ -552,6 +689,16 @@ def resolve_payer(args):
             f"NOTE: payer resolved via buyer NAME {args.buyer_name!r} → {resolved} "
             f"({ALLOWED_ACCOUNTS.get(resolved)}); buyer code "
             f"{('unmapped: ' + code) if code else 'absent'}.",
+            file=sys.stderr,
+        )
+    # Audit trail: an unmapped code means the wrong-account guard did NOT run, so the
+    # payer is whatever --payer said. Say so rather than proceeding silently.
+    if code and not code_resolved and args.payer:
+        print(
+            f"NOTE: buyer code {code} is not in BUYER_CODE_TO_ACCOUNT — the wrong-account "
+            f"guard could not verify it. Using --payer {args.payer} "
+            f"({ALLOWED_ACCOUNTS.get(args.payer, '?')}) unchecked. Add the verified code "
+            f"to the map to enable the guard.",
             file=sys.stderr,
         )
     if not resolved and not args.payer:
@@ -601,6 +748,13 @@ def _noon_epoch(d):
     )
 
 
+_NO_WINDOW_LEFT = (
+    "NOTE: past 23:00 in Vilnius — no same-day signing window left, so this is being sent "
+    "ASAP instead (operation_date is still today, so it stays visible in the mobile app). "
+    "The deadline is immediate: sign it now, or re-run tomorrow."
+)
+
+
 def compute_schedule(args):
     """Resolve perform_at + a display `mode` from the chosen options.
 
@@ -620,13 +774,19 @@ def compute_schedule(args):
     Priority: --perform-at > --advance > --today > --due-date > context-aware default.
     Returns (perform_at_epoch_or_None, mode). None => omit perform_at (ASAP).
     """
-    today = datetime.datetime.now(datetime.timezone.utc).date()
+    # Vilnius, not UTC: parse_perform_at judges "is this date past?" the same way, and
+    # between 21:00 and 24:00 UTC the two calendars disagree.
+    today = _vilnius_today()
     if args.perform_at:
         return parse_perform_at(args.perform_at), "scheduled"
     if args.advance:
         return None, "asap"
     if args.today:
-        return _end_of_today_epoch(), "today"
+        epoch = _end_of_today_epoch()
+        if epoch is None:
+            print(_NO_WINDOW_LEFT, file=sys.stderr)
+            return None, "asap"
+        return epoch, "today"
     if args.due_date:
         try:
             due = datetime.datetime.strptime(args.due_date, "%Y-%m-%d").date()
@@ -640,7 +800,11 @@ def compute_schedule(args):
     # Context-aware default: invoice/bulk -> +30d web-bank window; ad-hoc/personal -> today.
     if args.invoice_id:
         return parse_perform_at(None), "scheduled"  # +30d
-    return _end_of_today_epoch(), "today"
+    epoch = _end_of_today_epoch()
+    if epoch is None:
+        print(_NO_WINDOW_LEFT, file=sys.stderr)
+        return None, "asap"
+    return epoch, "today"
 
 
 def main():
@@ -729,8 +893,11 @@ def main():
         action="append",
         default=[],
         help="Other beneficiary IBAN(s) the SAME invoice lists (e.g. a second bank). "
-        "Repeatable. Used ONLY by the duplicate check — a prior payment to ANY of these "
-        "means the invoice is already paid. Pass every account printed on the invoice.",
+        "Repeatable. These feed the duplicate check — a prior payment to ANY of them means "
+        "the invoice is already paid. NOTE: a Paysera IBAN (LTkk35000...) in this list "
+        "BECOMES THE PAYEE, even if it was passed here rather than as --iban (Paysera "
+        "transfers are instant and free) — the chosen IBAN is always printed. Pass every "
+        "account printed on the invoice, in invoice order.",
     )
     ap.add_argument("--amount", required=True, help="Decimal string, e.g. 12.34")
     ap.add_argument("--currency", default="EUR", help="ISO currency (default EUR)")
@@ -765,8 +932,12 @@ def main():
     ap.add_argument(
         "--perform-at",
         default=None,
-        help="Scheduled execution date (date-granular, UTC): YYYY-MM-DD | +Nd | +Nh | epoch. "
-        "Default +30d. MUST resolve to a future day — same-day/past times out unsigned.",
+        help="Signing deadline: YYYY-MM-DD | +Nd | +Nh | epoch seconds. SAME-DAY is allowed "
+        "and is the recommended choice when you will sign on your phone (it keeps "
+        "operation_date = today, so the transfer shows in the mobile app as well as the web "
+        "bank); a FUTURE day is web-bank-only until that day. Only a past or near-instant "
+        "time is rejected — use --advance for sign-on-the-spot ASAP. Default when omitted: "
+        "+30d WITH --invoice-id, today WITHOUT it.",
     )
     ap.add_argument(
         "--no-register",
@@ -780,13 +951,26 @@ def main():
     )
     args = ap.parse_args()
 
+    _warn_tz_once()
     payer = resolve_payer(args)
 
     try:
-        if Decimal(args.amount) <= 0:
+        amount_dec = Decimal(args.amount)
+        # Decimal accepts "Infinity", "NaN" and "1e999" — all of which are > 0 and would
+        # sail into the payload to be rejected late and obscurely by the API.
+        if not amount_dec.is_finite() or amount_dec <= 0:
             raise InvalidOperation
     except InvalidOperation:
-        sys.exit("ERROR: --amount must be a positive decimal string like 12.34")
+        sys.exit("ERROR: --amount must be a positive, finite decimal string like 12.34")
+    if -amount_dec.as_tuple().exponent > 2:
+        sys.exit(
+            f"ERROR: --amount {args.amount} has more than 2 decimal places. "
+            f"Round it to cents first."
+        )
+    # Decimal is arbitrary-precision, so "1e999" is finite and positive. Bound it: no
+    # legitimate transfer is this large, and the API's rejection is late and cryptic.
+    if amount_dec >= Decimal("1e12"):
+        sys.exit(f"ERROR: --amount {args.amount} is implausibly large. Check the value.")
 
     token = read_token(args.token_file)
 
@@ -935,7 +1119,7 @@ def main():
     print("Charge  :", payload["charge_type"], "(mobile app needs this set)")
     # Same-day if the perform_at timestamp lands on today's Vilnius date — drives whether the
     # transfer is mobile-visible (today) or web-bank-only (a future day).
-    tz = _VILNIUS or datetime.timezone.utc
+    tz = _VILNIUS
     same_day = (
         perform_at is not None
         and datetime.datetime.fromtimestamp(perform_at, tz).date() == _vilnius_today()
@@ -1038,32 +1222,7 @@ def main():
 
 
 def http_json_post(url, payload, token):
-    out = subprocess.run(
-        [
-            "curl",
-            "-s",
-            "-X",
-            "POST",
-            url,
-            "-H",
-            f"Authorization: Bearer {token}",
-            "-H",
-            "Content-Type: application/json",
-            "-d",
-            json.dumps(payload),
-            "-w",
-            "\nHTTP:%{http_code}",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    txt = out.stdout
-    code = txt.split("\nHTTP:")[-1].strip()
-    body = txt.split("\nHTTP:")[0]
-    try:
-        return code, json.loads(body)
-    except json.JSONDecodeError:
-        return code, body
+    return http_json("POST", url, token, payload=payload)
 
 
 if __name__ == "__main__":

@@ -24,9 +24,21 @@ Skip it with `--no-register`.
 Scopes on the token: `accounts:read`, `transfers:read`, `transfers:create`,
 `transfers:cancel` (each scoped to the accounts you configure below).
 
+## Requirements
+
+- **Python 3.8+** and **`curl`** on `PATH`. If curl is missing or a request times out
+  (30 s), the tool says so on stderr rather than treating it as an empty API response.
+- **`tzdata`** (Python 3.9+ ships `zoneinfo`; slim containers often omit the tz database).
+  Scheduling is done in Europe/Vilnius, because that day boundary decides whether a
+  transfer is signable in the mobile app. Without tzdata the tool falls back to a built-in
+  EET/EEST rule and prints a note — correct under current EU DST rules, but install tzdata
+  if you want the authoritative zone.
+
 ## Token
 
 - Stored at `~/.config/paysera-payments/token` (mode `0600`, local to your machine).
+- Never passed on a command line. The scripts hand it to curl through stdin, because
+  command arguments are readable by any local user (`ps auxww`, `/proc/<pid>/cmdline`).
 - `jti` for revocation is in `~/.config/paysera-payments/jti.txt`.
 - Created against the public Personal Access Token API, authenticated with a
   `bank.paysera.com` session bearer token (`$AUTH`):
@@ -251,7 +263,8 @@ Pass `--invoice-id <id>` (and optionally `--invoice-date YYYY-MM-DD`) when creat
 Before posting, the tool reads a local ledger (`~/.config/paysera-payments/ledger.json`),
 finds prior transfers it created for that invoice, checks each one's **live** status,
 and **refuses** (`exit 3`, `SKIP`) if any is still alive or already succeeded — i.e.
-anything except `failed`/`rejected`/`canceled`/`expired`. A previously failed/canceled
+anything outside `NONBLOCKING_STATES` in `create-payment.py` (currently `failed`,
+`rejected`, `canceled`/`cancelled`, `expired`, `declined`). A previously failed/canceled
 attempt does NOT block (you can retry). Override with `--force`.
 
 ```bash
@@ -271,10 +284,12 @@ prior payment to **any** of them means the invoice is already paid. It **prints 
 payment it finds to those IBANs in the period** (amount + purpose) for you to eyeball,
 and **blocks** (`exit 3`, `SKIP`) on any whose **amount matches OR whose purpose quotes
 the invoice id** — so a duplicate made **manually in the Paysera app, to either bank**,
-is caught. Blocking ignores terminal transfers (`failed`/`rejected`/`canceled`/`expired`
-— a prior failed attempt does NOT block; retry freely). Override with `--force`. The
-live-list check is best-effort (skipped silently if the list call fails); the ledger
-remains the guaranteed guard against e.g. an hourly cron firing twice.
+is caught. Blocking ignores terminal transfers (`NONBLOCKING_STATES`, above — a prior
+failed attempt does NOT block; retry freely). Override with `--force`. The live-list
+check is best-effort: if the list call fails the tool **prints a warning to stderr** and
+falls back to the ledger, which remains the guaranteed guard against e.g. an hourly cron
+firing twice. Take that warning seriously — with only the ledger, a duplicate made by
+hand in the Paysera app is invisible.
 
 > **Pass all the invoice's IBANs.** The check is only as complete as the IBANs you give
 > it. If the invoice lists two banks, `--also-iban` the second one — otherwise a prior
@@ -284,9 +299,11 @@ remains the guaranteed guard against e.g. an hourly cron firing twice.
 
 One operation removes a transfer: `DELETE /transfers/{hash}` (scope
 `transfers:cancel`). It **deletes a live draft** and **cancels a pending transfer** —
-same call; the effect depends on the transfer's state. Only `new`/`reserved`-style
-(live, unsigned) transfers are removable; terminal states (`failed`, `done`,
-`rejected`, already `canceled`) return `409 invalid_state` and are skipped.
+same call; the effect depends on the transfer's state. Only live, unsigned transfers are
+removable — the authoritative list is `CANCELABLE_STATES` in `cancel-payment.py`
+(currently `new`, `reserved`, `registered`, `waiting_funds`, `signing`). Terminal states
+(`failed`, `done`, `rejected`, already `canceled`) return `409 invalid_state` and are
+skipped.
 
 Dry-run by default; add `--confirm` to actually remove. Accepts multiple hashes.
 
