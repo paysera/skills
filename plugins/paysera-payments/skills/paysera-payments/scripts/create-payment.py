@@ -1,0 +1,1070 @@
+#!/usr/bin/env python3
+"""Create a (draft) Paysera transfer via the public Transfer API.
+
+Uses the account-scoped `paysera-payments` Personal Access Token. That token has
+`transfers:create` but NOT `transfers:sign`, so every transfer it creates is a
+DRAFT — it is created and registered for signing but NOT executed. Money moves only
+after the transfer is signed in the Paysera app (2FA). This tool therefore cannot, by
+design, send money on its own.
+
+After POSTing the transfer (which lands in the validation-only `new` state, invisible
+for signing) the tool calls PUT /transfers/{hash}/register so it becomes visible for
+MANUAL SIGNING in the Paysera app/UI (skip with --no-register). The register route
+fixed the old "invisible draft" problem.
+
+Safety: dry-run by default. It prints the exact payload and does nothing until you
+re-run with --confirm.
+
+Idempotency (avoid double-paying an invoice): pass --invoice-id. Before creating, the
+tool checks two sources and REFUSES if any live/succeeded match exists (anything except
+failed/rejected/canceled/expired; override with --force):
+  1. a local ledger (~/.config/paysera-payments/ledger.json) of transfers it created
+     for that invoice (live-status-checked); and
+  2. the payer account's ACTUAL transfers since the invoice date (GET /transfers list,
+     shipped 2026-06-18). An invoice can name MORE THAN ONE beneficiary account (e.g. a
+     Luminor AND a SEB IBAN); a prior payment to EITHER is still "this invoice paid". So
+     pass every account from the invoice via --iban + --also-iban (repeatable). The check
+     pulls EVERY transfer to ANY of those IBANs over [invoice_date .. today], prints them
+     for review, and BLOCKS on any whose amount matches OR whose purpose mentions the
+     invoice id — catching a duplicate made manually in the app, to either bank.
+
+Scheduling (signing window, mobile vs web): Paysera sets a per-transfer signing deadline
+`max_execution_time`. Three regimes, all re-measured live 2026-06-30:
+  * perform_at = LATER TODAY (--today, or --perform-at +Nh / today's date) -> the deadline
+    is that exact same-day timestamp, so you get an intraday window (e.g. until 23:00). The
+    transfer keeps operation_date = today, so it shows in BOTH the mobile app AND the web
+    bank. THIS is the right choice for "pay today and sign on my phone now". (Verified: a
+    same-day perform_at IS accepted and IS mobile-visible — the older "you can't have both a
+    window and mobile" claim was wrong; it only tested ASAP and future-DAY.)
+  * perform_at OMITTED (--advance / ASAP) -> due now. Deadline ~immediate: with urgency
+    `urgent` (EUR SEPA-Instant default) max_execution_time == creation instant (≈0 s window);
+    with normal priority it's a ~30-min grace. Mobile-visible, but you must sign on the spot.
+    Prefer --today for a same-day payment you'll sign within hours.
+  * perform_at = a FUTURE DAY (--perform-at +Nd / YYYY-MM-DD; +30d is the INVOICE default) ->
+    the deadline is ~Vilnius-midnight at the start of perform_at, i.e. an ~N-day window. BUT
+    a future operation_date renders only in the WEB BANK, not mobile, until that day — sign
+    it in the web bank.
+Default is context-aware: a payment WITH --invoice-id (invoice/bulk) defaults to +30d (long
+web-bank window); a payment WITHOUT --invoice-id (ad-hoc/personal) defaults to TODAY (mobile-
+signable). Override either with --today / --advance / --perform-at.
+
+Token: read from ~/.config/paysera-payments/token (override with --token-file or
+the PAYSERA_PAT env var).
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+import unicodedata
+import time
+from decimal import Decimal, InvalidOperation
+
+try:
+    from zoneinfo import ZoneInfo
+
+    _VILNIUS = ZoneInfo("Europe/Vilnius")
+except Exception:  # no tzdata — degrade gracefully (see _end_of_today_epoch)
+    _VILNIUS = None
+
+# Accounts the PAT is scoped to. The token will reject any other payer account.
+# ── CONFIGURE THIS ─ replace the placeholders with the EVP account_number(s) your
+# own token is scoped to (see the Paysera app → account number, the "EVP..." one,
+# NOT the IBAN). The script refuses any payer not listed here, as a safety guard.
+ALLOWED_ACCOUNTS = {
+    "EVP0000000000001": "Company A (example — replace me)",
+    "EVP0000000000002": "Company B (example — replace me)",
+}
+
+# --- Invoice BUYER (pirkėjas) -> payer account resolution -------------------
+# Prevents paying an invoice from the WRONG account. The correct payer is whichever
+# scoped account belongs to the invoice's BUYER (pirkėjas). Resolution is by company
+# registration code (reliable). Names are only a soft cross-check, never the sole key
+# (fuzzy: two entities that share a surname must be resolved by code, not by name).
+# ── CONFIGURE THIS ─ add an entry ONLY with a registration code you have actually
+# verified on a real invoice — NEVER guess/fabricate a code. Leave empty to always
+# pass --payer explicitly.
+BUYER_CODE_TO_ACCOUNT = {
+    # "123456789": "EVP0000000000001",  # Company A, UAB (verified: invoice <nr>, <date>)
+    # "987654321": "EVP0000000000002",  # Company B, UAB (verified: invoice <nr>, <date>)
+}
+
+# Fail-closed BUYER NAME -> payer account fallback. Used ONLY when the registration
+# code did not resolve a payer — some documents never print the buyer's code, only
+# the SELLER's (e.g. an insurer's "Mokėjimo pranešimas" payment reminder), so the
+# LLM returns an empty or wrong buyer_code. Keys are _norm_buyer_name() output
+# (UPPERCASE, punctuation stripped, whitespace collapsed). EXACT match only — NEVER
+# fuzzy — and ONLY your own, unambiguous entities. Do NOT add ambiguous pairs here
+# (two entities that share a surname); resolve those by code.
+# ── CONFIGURE THIS ─ starts empty; add an exact, unambiguous buyer name only when a
+# real invoice confirms it.
+BUYER_NAME_TO_ACCOUNT = {
+    # "COMPANY A UAB": "EVP0000000000001",  # verified <ref> (example — replace me)
+}
+
+
+def _norm_buyer_name(s):
+    """Normalize a buyer name for EXACT allow-list matching: NFC-compose (so a
+    decomposed Lithuanian diacritic like S+caron matches the precomposed Š),
+    uppercase, strip punctuation, collapse whitespace. Conservative on purpose — only
+    an exact normalized hit resolves a payer (never a fuzzy/substring match)."""
+    s = unicodedata.normalize("NFC", s or "").upper()
+    s = re.sub(r"[^\w]+", " ", s, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+TRANSFER_API = "https://api.paysera.com/public/transfer/rest/v1/transfers"
+DEFAULT_TOKEN_FILE = os.path.expanduser("~/.config/paysera-payments/token")
+LEDGER_FILE = os.path.expanduser("~/.config/paysera-payments/ledger.json")
+
+# Transfer states that mean "no payment exists / safe to (re)create". Anything NOT in
+# this set (new, reserved, signed, processing, done, ...) blocks a duplicate.
+NONBLOCKING_STATES = {"failed", "rejected", "canceled", "cancelled", "expired", "declined"}
+
+# SEPA purpose-of-payment field max length (the API rejects longer with
+# 'details_too_long'). Used to trim long invoice purposes on a word boundary.
+PURPOSE_MAX = 140
+
+# SEPA zone (EU + EEA + the non-EU SEPA members). A EUR transfer to a SEPA-zone
+# beneficiary can use the instant rail; one to a non-SEPA country (UA, AM, GE, …)
+# is a regular international SWIFT transfer (needs a BIC, not instant).
+SEPA_COUNTRIES = {
+    "AT",
+    "BE",
+    "BG",
+    "HR",
+    "CY",
+    "CZ",
+    "DK",
+    "EE",
+    "FI",
+    "FR",
+    "DE",
+    "GR",
+    "HU",
+    "IE",
+    "IT",
+    "LV",
+    "LT",
+    "LU",
+    "MT",
+    "NL",
+    "PL",
+    "PT",
+    "RO",
+    "SK",
+    "SI",
+    "ES",
+    "SE",
+    "IS",
+    "LI",
+    "NO",
+    "CH",
+    "MC",
+    "SM",
+    "GB",
+    "VA",
+    "AD",
+    "GI",
+}
+
+
+def beneficiary_country(iban: str, bic: str | None) -> str | None:
+    """Recipient ISO-2 country. A BIC's chars 5-6 are the country (reliable even for
+    non-IBAN accounts); otherwise the IBAN's 2-letter prefix."""
+    if bic and len(bic) >= 6 and bic[4:6].isalpha():
+        return bic[4:6].upper()
+    iban = (iban or "").replace(" ", "").upper()
+    return iban[:2] if iban[:2].isalpha() else None
+
+
+def _clip_purpose(text: str, limit: int = PURPOSE_MAX) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    sp = cut.rfind(" ")
+    return (cut[:sp] if sp > limit * 0.6 else cut).rstrip()
+
+
+def read_token(path):
+    tok = os.environ.get("PAYSERA_PAT")
+    if tok:
+        return tok.strip()
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError as e:
+        sys.exit(f"ERROR: cannot read PAT ({e}). Set PAYSERA_PAT or pass --token-file.")
+
+
+def http_json(method, url, token):
+    out = subprocess.run(
+        [
+            "curl",
+            "-s",
+            "-X",
+            method,
+            url,
+            "-H",
+            f"Authorization: Bearer {token}",
+            "-w",
+            "\nHTTP:%{http_code}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    txt = out.stdout
+    code = txt.split("\nHTTP:")[-1].strip()
+    body = txt.split("\nHTTP:")[0]
+    try:
+        return code, json.loads(body)
+    except json.JSONDecodeError:
+        return code, body
+
+
+def load_ledger():
+    try:
+        with open(LEDGER_FILE) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def append_ledger(entry):
+    data = load_ledger()
+    data.append(entry)
+    os.makedirs(os.path.dirname(LEDGER_FILE), exist_ok=True)
+    tmp = LEDGER_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, LEDGER_FILE)
+    try:
+        os.chmod(LEDGER_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def _transfer_items(doc):
+    """Extract the list of transfer rows from a GET /transfers response, robust to the
+    container key (items / transfers / a bare list)."""
+    if isinstance(doc, list):
+        return doc
+    if isinstance(doc, dict):
+        for key in ("items", "transfers", "data"):
+            if isinstance(doc.get(key), list):
+                return doc[key]
+    return []
+
+
+def list_transfers(token, payer_account, created_from, max_pages=50):
+    """List the payer account's OUTGOING transfers since `created_from` (epoch) via
+    the `GET /transfers` filter (added 2026-06-18), with OFFSET pagination so a
+    busy account is NOT capped at the default page size. Returns [] on any
+    error/unknown shape so the caller falls back to the ledger check rather than
+    crashing.
+
+    DIRECTION PARAM (fixed 2026-07-08): the API uses ACCOUNTING semantics —
+    `credit_account_number=X` returns transfers where X is the PAYER (outgoing;
+    paying out credits the asset account), `debit_account_number=X` returns INCOMING
+    ones. Verified empirically on a live payer account: `credit_…` returned a full
+    page of rows with payer=X while `debit_…` returned none. Until this fix the live
+    dedup cross-check was reading the INCOMING list, so it could never see an executed
+    outgoing duplicate.
+
+    PAGINATION (fixed 2026-07-08): the cursor `after` param is BROKEN server-side —
+    following `_metadata.cursors.after` returns the SAME date window again (mirrored
+    order) and then reports has_next=false, silently truncating the list (verified on
+    a 256-row window: cursor walk stopped at 06-16 while 58 July rows existed).
+    `offset` works correctly (0/100/200 → full 256, ranges 06-01..06-16 / 06-16..07-01
+    / 07-01..07-08). The earlier "verified 39 vs old 20" cursor check never exercised
+    page 2 (39 < limit=100), so the breakage went unseen. Rows are deduped by id —
+    page boundaries can shift while new transfers land.
+
+    LIMITATION (verified 2026-06-29): this endpoint returns only EXECUTED/terminal
+    transfers (done/revoked/failed/rejected); it does NOT list unsigned drafts
+    (new/registered/signed), and its `status` query param is ignored. So the live
+    cross-check catches an already-EXECUTED duplicate, but NOT one left as an unsigned
+    draft — the tool's own drafts are deduped via the LEDGER instead (find_blocking
+    source 1); a duplicate created manually in the app and left unsigned stays invisible
+    here. It also cannot see a payment made OUTSIDE the Paysera wallet (e.g. from the
+    company's real bank account) — that is fundamentally out of this API's reach.
+    """
+    page_size = 100
+    base = (
+        f"{TRANSFER_API}?credit_account_number={payer_account}"
+        f"&created_date_from={int(created_from)}&limit={page_size}"
+    )
+    items, seen_ids = [], set()
+    for page in range(max_pages):
+        code, doc = http_json("GET", f"{base}&offset={page * page_size}", token)
+        if code != "200":
+            break
+        page_items = _transfer_items(doc)
+        if not page_items:
+            break
+        for t in page_items:
+            tid = t.get("id") if isinstance(t, dict) else None
+            if tid and tid in seen_ids:
+                continue
+            if tid:
+                seen_ids.add(tid)
+            items.append(t)
+        meta = doc.get("_metadata") if isinstance(doc, dict) else None
+        total = meta.get("total") if isinstance(meta, dict) else None
+        if len(page_items) < page_size:
+            break
+        if isinstance(total, int) and (page + 1) * page_size >= total:
+            break
+    return items
+
+
+def _norm_iban(s):
+    return (s or "").replace(" ", "").upper()
+
+
+def is_paysera_iban(s):
+    """True if `s` is a Paysera IBAN — Lithuanian, bank (payment institution) code
+    35000, i.e. LTkk35000…. Paysera→Paysera transfers are instant and free, so when an
+    invoice lists a Paysera account alongside others we always pay to it."""
+    return bool(re.match(r"^LT\d{2}35000", _norm_iban(s)))
+
+
+def select_beneficiary_iban(primary, also):
+    """Choose which beneficiary IBAN to actually pay, from all the IBANs an invoice lists.
+
+    Rule:
+      * If ANY listed IBAN is a Paysera account (LTkk35000…) → ALWAYS pay to that one,
+        even if it was passed as --also-iban.
+      * Otherwise → pay to the FIRST listed IBAN (the one passed as --iban).
+
+    Returns (chosen_iban, other_ibans, reason). `other_ibans` keeps the rest (for the
+    duplicate check). De-dupes by normalized IBAN while preserving the given order."""
+    seen, ordered = set(), []
+    for ib in [primary] + list(also or []):
+        n = _norm_iban(ib)
+        if n and n not in seen:
+            seen.add(n)
+            ordered.append(ib)
+    paysera = [ib for ib in ordered if is_paysera_iban(ib)]
+    if paysera:
+        chosen, reason = (
+            paysera[0],
+            "Paysera IBAN (bank code 35000) — always pay Paysera (instant & free)",
+        )
+    else:
+        chosen, reason = ordered[0], "no Paysera IBAN listed — paying the first IBAN on the invoice"
+    others = [ib for ib in ordered if _norm_iban(ib) != _norm_iban(chosen)]
+    return chosen, others, reason
+
+
+def find_blocking(invoice_id, token, payer=None, ibans=None, amount=None, invoice_date=None):
+    """Return (blocking, seen_to_ibans).
+
+    `blocking` = [(hash, status, source)] that block re-creating a payment for this
+    invoice. `seen_to_ibans` = [(hash, status, amount, iban, purpose)] — EVERY transfer
+    to any candidate IBAN in the period, for human review (printed by the caller).
+
+    Two block sources, deduped by hash:
+      1. LEDGER — prior transfers this tool recorded for `invoice_id` (live-checked).
+      2. LIVE LIST — the payer account's ACTUAL transfers since the invoice date to ANY
+         of the beneficiary's accounts. An invoice can list several IBANs (Luminor AND
+         SEB); a payment to EITHER means "this invoice already paid". Pass them all via
+         `ibans` (a set). A transfer to a candidate IBAN BLOCKS when its amount matches
+         OR its purpose mentions the invoice id. All transfers to those IBANs (whatever
+         the amount) are also returned in `seen_to_ibans` so a human can eyeball "what
+         was it for". Uses GET /transfers (shipped 2026-06-18); best-effort.
+
+    A transfer blocks unless its status is in NONBLOCKING_STATES (failed/rejected/...).
+    """
+    blocking = {}
+    seen_to_ibans = []
+
+    # 1. Ledger-recorded transfers for this invoice.
+    for e in load_ledger():
+        if str(e.get("invoice_id")) != str(invoice_id):
+            continue
+        h = e.get("transfer_hash")
+        if not h:
+            continue
+        code, doc = http_json("GET", f"{TRANSFER_API}/{h}", token)
+        if code == "200" and isinstance(doc, dict) and doc.get("id"):
+            st = (doc.get("status") or "").lower()
+            if st not in NONBLOCKING_STATES:
+                blocking[h] = (h, doc.get("status"), "ledger")
+        else:
+            # Could not confirm it's dead -> be conservative, treat as blocking.
+            blocking[h] = (h, f"unknown (HTTP {code})", "ledger")
+
+    # 2. Live cross-check: same payer, any candidate beneficiary IBAN, over the whole
+    #    period from (invoice issue date - 1d grace) to now — regardless of who created
+    #    the transfer (app or tool).
+    cand = {_norm_iban(i) for i in (ibans or []) if i}
+    if payer and cand:
+        from_epoch = 0
+        if invoice_date:
+            try:
+                d = datetime.datetime.strptime(invoice_date, "%Y-%m-%d").replace(
+                    tzinfo=datetime.timezone.utc
+                )
+                from_epoch = int(d.timestamp()) - 86400  # 1-day grace before issue date
+            except ValueError:
+                from_epoch = 0
+        for t in list_transfers(token, payer, from_epoch):
+            if not isinstance(t, dict):
+                continue
+            ben = t.get("beneficiary") or {}
+            # IBAN location varies by beneficiary type: bank → beneficiary.bank_account.iban,
+            # paysera → beneficiary.iban (verified against the live list). Check both.
+            t_iban = _norm_iban((ben.get("bank_account") or {}).get("iban") or ben.get("iban"))
+            if t_iban not in cand:
+                continue
+            t_amt = (
+                ((t.get("amount") or {}).get("amount"))
+                if isinstance(t.get("amount"), dict)
+                else None
+            )
+            purpose = (
+                (t.get("purpose") or {}).get("details", "")
+                if isinstance(t.get("purpose"), dict)
+                else ""
+            )
+            st = (t.get("status") or "").lower()
+            h = t.get("id")
+            seen_to_ibans.append((h, t.get("status"), t_amt, t_iban, purpose))
+            # Block if amount matches OR the invoice id is quoted in the purpose.
+            amount_match = False
+            if amount is not None and t_amt is not None:
+                try:
+                    amount_match = Decimal(str(t_amt)) == Decimal(str(amount))
+                except InvalidOperation:
+                    amount_match = False
+            id_match = bool(invoice_id) and str(invoice_id).lower() in (purpose or "").lower()
+            if (
+                h
+                and (amount_match or id_match)
+                and st not in NONBLOCKING_STATES
+                and h not in blocking
+            ):
+                blocking[h] = (h, t.get("status"), "live-list")
+
+    return list(blocking.values()), seen_to_ibans
+
+
+def _vilnius_today():
+    """Today's date in Europe/Vilnius (the timezone Paysera uses for operation_date /
+    the day boundary that decides mobile visibility)."""
+    tz = _VILNIUS or datetime.timezone.utc
+    return datetime.datetime.now(tz).date()
+
+
+def _end_of_today_epoch():
+    """Latest SAME-DAY signing deadline: today 23:00 Europe/Vilnius. Still 'today' for
+    operation_date (so the transfer stays mobile-visible) while giving the longest intraday
+    window. Falls back to a short window if it's already late or tzdata is unavailable."""
+    now = int(time.time())
+    if _VILNIUS is None:  # no tzdata: a safe ~4-hour same-day window
+        return now + 4 * 3600
+    end = datetime.datetime.now(_VILNIUS).replace(hour=23, minute=0, second=0, microsecond=0)
+    epoch = int(end.timestamp())
+    return epoch if epoch > now + 600 else now + 1800  # already past 23:00 -> 30-min window
+
+
+def parse_perform_at(spec):
+    """Resolve --perform-at to a FUTURE epoch — SAME-DAY allowed.
+
+    perform_at is the signing deadline (`max_execution_time` == this timestamp for a same-day
+    time; ~Vilnius-midnight-before for a future day). A LATER-TODAY time keeps operation_date =
+    today, so the transfer shows in BOTH the mobile app and the web bank; a FUTURE DAY is
+    web-bank-only until that day. Only a PAST/near-instant time is rejected (use --advance for
+    sign-on-the-spot ASAP). Accepts: YYYY-MM-DD | +Nd | +Nh | epoch seconds | (default) +30d.
+    """
+    now = int(time.time())
+    if not spec:
+        return now + 30 * 86400
+    if spec.isdigit():
+        epoch = int(spec)
+    elif spec.startswith("+") and spec[1:-1].isdigit() and spec[-1] in "dh":
+        n = int(spec[1:-1])
+        epoch = now + n * (86400 if spec[-1] == "d" else 3600)
+    else:
+        try:
+            d = datetime.datetime.strptime(spec, "%Y-%m-%d").date()
+        except ValueError:
+            sys.exit("ERROR: --perform-at must be YYYY-MM-DD, +Nd, +Nh, or epoch seconds")
+        today = _vilnius_today()
+        if d < today:
+            sys.exit(f"ERROR: --perform-at {d} is in the past. Pick today or a future date.")
+        # Today's date -> latest same-day deadline; a future day -> noon UTC inside it.
+        epoch = (
+            _end_of_today_epoch()
+            if d == today
+            else int(
+                datetime.datetime(
+                    d.year, d.month, d.day, 12, tzinfo=datetime.timezone.utc
+                ).timestamp()
+            )
+        )
+    if epoch <= now + 60:
+        sys.exit(
+            "ERROR: --perform-at resolves to a past/near-instant time. perform_at is the signing "
+            "deadline, so pick a comfortably-future time (e.g. +3h, +1d) — or use --advance for "
+            "sign-on-the-spot ASAP."
+        )
+    return epoch
+
+
+def resolve_payer(args):
+    """Decide the payer account from the invoice BUYER, refusing to pay from an
+    arbitrary account. Priority: verified --buyer-code map > verified --buyer-name map
+    (fail-closed fallback for documents that print only the seller's code, e.g. an
+    ERGO "Mokėjimo pranešimas") > explicit --payer. A code/--payer or code/name
+    mismatch is a hard error (the whole point: never pay an invoice from the wrong
+    company's account)."""
+    code = (args.buyer_code or "").strip()
+    code_resolved = BUYER_CODE_TO_ACCOUNT.get(code) if code else None
+    # NAME fallback — used only when the code did not resolve. Some documents never
+    # print the buyer's registration code (only the seller's), so the LLM returns an
+    # empty or wrong buyer_code; an EXACT, curated buyer-name match then recovers the
+    # payer. Never fuzzy, only our own unambiguous entities.
+    name_resolved = (
+        BUYER_NAME_TO_ACCOUNT.get(_norm_buyer_name(args.buyer_name)) if args.buyer_name else None
+    )
+    # If a mapped code and a mapped name DISAGREE, something is mis-extracted — refuse
+    # rather than silently trust the code (defense in depth).
+    if code_resolved and name_resolved and code_resolved != name_resolved:
+        sys.exit(
+            f"ERROR: buyer mismatch — code {code} maps to {code_resolved} "
+            f"({ALLOWED_ACCOUNTS.get(code_resolved)}), but name {args.buyer_name!r} maps to "
+            f"{name_resolved} ({ALLOWED_ACCOUNTS.get(name_resolved)}). Refusing (possible "
+            f"mis-extraction) — verify and pass --payer explicitly."
+        )
+    resolved = code_resolved or name_resolved
+    # Audit trail: a payer chosen by NAME (no usable code) is the safety-sensitive
+    # path — make it visible in logs.
+    if name_resolved and not code_resolved:
+        print(
+            f"NOTE: payer resolved via buyer NAME {args.buyer_name!r} → {resolved} "
+            f"({ALLOWED_ACCOUNTS.get(resolved)}); buyer code "
+            f"{('unmapped: ' + code) if code else 'absent'}.",
+            file=sys.stderr,
+        )
+    if not resolved and not args.payer:
+        known = "\n".join(f"    {a}  {l}" for a, l in ALLOWED_ACCOUNTS.items())
+        ident = (
+            " / ".join(
+                x
+                for x in [
+                    f"code {code}" if code else "",
+                    f"name {args.buyer_name!r}" if args.buyer_name else "",
+                ]
+                if x
+            )
+            or "(no buyer code or name given)"
+        )
+        sys.exit(
+            f"ERROR: could not resolve a payer account from the invoice buyer [{ident}].\n"
+            f"  Refusing to guess the account. Add a verified code to BUYER_CODE_TO_ACCOUNT\n"
+            f"  or an exact name to BUYER_NAME_TO_ACCOUNT, or pass --payer explicitly.\n"
+            f"  Scoped accounts:\n{known}"
+        )
+    if resolved and args.payer and args.payer != resolved:
+        sys.exit(
+            f"ERROR: account mismatch — invoice buyer maps to "
+            f"{resolved} ({ALLOWED_ACCOUNTS.get(resolved)}), but --payer is {args.payer} "
+            f"({ALLOWED_ACCOUNTS.get(args.payer, '?')}). Refusing to pay from the wrong account."
+        )
+    payer = resolved or args.payer
+    if not payer:
+        sys.exit(
+            "ERROR: no payer. Pass --buyer-code (mapped), --buyer-name (mapped), or "
+            "--payer (EVP...)."
+        )
+    if payer not in ALLOWED_ACCOUNTS:
+        print(f"ERROR: payer {payer} is not one of the token's scoped accounts:", file=sys.stderr)
+        for a, label in ALLOWED_ACCOUNTS.items():
+            print(f"  {a}  {label}", file=sys.stderr)
+        sys.exit(2)
+    return payer
+
+
+def _noon_epoch(d):
+    """Epoch for 12:00 UTC on date d (safe inside the perform_at day, away from
+    midnight boundaries)."""
+    return int(
+        datetime.datetime(d.year, d.month, d.day, 12, tzinfo=datetime.timezone.utc).timestamp()
+    )
+
+
+def compute_schedule(args):
+    """Resolve perform_at + a display `mode` from the chosen options.
+
+    Regimes (re-measured live 2026-06-30):
+      * --today    -> perform_at = LATER TODAY (23:00 Vilnius): same-day window, and the
+        transfer shows in BOTH the mobile app AND the web bank. The right pick for "pay
+        today, sign on my phone within hours".
+      * --advance  -> perform_at OMITTED (ASAP): due now. Deadline ~immediate (urgent EUR =
+        ~0 s, normal = ~30 min). Mobile-visible but must be signed on the spot.
+      * --due-date -> perform_at = ONE DAY BEFORE the due date (after-fact invoices). If
+        due-1 is today/past, falls back to ASAP.
+      * --perform-at / default -> see parse_perform_at. The DEFAULT is context-aware:
+        a payment WITH --invoice-id (invoice/bulk) gets +30d (long WEB-BANK window, signed
+        at leisure); a payment WITHOUT --invoice-id (ad-hoc/personal) defaults to TODAY so
+        it is mobile-signable. Both overridable via --today / --advance / --perform-at.
+
+    Priority: --perform-at > --advance > --today > --due-date > context-aware default.
+    Returns (perform_at_epoch_or_None, mode). None => omit perform_at (ASAP).
+    """
+    today = datetime.datetime.now(datetime.timezone.utc).date()
+    if args.perform_at:
+        return parse_perform_at(args.perform_at), "scheduled"
+    if args.advance:
+        return None, "asap"
+    if args.today:
+        return _end_of_today_epoch(), "today"
+    if args.due_date:
+        try:
+            due = datetime.datetime.strptime(args.due_date, "%Y-%m-%d").date()
+        except ValueError:
+            sys.exit("ERROR: --due-date must be YYYY-MM-DD")
+        pay_day = due - datetime.timedelta(days=1)
+        if pay_day <= today:
+            print(f"NOTE: due-date {due} minus 1 day is today/past — paying ASAP instead.")
+            return None, "asap"
+        return _noon_epoch(pay_day), "scheduled"
+    # Context-aware default: invoice/bulk -> +30d web-bank window; ad-hoc/personal -> today.
+    if args.invoice_id:
+        return parse_perform_at(None), "scheduled"  # +30d
+    return _end_of_today_epoch(), "today"
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Create a draft Paysera transfer (dry-run unless --confirm)."
+    )
+    ap.add_argument(
+        "--payer",
+        default=None,
+        help="Payer Paysera account_number (EVP...). Optional if --buyer-code resolves it. "
+        "Must be a scoped account; a mismatch with --buyer-code is refused.",
+    )
+    ap.add_argument(
+        "--buyer-code",
+        default=None,
+        help="Invoice BUYER (pirkėjas) registration code. Resolves the correct payer "
+        "account so an invoice is never paid from the wrong company's account.",
+    )
+    ap.add_argument(
+        "--buyer-name", default=None, help="Invoice buyer name (display / soft cross-check)."
+    )
+    ap.add_argument(
+        "--today",
+        action="store_true",
+        help="Pay TODAY, sign on your phone: perform_at = 23:00 Vilnius today → a same-day "
+        "signing window (until tonight) AND the transfer shows in BOTH the mobile app and the "
+        "web bank. This is the right pick for an ad-hoc/personal payment you'll sign shortly. "
+        "(It is already the default when no --invoice-id is given.)",
+    )
+    ap.add_argument(
+        "--advance",
+        action="store_true",
+        help="Sign-RIGHT-NOW mode (advance/prepayment, Išankstinis) → perform_at omitted = "
+        "due now. Deadline is IMMEDIATE (max_execution_time ≈ creation instant), so it must "
+        "be signed on the spot. For a same-day payment you'll sign within hours prefer --today; "
+        "for an invoice you'll sign later use the default (+30d) or --perform-at.",
+    )
+    ap.add_argument(
+        "--due-date",
+        default=None,
+        help="Invoice due date YYYY-MM-DD (after-fact invoices). Money leaves (instantly, "
+        "on signing) at the latest one day before the due date.",
+    )
+    ap.add_argument(
+        "--priority",
+        choices=["auto", "urgent", "normal"],
+        default="auto",
+        help="Transfer priority. 'auto' (default) = SEPA Instant (urgency=urgent) for EUR, "
+        "normal otherwise. 'urgent' forces instant; 'normal' forces a regular transfer.",
+    )
+    ap.add_argument(
+        "--charge-type",
+        default="sha",
+        help="Charge bearer (SEPA standard 'sha'). REQUIRED for the mobile app to show the "
+        "transfer — without it the row has charge_type=NULL and mobile hides it.",
+    )
+    ap.add_argument("--beneficiary-name", required=True, help="Beneficiary full name")
+    ap.add_argument(
+        "--beneficiary-address",
+        default=None,
+        help="Beneficiary postal address (street, city, country). REQUIRED by the "
+        "Paysera API for cross-border / international transfers (non-SEPA-Instant); "
+        "the API rejects them with 'mapper_empty_beneficiary_address' otherwise.",
+    )
+    ap.add_argument("--iban", required=True, help="Beneficiary IBAN/account (the one to pay TO)")
+    ap.add_argument(
+        "--beneficiary-bic",
+        default=None,
+        help="Beneficiary bank BIC/SWIFT (e.g. PBANUA2X). REQUIRED for non-SEPA "
+        "international transfers (UA/AM/GE/…); the BIC's chars 5-6 also give the "
+        "recipient country. SEPA transfers don't need it.",
+    )
+    ap.add_argument(
+        "--beneficiary-bank-name",
+        default=None,
+        help="Beneficiary bank name (e.g. JSC CB PRIVATBANK), for international wires.",
+    )
+    ap.add_argument(
+        "--beneficiary-city",
+        default=None,
+        help="Beneficiary city — required by the API for international transfers "
+        "(goes in additional_information; missing → 'mapper_beneficiary_city_not_set').",
+    )
+    ap.add_argument(
+        "--also-iban",
+        action="append",
+        default=[],
+        help="Other beneficiary IBAN(s) the SAME invoice lists (e.g. a second bank). "
+        "Repeatable. Used ONLY by the duplicate check — a prior payment to ANY of these "
+        "means the invoice is already paid. Pass every account printed on the invoice.",
+    )
+    ap.add_argument("--amount", required=True, help="Decimal string, e.g. 12.34")
+    ap.add_argument("--currency", default="EUR", help="ISO currency (default EUR)")
+    ap.add_argument("--purpose", required=True, help="Payment purpose / details")
+    ap.add_argument(
+        "--no-preserve",
+        dest="preserve",
+        action="store_false",
+        help="Let Paysera transliterate the purpose to the SEPA charset (ą→a, etc.). By "
+        "default the tool sends purpose.details_options.preserve=true so Lithuanian "
+        "letters are kept verbatim (matches typing them in the web bank).",
+    )
+    ap.set_defaults(preserve=True)
+    ap.add_argument(
+        "--payer-name", default=None, help="Payer display name (default: account label)"
+    )
+    ap.add_argument(
+        "--invoice-id",
+        default=None,
+        help="Invoice number/identifier — dedup key. If a live/succeeded transfer for "
+        "this invoice already exists, creation is refused (unless --force).",
+    )
+    ap.add_argument(
+        "--invoice-date", default=None, help="Invoice issue date YYYY-MM-DD (recorded)."
+    )
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        help="Bypass the invoice duplicate check and create anyway.",
+    )
+    ap.add_argument("--token-file", default=DEFAULT_TOKEN_FILE)
+    ap.add_argument(
+        "--perform-at",
+        default=None,
+        help="Scheduled execution date (date-granular, UTC): YYYY-MM-DD | +Nd | +Nh | epoch. "
+        "Default +30d. MUST resolve to a future day — same-day/past times out unsigned.",
+    )
+    ap.add_argument(
+        "--no-register",
+        action="store_true",
+        help="Skip the PUT /register step after create. By default the tool registers the "
+        "created transfer so it becomes visible for manual signing in the Paysera app/UI. "
+        "Without registering, the transfer stays in the validation-only 'new' state (invisible).",
+    )
+    ap.add_argument(
+        "--confirm", action="store_true", help="Actually POST. Without it, dry-run only."
+    )
+    args = ap.parse_args()
+
+    payer = resolve_payer(args)
+
+    try:
+        if Decimal(args.amount) <= 0:
+            raise InvalidOperation
+    except InvalidOperation:
+        sys.exit("ERROR: --amount must be a positive decimal string like 12.34")
+
+    token = read_token(args.token_file)
+
+    # --- Beneficiary IBAN selection (multi-IBAN invoices) -----------------------
+    # An invoice may list several beneficiary IBANs (e.g. SEB AND Luminor). Pay to the
+    # Paysera one (LTkk35000…) if any is listed, else the first listed. This is enforced
+    # here so it holds no matter the order --iban/--also-iban were given in. Every listed
+    # IBAN still feeds the duplicate check below.
+    chosen_iban, other_ibans, sel_reason = select_beneficiary_iban(args.iban, args.also_iban)
+    if other_ibans:
+        print(f"Beneficiary IBAN: {chosen_iban}  ({sel_reason})")
+        print(f"  other listed IBAN(s), dup-check only: {', '.join(other_ibans)}")
+    args.iban = chosen_iban
+    args.also_iban = other_ibans
+
+    # --- Idempotency: refuse to double-pay the same invoice ---
+    candidate_ibans = [args.iban] + list(args.also_iban or [])
+    if args.invoice_id and not args.force:
+        blocking, seen = find_blocking(
+            args.invoice_id,
+            token,
+            payer=payer,
+            ibans=candidate_ibans,
+            amount=args.amount,
+            invoice_date=args.invoice_date,
+        )
+        # Show EVERY payment to any candidate IBAN in the period, for human review.
+        period = f"since {args.invoice_date}" if args.invoice_date else "(full account history)"
+        print(
+            f"Dup-check: scanned payments from {payer} to "
+            f"{len(set(_norm_iban(i) for i in candidate_ibans))} beneficiary IBAN(s) {period}."
+        )
+        if seen:
+            print(f"  Found {len(seen)} prior payment(s) to those IBANs — review:")
+            for h, st, amt, ib, purp in seen:
+                print(f"    {amt} -> {ib}  status={st}  {h}\n      purpose: {purp[:120]}")
+        else:
+            print("  No prior payments to those IBAN(s) in the period.")
+        if blocking:
+            print(f"SKIP — a payment for invoice '{args.invoice_id}' already exists:")
+            for h, st, src in blocking:
+                print(f"  transfer {h}  status={st}  [{src}]")
+            print("Not creating another. Use --force to override.")
+            sys.exit(3)
+    elif not args.invoice_id:
+        print("NOTE: no --invoice-id given — duplicate check is OFF for this run.")
+
+    perform_at, mode = compute_schedule(args)
+
+    payer_name = args.payer_name or ALLOWED_ACCOUNTS[payer]
+
+    # Recipient country (ISO-2) from the BIC (chars 5-6, reliable for non-IBAN
+    # accounts too) or the IBAN prefix. Drives both the address.country field and
+    # the SEPA-vs-international routing below.
+    benef_country = beneficiary_country(args.iban, args.beneficiary_bic)
+    # A real IBAN goes in bank_account.iban; a non-IBAN national account number (e.g.
+    # Armenia "2050…") goes in bank_account_number (the API rejects it as iban).
+    acct = (args.iban or "").replace(" ", "").upper()
+    is_iban = bool(re.fullmatch(r"[A-Z]{2}[0-9A-Z]{13,32}", acct))
+    bank_account = {"iban": acct} if is_iban else {"bank_account_number": acct}
+    if args.beneficiary_bic:
+        # BIC/SWIFT for international (non-SEPA) wires, e.g. UA PrivatBank PBANUA2X.
+        bank_account["bic"] = args.beneficiary_bic.strip().upper()
+    beneficiary = {
+        "type": "bank",
+        "name": args.beneficiary_name,
+        "bank_account": bank_account,
+    }
+    # The international mapper reads the recipient country from
+    # beneficiary.additional_information.country (ISO 3166-1 alpha-2), per the Paysera
+    # Transfers API spec — NOT from beneficiary.country or address.country. Without it
+    # a non-SEPA transfer fails 'mapper_beneficiary_country_not_set'. `type` = natural
+    # (these contractors are individuals / FOP).
+    if benef_country and benef_country != "LT":
+        addl = {"type": "natural", "country": benef_country}
+        if args.beneficiary_city:
+            addl["city"] = args.beneficiary_city.strip()
+        beneficiary["additional_information"] = addl
+    # Address is required by the API for cross-border transfers (e.g. PL/UA/PT
+    # contractor IBANs); the schema is structured ({address_line, country}), a flat
+    # string is rejected as 'beneficiary.address.address_line is blank'. Omitted for
+    # domestic SEPA where it isn't needed.
+    if args.beneficiary_address:
+        # Clip the address line — the API rejects long ones with
+        # 'mapper_beneficiary_address_too_long' (SWIFT address lines are short). 70 is
+        # the safe single-line cap.
+        addr = {"address_line": args.beneficiary_address.strip()[:70].rstrip()}
+        if benef_country:
+            addr["country"] = benef_country
+        beneficiary["address"] = addr
+    # Beneficiary bank name, for international wires (helps the receiving side route).
+    if args.beneficiary_bank_name:
+        beneficiary["bank"] = {"title": args.beneficiary_bank_name.strip()}
+    payload = {
+        "amount": {"amount": args.amount, "currency": args.currency},
+        "beneficiary": beneficiary,
+        "payer": {"name": payer_name, "account_number": payer},
+        # preserve=true keeps Lithuanian diacritics verbatim instead of letting Paysera
+        # transliterate to the SEPA charset (the stored transfer exposes this as
+        # purpose.details_options.preserve). Override with --no-preserve.
+        # SEPA caps the purpose at 140 chars; the API rejects longer with
+        # 'details_too_long'. Trim on a word boundary so the invoice ref survives.
+        "purpose": {
+            "details": _clip_purpose(args.purpose),
+            "details_options": {"preserve": args.preserve},
+        },
+        # REQUIRED for the mobile app to render the transfer. Web sets charge_type='sha'
+        # (shared SEPA charges); without it the bank_transfer row has charge_type=NULL and
+        # the Paysera mobile app filters it out of the sign list (verified 2026-06-15 by
+        # diffing an API-created transfer vs a web-created one in gateway.bank_transfer).
+        "charge_type": args.charge_type,
+    }
+    # perform_at is OPTIONAL: omitted => execute ASAP (operation_date=today), which is how
+    # a hand-made web instant payment looks. A future timestamp schedules it for that day.
+    if perform_at is not None:
+        payload["perform_at"] = perform_at
+    # SEPA Instant for EUR (urgency=urgent) unless overridden. Instant executes the
+    # moment the transfer is signed (EUR SEPA Instant rail: bank=lt_lb_sepa_inst).
+    # The instant rail only reaches SEPA-zone banks — a EUR transfer to a non-SEPA
+    # country (UA/AM/GE/…) is a regular international SWIFT transfer, NOT instant.
+    is_sepa = benef_country is None or benef_country in SEPA_COUNTRIES
+    if args.priority == "urgent":
+        instant = True
+    elif args.priority == "normal":
+        instant = False
+    else:  # auto
+        instant = args.currency.upper() == "EUR" and is_sepa
+    if instant:
+        payload["urgency"] = "urgent"
+
+    print("Payer  :", payer, f"({ALLOWED_ACCOUNTS[payer]})")
+    if args.buyer_code or args.buyer_name:
+        bits = " ".join(
+            x
+            for x in [args.buyer_name or "", f"(code {args.buyer_code})" if args.buyer_code else ""]
+            if x
+        )
+        print("Buyer  :", bits)
+    if args.invoice_id:
+        print(
+            "Invoice:",
+            args.invoice_id,
+            f"(issued {args.invoice_date})" if args.invoice_date else "",
+        )
+    print("Priority:", "SEPA Instant (urgent)" if instant else "normal")
+    print("Charge  :", payload["charge_type"], "(mobile app needs this set)")
+    # Same-day if the perform_at timestamp lands on today's Vilnius date — drives whether the
+    # transfer is mobile-visible (today) or web-bank-only (a future day).
+    tz = _VILNIUS or datetime.timezone.utc
+    same_day = (
+        perform_at is not None
+        and datetime.datetime.fromtimestamp(perform_at, tz).date() == _vilnius_today()
+    )
+    if mode == "asap":
+        print(
+            "Schedule: ASAP (perform_at omitted) — operation_date = today. Deadline is "
+            "IMMEDIATE (max_execution_time ≈ now) — sign on the spot, or it times out. "
+            "For a same-day window you can sign within hours, use --today instead."
+        )
+        print("         WHERE TO SIGN: mobile app or web bank (2FA) — but immediately.")
+        if instant:
+            print("         Executes INSTANTLY the moment it is signed (EUR SEPA Instant).")
+    elif mode == "today" or same_day:
+        deadline = datetime.datetime.fromtimestamp(perform_at, tz)
+        print(
+            f"Schedule: TODAY — sign until {deadline:%H:%M} (Vilnius) today; "
+            f"then auto-cancels if unsigned."
+        )
+        print(
+            "         WHERE TO SIGN: BOTH the mobile app AND the web bank (operation_date = "
+            "today). Sign on your phone (2FA)."
+        )
+        if instant:
+            print("         Executes INSTANTLY the moment it is signed (EUR SEPA Instant).")
+    else:
+        perform_day = datetime.datetime.fromtimestamp(perform_at, datetime.timezone.utc).date()
+        deadline_day = perform_day - datetime.timedelta(days=1)
+        print(
+            f"Schedule: execute {perform_day} — sign/cancel until end of {deadline_day} "
+            f"(Vilnius midnight); then auto-cancels if unsigned."
+        )
+        print(
+            "         WHERE TO SIGN: the WEB BANK only (bank.paysera.com) — a future "
+            "operation_date is NOT shown in the mobile app until that day."
+        )
+        if instant:
+            print(
+                f"         Scheduled for {perform_day}; once executed it uses the instant "
+                f"rail (EUR SEPA Instant). Money leaves on the scheduled day, not at signing."
+            )
+    print("Payload:")
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+    if not args.confirm:
+        print("\nDRY-RUN — nothing sent. Re-run with --confirm to register the draft transfer.")
+        return
+
+    code, j = http_json_post(TRANSFER_API, payload, token)
+
+    if code in ("200", "201") and isinstance(j, dict) and j.get("id") and not j.get("error"):
+        transfer_hash = j.get("id")
+        print(f"\nOK draft transfer created (HTTP {code})")
+        print("  id (transferHash):", transfer_hash)
+        print("  status           :", j.get("status"))
+
+        # Register the transfer so it becomes visible for MANUAL SIGNING in the Paysera
+        # app/UI. A bare POST leaves the transfer in the validation-only `new` state, which
+        # is NOT shown anywhere for signing (the cause of the old "invisible draft" problem).
+        # PUT /transfers/{hash}/register (scope transfers:create) moves it to a registered,
+        # signable state. Skip with --no-register.
+        if not args.no_register:
+            rcode, rj = http_json("PUT", f"{TRANSFER_API}/{transfer_hash}/register", token)
+            if rcode in ("200", "201", "204"):
+                reg_status = rj.get("status") if isinstance(rj, dict) else None
+                print("  registered       : yes (visible for manual signing)", end="")
+                print(f" — status={reg_status}" if reg_status else "")
+            else:
+                print(
+                    f"  registered       : FAILED (HTTP {rcode}) — transfer stays in 'new' "
+                    f"(invisible). Retry: PUT {TRANSFER_API}/{transfer_hash}/register"
+                )
+                print("   ", str(rj)[:400])
+        else:
+            print("  registered       : skipped (--no-register) — stays 'new' (invisible).")
+
+        if args.invoice_id:
+            append_ledger(
+                {
+                    "invoice_id": args.invoice_id,
+                    "invoice_date": args.invoice_date,
+                    "transfer_hash": j.get("id"),
+                    "status_at_create": j.get("status"),
+                    "payer": payer,
+                    "amount": args.amount,
+                    "currency": args.currency,
+                    "beneficiary_iban": args.iban,
+                    "beneficiary_name": args.beneficiary_name,
+                    "created_at": int(time.time()),
+                    "created_at_iso": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                }
+            )
+            print("  ledger           : recorded for invoice", args.invoice_id)
+        print("\nNOT executed — this token has no sign scope. Open the Paysera app and SIGN the")
+        print("transfer (2FA) to actually send the money.")
+    else:
+        print(f"\nFAILED (HTTP {code})")
+        print(str(j)[:1500])
+        sys.exit(1)
+
+
+def http_json_post(url, payload, token):
+    out = subprocess.run(
+        [
+            "curl",
+            "-s",
+            "-X",
+            "POST",
+            url,
+            "-H",
+            f"Authorization: Bearer {token}",
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            json.dumps(payload),
+            "-w",
+            "\nHTTP:%{http_code}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    txt = out.stdout
+    code = txt.split("\nHTTP:")[-1].strip()
+    body = txt.split("\nHTTP:")[0]
+    try:
+        return code, json.loads(body)
+    except json.JSONDecodeError:
+        return code, body
+
+
+if __name__ == "__main__":
+    main()
