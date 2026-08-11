@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.6.2 (2026-08-11)
+
+Fifth review round — publication checker only; the shipped skill is unchanged.
+
+- The "checker is exempt" test asserted an empty result against an empty temporary
+  repository, so it held regardless of the exemption logic and never reached it. It now
+  writes real files, including a decoy with the same name in another directory, and pins
+  both halves of the rule. Breaking the exemption either way now fails it.
+- Removed the residual false positives on dotted code chains whose last label happens to be
+  a real TLD (`handler = pkg.internal.io`): the unquoted right-hand side of an assignment
+  is code. A quoted host in an assignment, and a YAML `host:` value, are still checked.
+- `.test` and `.invalid` are reserved TLDs but also ordinary file suffixes, so they now
+  count only inside a URL: `config.test` in prose is a filename, while the same name after
+  a scheme is a host. "Inside a URL" is now judged per occurrence rather than per line,
+  so the two can appear together and still be told apart.
+- Recorded the checker's one deliberate blind spot in the code and in CONTRIBUTING.md: an
+  `internal` label under an uncommon gTLD is not detected, because widening the rule brings
+  the code false positives back.
+
 ## 1.6.1 (2026-08-11)
 
 Fourth review round.

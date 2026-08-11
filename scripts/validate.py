@@ -18,8 +18,8 @@ SKIP_DIRS = {".git", "__pycache__", ".pytest_cache"}
 # This is an allowlist on purpose: naming the hosts that are *not* public would
 # put them in this repository, which is exactly what the check exists to prevent.
 HOSTNAME = re.compile(r"\b(?:[a-z0-9-]+\.)+[a-z]{2,}\b", re.IGNORECASE)
-# The host portion of an explicit URL — unambiguous, unlike a bare dotted token.
-URL_HOST = re.compile(r"https?://([a-z0-9.-]+)", re.IGNORECASE)
+# A hostname sits in an explicit URL when the text right before it is a scheme.
+URL_PREFIX = re.compile(r"https?://\Z", re.IGNORECASE)
 PAYSERA_HOST = re.compile(r"(?:^|\.)paysera\.[a-z]{2,}$", re.IGNORECASE)
 PUBLIC_PAYSERA_HOSTS = frozenset(
     {
@@ -41,6 +41,10 @@ PUBLIC_PAYSERA_HOSTS = frozenset(
 INTERNAL_HOST_LABEL = re.compile(r"(?:^|\.)(?:intranet|internal)(?:\.|$)", re.IGNORECASE)
 # ... and these only as the final label, where they are non-routable by convention.
 INTERNAL_HOST_TLD = re.compile(r"\.(?:local|lan|corp|localdomain|home|test|invalid)$", re.IGNORECASE)
+# `.test` and `.invalid` are reserved TLDs, but they are also ordinary file suffixes
+# ("config.test"), so outside a URL they are treated as filenames. The rest have no such
+# collision and are flagged wherever they appear.
+URL_ONLY_TLD = re.compile(r"\.(?:test|invalid)$", re.IGNORECASE)
 COMMON_GTLDS = frozenset(
     {
         "com", "net", "org", "info", "biz", "edu", "gov", "mil", "int",
@@ -167,6 +171,12 @@ def looks_like_prose(line, match):
     # A filesystem path, or an attribute chain hanging off something.
     if before.endswith(("/", "\\")) or re.search(r"[\w)\]]\Z", before):
         return True
+    # The right-hand side of an assignment, unquoted: `handler = pkg.internal.io` is code.
+    # A quoted host — HOST = "db.corp.local" — is not exempt, because `before` then ends
+    # with the quote character rather than the assignment.
+    # (`=` only, never `:` — a YAML value like `host: db.corp.local` IS a hostname.)
+    if re.search(r"=\s*\Z", before) and not before.rstrip().endswith(("'", '"', "`")):
+        return True
     # A dotted name continuing into a call or subscript.
     if re.match(r"\s*[(\[]", after):
         return True
@@ -176,6 +186,21 @@ def looks_like_prose(line, match):
     if not is_plausible_tld(token.rsplit(".", 1)[-1]):
         return True
     return False
+
+
+def is_internal_host(host, in_url):
+    """True if `host` names something only reachable inside a private network.
+
+    KNOWN LIMIT: an `internal`/`intranet` label under an uncommon gTLD (one outside
+    COMMON_GTLDS and not two letters) is not detected, because at that point a hostname
+    and a dotted code path cannot be told apart — see looks_like_prose(). The realistic
+    internal suffixes are covered; this check is a backstop, not the review.
+    """
+    if INTERNAL_HOST_LABEL.search(host):
+        return True
+    if URL_ONLY_TLD.search(host):
+        return bool(in_url)
+    return bool(INTERNAL_HOST_TLD.search(host))
 
 
 def is_plausible_tld(label):
@@ -203,10 +228,11 @@ def scan_published_content():
             continue
         rel = path.relative_to(ROOT)
         for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            url_hosts = {h.lower() for h in URL_HOST.findall(line)}
             for match in HOSTNAME.finditer(line):
                 host = match.group(0).lower()
-                in_url = host in url_hosts
+                # Per OCCURRENCE, not per line: the same name can appear twice on one
+                # line, once as a URL host and once as a filename, and they are different.
+                in_url = bool(URL_PREFIX.search(line[: match.start()]))
                 if PAYSERA_HOST.search(host) and host not in PUBLIC_PAYSERA_HOSTS:
                     # A Paysera hostname is unambiguous whether or not it sits in a URL.
                     errors.append(
@@ -214,14 +240,15 @@ def scan_published_content():
                         f"published content may only reference "
                         f"{', '.join(sorted(PUBLIC_PAYSERA_HOSTS))}"
                     )
-                elif INTERNAL_HOST_LABEL.search(host) or INTERNAL_HOST_TLD.search(host):
-                    # These markers are ordinary words in code and prose ("internal.md",
-                    # `pkg.internal.helpers`, `config.test`), so only flag them where the
-                    # token is actually being used as a host.
-                    if in_url or not looks_like_prose(line, match):
-                        errors.append(
-                            f"{rel}:{number}: '{host}' looks like an internal-only hostname"
-                        )
+                elif is_internal_host(host, in_url) and (
+                    in_url or not looks_like_prose(line, match)
+                ):
+                    # These markers are ordinary words in code and prose
+                    # ("pkg.internal.helpers", "config.test"), so they are only flagged
+                    # where the token is really being used as a host.
+                    errors.append(
+                        f"{rel}:{number}: '{host}' looks like an internal-only hostname"
+                    )
             for url in TRACKER_URL.findall(line):
                 errors.append(
                     f"{rel}:{number}: '{url}' links into an issue tracker or forge — "

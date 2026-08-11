@@ -30,17 +30,22 @@ repository (not just `plugins/`) and fails on:
 - a hostname containing `intranet`/`internal`, or ending in `.local`, `.lan`, `.corp`,
   `.localdomain`, `.home`, `.test`, `.invalid` — but only where the token is genuinely
   used as a host. Not flagged: import paths (`pkg.internal.helpers`), filenames
-  (`internal.md`), file paths (`app/config.test`), dotted calls, and any dotted name whose
-  last label cannot be a TLD. **Backticks are not an exemption** — a hostname in backticks
-  is checked exactly as a bare one is, because backticks are how this repository normally
-  writes hostnames;
+  (`internal.md`), file paths (`app/config.test`), dotted calls, the unquoted right-hand
+  side of an assignment (`handler = pkg.internal.io`), and any dotted name whose last label
+  cannot be a TLD. A *quoted* host in an assignment is still checked. **Backticks are not
+  an exemption** — a hostname in backticks is checked exactly as a bare one is, because
+  backticks are how this repository normally writes hostnames. `.test` and `.invalid` are
+  reserved TLDs but also ordinary file suffixes, so they count only inside a URL;
 - a URL that looks like an issue tracker or forge link (`/browse/KEY-123`, `/jira/`,
   `/confluence/`, `/-/merge_requests/`).
 
 It is a **backstop, not the review**. It cannot see an internal service or database name
 written in prose, an internal tool referred to by name, an internal wiki link on a domain
 it does not recognise, a real account number that looks like a placeholder, or a ticket key
-in a commit message. A human reviewer must check those, and must state in the pull request
+in a commit message. One limit is deliberate and worth knowing: an `internal`/`intranet`
+label under an *uncommon* gTLD is not detected, because at that point a hostname and a
+dotted code path are indistinguishable. Widening it would bring the code false positives
+back. A human reviewer must check those, and must state in the pull request
 that they did.
 
 The gate has its own tests in `scripts/test_validate.py`, table-driven over the samples it

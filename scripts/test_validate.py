@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -47,6 +48,22 @@ SAMPLES = [
     ("`bank.paysera.com`", False, "public Paysera host in backticks"),
     ("https://github.com/paysera/skills", False, "public third-party host"),
     ("https://code.claude.com/docs/en/plugin-marketplaces", False, "public docs link"),
+    # --- dotted code chains whose last label happens to be a plausible TLD -----------
+    # Python module names like io/app/net/dev are all real TLDs, so the last-label rule
+    # alone is not enough; an unquoted right-hand side is code.
+    ("handler = mypkg.internal.io", False, "assignment, module name that is also a TLD"),
+    ("cfg = mypkg.internal.app", False, "assignment, module name that is also a TLD"),
+    ("client = pkg.internal.net", False, "assignment, module name that is also a TLD"),
+    ("value = pkg.internal.helpers", False, "assignment, ordinary module name"),
+    # ...but a quoted host on the right-hand side is still a host.
+    ('HOST = "db.corp.local"', True, "quoted internal host in an assignment"),
+    ("host: db.corp.local", True, "YAML value is a host, not an assignment"),
+    # `.test` is a reserved TLD and a common file suffix; only a URL settles it.
+    ("config.test holds the fixture", False, "bare fixture filename"),
+    ("`config.test`", False, "bare fixture filename in backticks"),
+    ("https://config.test/path", True, "reserved TLD used as a real host"),
+    # Both spellings on one line: "in a URL" is decided per occurrence, not per line.
+    ("`config.test` is a file; https://config.test/x is a host", True, "URL wins on its own"),
 ]
 
 
@@ -103,8 +120,32 @@ class TestPublishedContentScan(unittest.TestCase):
         self.assertTrue(validate.scan_published_content())
 
     def test_the_validator_itself_is_exempt(self):
-        # It has to name the patterns it looks for.
-        self.assertEqual(validate.scan_published_content(), [])
+        """The exemption is the one rule that lets a file bypass the gate, so it is
+        pinned with real files — and with a decoy that must NOT inherit it."""
+        internal_host = "wiki." + "internal"
+        line = f"see https://{internal_host}/page\n"
+
+        scripts_dir = self.root / "scripts"
+        scripts_dir.mkdir()
+        (scripts_dir / "validate.py").write_text(line, encoding="utf-8")
+        (scripts_dir / "test_validate.py").write_text(line, encoding="utf-8")
+        # Same names, different directory: the exemption must not follow the name alone.
+        decoy_dir = self.root / "plugins" / "demo" / "scripts"
+        decoy_dir.mkdir(parents=True)
+        (decoy_dir / "validate.py").write_text(line, encoding="utf-8")
+
+        # The exemption is anchored to the real scripts/ directory, so point it at ours.
+        with mock.patch.object(validate, "__file__", str(scripts_dir / "validate.py")):
+            errors = validate.scan_published_content()
+
+        flagged = {e.split(":")[0] for e in errors}
+        self.assertNotIn("scripts/validate.py", flagged, "the checker must be exempt")
+        self.assertNotIn("scripts/test_validate.py", flagged, "its tests must be exempt")
+        self.assertIn(
+            "plugins/demo/scripts/validate.py",
+            flagged,
+            "a file that merely shares the name must still be scanned",
+        )
 
 
 class TestPlausibleTld(unittest.TestCase):
