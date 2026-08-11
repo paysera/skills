@@ -367,6 +367,10 @@ pcurl() {  # pcurl <url> [curl args...] — sends the PAT via stdin, not argv
   printf 'header = "Authorization: Bearer %s"\n' "$(cat ~/.config/paysera-payments/token)" |
     curl -sS -K - "$@"
 }
+# `printf` must be the SHELL BUILTIN — it is in bash, dash and zsh. The token is an
+# argument to it, so if it resolved to /usr/bin/printf a real process would be started
+# with the token in its argv, which is the exact exposure this avoids. Do not substitute
+# /usr/bin/printf, and do not put the token in a `curl` argument.
 
 # read one transfer (status moves to e.g. "signed"/"done" after you sign in the app)
 pcurl "https://api.paysera.com/public/transfer/rest/v1/transfers/{transferHash}"

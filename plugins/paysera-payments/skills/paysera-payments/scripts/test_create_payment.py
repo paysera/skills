@@ -766,6 +766,46 @@ class TestCommandLineValidation(unittest.TestCase):
         self.assertNotEqual(out.returncode, 0)
         self.assertIn("invalid choice", out.stderr)
 
+    def test_placeholder_account_label_is_refused(self):
+        # Without --payer-name the shipped label would reach the beneficiary.
+        env_free = [
+            sys.executable,
+            str(SCRIPTS / "create-payment.py"),
+            "--payer", "EVP0000000000001",
+            "--beneficiary-name", "Acme UAB",
+            "--iban", "LT121000011101001000",
+            "--purpose", "test",
+            "--amount", "12.34",
+        ]
+        env = dict(os.environ, PATH=self.bin + os.pathsep + os.environ["PATH"],
+                   HOME=self.tmp, PAYSERA_PAT="test-token")
+        out = subprocess.run(env_free, capture_output=True, text=True, env=env, timeout=60)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("placeholder", out.stdout + out.stderr)
+
+    def test_an_explicit_payer_name_is_never_second_guessed(self):
+        # A real company may legitimately be called "Example ..."; the guard is about the
+        # unedited config label, not about a name the operator typed deliberately.
+        out = self.run_script("--amount", "12.34", "--payer-name", "Example Holdings, UAB")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("DRY-RUN", out.stdout)
+
+    def test_configuration_errors_are_reported_before_any_request(self):
+        # A cross-border run with no --beneficiary-type must fail without spending the
+        # duplicate check's network calls first.
+        self.write_stub('echo "$@" >> %s/calls.log; printf \'{"items":[]}\\nHTTP:200\''
+                        % self.tmp)
+        out = self.run_script(
+            "--amount", "50.00", "--invoice-id", "INV-INTL",
+            "--iban", "UA213223130000026007233566001",
+        )
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("--beneficiary-type is required", out.stdout + out.stderr)
+        self.assertFalse(
+            os.path.exists(os.path.join(self.tmp, "calls.log")),
+            "no request should be made before a known-bad configuration is rejected",
+        )
+
     def test_force_announces_that_the_duplicate_check_was_skipped(self):
         out = self.run_script("--amount", "12.34", "--invoice-id", "INV-X", "--force")
         self.assertIn("--force", out.stderr)

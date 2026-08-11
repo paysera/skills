@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.6.1 (2026-08-11)
+
+Fourth review round.
+
+- The published-content scan exempted any hostname wrapped in backticks — which is how
+  this repository normally writes hostnames, so the most likely spelling of a leaked
+  internal host was the one spelling the gate passed over. The exemption is gone; a dotted
+  name is now judged by whether its last label can be a TLD, which covers the code-path
+  false positives without creating a hole. CONTRIBUTING.md says so explicitly.
+- The publication gate now has its own tests (`scripts/test_validate.py`), table-driven
+  over what must and must not be flagged, and CI runs them. Reinstating the backtick
+  exemption fails five of them.
+- The placeholder-payer-name guard no longer applies to a name the operator passed
+  explicitly: a company legitimately called "Example ..." could not pay at all, and the
+  error told them to do the thing they had already done.
+- The placeholder and cross-border checks now run BEFORE the duplicate check, so a
+  configuration error is reported without first spending a round of network requests.
+- SKILL.md notes that `printf` in the `pcurl` helper must be the shell builtin: the token
+  is an argument to it, so `/usr/bin/printf` would put the token back into a process's argv.
+
 ## 1.6.0 (2026-08-11)
 
 Final review round.

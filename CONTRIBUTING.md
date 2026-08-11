@@ -29,8 +29,11 @@ repository (not just `plugins/`) and fails on:
 - a `paysera.*` hostname that is not on its allowlist of public hosts, wherever it appears;
 - a hostname containing `intranet`/`internal`, or ending in `.local`, `.lan`, `.corp`,
   `.localdomain`, `.home`, `.test`, `.invalid` — but only where the token is genuinely
-  used as a host. Import paths (`pkg.internal.helpers`), filenames (`internal.md`) and
-  file paths (`app/config.test`) are not flagged;
+  used as a host. Not flagged: import paths (`pkg.internal.helpers`), filenames
+  (`internal.md`), file paths (`app/config.test`), dotted calls, and any dotted name whose
+  last label cannot be a TLD. **Backticks are not an exemption** — a hostname in backticks
+  is checked exactly as a bare one is, because backticks are how this repository normally
+  writes hostnames;
 - a URL that looks like an issue tracker or forge link (`/browse/KEY-123`, `/jira/`,
   `/confluence/`, `/-/merge_requests/`).
 
@@ -39,6 +42,10 @@ written in prose, an internal tool referred to by name, an internal wiki link on
 it does not recognise, a real account number that looks like a placeholder, or a ticket key
 in a commit message. A human reviewer must check those, and must state in the pull request
 that they did.
+
+The gate has its own tests in `scripts/test_validate.py`, table-driven over the samples it
+must flag and the samples it must not. Add to that table whenever you change the rules —
+every exemption is a hole until a test says otherwise.
 
 Internal tooling stays in the internal repository. This repository is not a mirror of it —
 skills are added here deliberately, one at a time.
@@ -64,15 +71,15 @@ skills are added here deliberately, one at a time.
 The same commands CI runs on every pull request:
 
 ```bash
-python3 scripts/validate.py     # manifests, skill frontmatter, published-content scan
-python3 -m pytest plugins -q    # the skill tests
+python3 scripts/validate.py             # manifests, frontmatter, published-content scan
+python3 -m pytest plugins scripts -q    # the skill tests AND the publication gate's own
 ```
 
 The tests are plain `unittest`, so they also run without pytest installed — which is how
 CI double-checks them:
 
 ```bash
-for t in $(find plugins -name 'test_*.py'); do python3 "$t"; done
+for t in $(find plugins scripts -name 'test_*.py'); do python3 "$t"; done
 ```
 
 Tests are **required** for anything that moves money or decides whether a payment is a

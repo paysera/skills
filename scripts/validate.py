@@ -41,6 +41,12 @@ PUBLIC_PAYSERA_HOSTS = frozenset(
 INTERNAL_HOST_LABEL = re.compile(r"(?:^|\.)(?:intranet|internal)(?:\.|$)", re.IGNORECASE)
 # ... and these only as the final label, where they are non-routable by convention.
 INTERNAL_HOST_TLD = re.compile(r"\.(?:local|lan|corp|localdomain|home|test|invalid)$", re.IGNORECASE)
+COMMON_GTLDS = frozenset(
+    {
+        "com", "net", "org", "info", "biz", "edu", "gov", "mil", "int",
+        "app", "dev", "io", "ai", "cloud", "online", "site", "tech", "xyz",
+    }
+)
 # Links into an issue tracker or source forge: the host allowlist would miss these when
 # they live on a non-Paysera domain.
 TRACKER_URL = re.compile(
@@ -145,17 +151,18 @@ def looks_like_prose(line, match):
     The host patterns below use words that occur naturally in source and documentation, so
     without this a contributor gets a CI failure that names the wrong cause.
     """
+    token = match.group(0)
     before = line[: match.start()]
     after = line[match.end() :]
-    # Wrapped in backticks: inline code or a filename in documentation. A genuine internal
-    # link is written as a URL and is matched by the in_url branch instead.
-    if before.endswith("`") and after.startswith("`"):
-        return True
+    # NOTE: there is deliberately no "wrapped in backticks" rule. Backticks are how this
+    # repository writes hostnames (`bank.paysera.com`, `api.paysera.com`), so exempting
+    # them would skip the most likely spelling of a leaked internal host.
+    #
     # A module path in an import statement.
     if re.match(r"\s*(?:from|import)\s", line):
         return True
     # A filename: the final label is a known extension.
-    if re.search(r"\.(?:md|py|json|ya?ml|txt|cfg|ini|toml|sh|lock)\Z", match.group(0), re.I):
+    if re.search(r"\.(?:md|py|json|ya?ml|txt|cfg|ini|toml|sh|lock)\Z", token, re.I):
         return True
     # A filesystem path, or an attribute chain hanging off something.
     if before.endswith(("/", "\\")) or re.search(r"[\w)\]]\Z", before):
@@ -163,17 +170,36 @@ def looks_like_prose(line, match):
     # A dotted name continuing into a call or subscript.
     if re.match(r"\s*[(\[]", after):
         return True
+    # A dotted name whose last label cannot be a TLD is a code path, not a host:
+    # `pkg.internal.helpers` ends in "helpers"; `wiki.internal` and `paysera.intranet.lt`
+    # end in something a host can really end with.
+    if not is_plausible_tld(token.rsplit(".", 1)[-1]):
+        return True
     return False
 
 
-def scan_published_content():
-    """Flag internal references in anything this repository publishes.
+def is_plausible_tld(label):
+    """True if `label` could end a real hostname."""
+    label = label.lower()
+    if INTERNAL_HOST_TLD.search("." + label) or label in {"internal", "intranet"}:
+        return True
+    # Every ccTLD is two letters; beyond those, a short allowlist of the gTLDs that
+    # plausibly appear here. An unknown long label means "not a hostname".
+    return len(label) == 2 or label in COMMON_GTLDS
 
-    This file is itself exempt: it has to name the patterns it looks for.
-    """
+
+# The checker and its tests are exempt: both have to name the patterns they look for, and
+# the test file's sample table deliberately contains internal hostnames. Nothing else in
+# the repository is exempt — in particular there is no way for ordinary content to opt out.
+SELF_EXEMPT = {"validate.py", "test_validate.py"}
+
+
+def scan_published_content():
+    """Flag internal references in anything this repository publishes."""
     errors = []
+    here = Path(__file__).resolve().parent
     for path in published_files():
-        if path.resolve() == Path(__file__).resolve():
+        if path.name in SELF_EXEMPT and path.resolve().parent == here:
             continue
         rel = path.relative_to(ROOT)
         for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):

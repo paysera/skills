@@ -1134,6 +1134,54 @@ def main():
     args.iban = chosen_iban
     args.also_iban = other_ibans
 
+    # --- Configuration checks -------------------------------------------------------
+    # These need no network, so they run BEFORE the duplicate check. Otherwise a missing
+    # --beneficiary-type would first pay for a full round of dup-check requests (and any
+    # warnings they print) before failing on something known up front.
+    payer_name = args.payer_name or ALLOWED_ACCOUNTS[payer]
+    # The shipped ALLOWED_ACCOUNTS labels are placeholders, and the label becomes the payer
+    # NAME the beneficiary sees — an unedited config would send a transfer from
+    # "Company A (example — replace me)". Only the LABEL is checked: an explicit
+    # --payer-name is a deliberate choice, and a company really can be called "Example Ltd".
+    if not args.payer_name and re.search(r"example|replace me", ALLOWED_ACCOUNTS[payer], re.I):
+        sys.exit(
+            f"ERROR: the ALLOWED_ACCOUNTS label for {payer} is still the placeholder "
+            f"{ALLOWED_ACCOUNTS[payer]!r}. The beneficiary would see it as the payer name.\n"
+            f"  Set a real label in ALLOWED_ACCOUNTS, or pass --payer-name."
+        )
+
+    # Recipient country (ISO-2) from the BIC (chars 5-6, reliable for non-IBAN accounts
+    # too) or the IBAN prefix. Drives the address.country field and SEPA-vs-international
+    # routing further down.
+    benef_country = beneficiary_country(args.iban, args.beneficiary_bic)
+    is_international = bool(benef_country) and benef_country != "LT"
+    is_sepa_zone = benef_country is None or benef_country in SEPA_COUNTRIES
+
+    if is_international and not args.beneficiary_type:
+        sys.exit(
+            f"ERROR: beneficiary is in {benef_country} (cross-border), so "
+            f"--beneficiary-type is required.\n"
+            f"  Pass 'legal' for a company or 'natural' for a private person — it goes on "
+            f"the regulated payment message and must not be guessed."
+        )
+    if not is_sepa_zone:
+        missing = [
+            flag
+            for flag, value in [
+                ("--beneficiary-bic", args.beneficiary_bic),
+                ("--beneficiary-address", args.beneficiary_address),
+                ("--beneficiary-city", args.beneficiary_city),
+            ]
+            if not value
+        ]
+        if missing:
+            sys.exit(
+                f"ERROR: {benef_country} is outside the SEPA zone, so this is an "
+                f"international wire and the API requires: {', '.join(missing)}.\n"
+                f"  Without them the transfer is rejected with a 'mapper_*_not_set' error "
+                f"after it is sent."
+            )
+
     # --- Idempotency: refuse to double-pay the same invoice ---
     candidate_ibans = [args.iban] + list(args.also_iban or [])
     if args.invoice_id and not args.force:
@@ -1178,51 +1226,6 @@ def main():
 
     perform_at, mode = compute_schedule(args)
 
-    payer_name = args.payer_name or ALLOWED_ACCOUNTS[payer]
-    # The shipped ALLOWED_ACCOUNTS labels are placeholders. The label becomes the payer
-    # NAME the beneficiary sees, so sending one means a real transfer arrives from
-    # "Company A (example — replace me)".
-    if re.search(r"example|replace me", payer_name, re.I):
-        sys.exit(
-            f"ERROR: the payer name for {payer} is still the placeholder label "
-            f"{payer_name!r}. The beneficiary would see it on the transfer.\n"
-            f"  Set a real label in ALLOWED_ACCOUNTS, or pass --payer-name."
-        )
-
-    # Recipient country (ISO-2) from the BIC (chars 5-6, reliable for non-IBAN
-    # accounts too) or the IBAN prefix. Drives both the address.country field and
-    # the SEPA-vs-international routing below.
-    benef_country = beneficiary_country(args.iban, args.beneficiary_bic)
-    is_international = bool(benef_country) and benef_country != "LT"
-    is_sepa_zone = benef_country is None or benef_country in SEPA_COUNTRIES
-
-    # Pre-flight the fields the API demands for a cross-border transfer, instead of
-    # letting a clean dry-run turn into a 'mapper_*_not_set' rejection the operator has
-    # to decode. Checked here so it fails BEFORE anything is sent.
-    if is_international and not args.beneficiary_type:
-        sys.exit(
-            f"ERROR: beneficiary is in {benef_country} (cross-border), so "
-            f"--beneficiary-type is required.\n"
-            f"  Pass 'legal' for a company or 'natural' for a private person — it goes on "
-            f"the regulated payment message and must not be guessed."
-        )
-    if not is_sepa_zone:
-        missing = [
-            flag
-            for flag, value in [
-                ("--beneficiary-bic", args.beneficiary_bic),
-                ("--beneficiary-address", args.beneficiary_address),
-                ("--beneficiary-city", args.beneficiary_city),
-            ]
-            if not value
-        ]
-        if missing:
-            sys.exit(
-                f"ERROR: {benef_country} is outside the SEPA zone, so this is an "
-                f"international wire and the API requires: {', '.join(missing)}.\n"
-                f"  Without them the transfer is rejected with a 'mapper_*_not_set' error "
-                f"after it is sent."
-            )
     # A real IBAN goes in bank_account.iban; a non-IBAN national account number (e.g.
     # Armenia "2050…") goes in bank_account_number (the API rejects it as iban).
     acct = (args.iban or "").replace(" ", "").upper()

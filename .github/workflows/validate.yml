@@ -50,7 +50,7 @@ jobs:
         # pass. A green pipeline must not be reachable by losing the tests.
         run: |
           pip install pytest
-          pytest plugins -q -p no:randomly
+          pytest plugins scripts -q -p no:randomly
 
       - name: Run the same tests without pytest
         # Not a duplicate of the step above: this proves the suite needs no third-party
@@ -58,7 +58,7 @@ jobs:
         # the test files disappear entirely.
         run: |
           found=0
-          for t in $(find plugins -name 'test_*.py' | sort); do
+          for t in $(find plugins scripts -name 'test_*.py' | sort); do
             echo "--- $t"
             python3 "$t" || exit 1
             found=$((found + 1))
