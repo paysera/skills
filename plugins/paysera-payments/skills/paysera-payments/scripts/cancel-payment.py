@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -33,6 +34,12 @@ HTTP_TIMEOUT = 30  # seconds per request — an unanswered API must not hang the
 # States in which a transfer is still live and unsigned, so DELETE can remove it.
 # This is the authoritative list; SKILL.md points here rather than repeating it.
 CANCELABLE_STATES = {"new", "reserved", "registered", "waiting_funds", "signing"}
+
+
+# A transferHash is an opaque alphanumeric id. The character class is the point: it keeps
+# slashes, dot-segments and query characters out of the URL path we build. The length
+# bound is only a sanity cap — no minimum is imposed, since the API defines the format.
+TRANSFER_HASH = re.compile(r"\A[A-Za-z0-9_-]{1,128}\Z")
 
 
 class HttpError(RuntimeError):
@@ -105,6 +112,10 @@ def main():
     token = read_token(args.token_file)
     rc = 0
     for h in args.hashes:
+        if not TRANSFER_HASH.match(h):
+            print(f"{h!r}: not a valid transferHash (expected only A-Z a-z 0-9 _ -). Skipping.")
+            rc = 1
+            continue
         try:
             http, doc = curl_json("GET", f"{TRANSFER_API}/{h}", token)
         except HttpError as e:

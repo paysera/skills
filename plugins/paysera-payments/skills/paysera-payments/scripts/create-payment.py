@@ -277,6 +277,30 @@ def _validate_token(token):
     return token
 
 
+ADDRESS_MAX = 70  # the API rejects longer with 'mapper_beneficiary_address_too_long'
+
+
+def _clip_address(text, limit=ADDRESS_MAX):
+    """Trim the beneficiary address line, saying what was lost.
+
+    Same rule as _clip_purpose: an address that quietly loses its city, postcode or
+    country can get an international wire refused, so the operator has to be told.
+    """
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    kept = text[:limit].rstrip()
+    print(
+        f"WARNING: beneficiary address is {len(text)} chars, over the {limit}-char limit "
+        f"— trimmed to {len(kept)}.\n"
+        f"         DROPPED: {text[len(kept):].strip()!r}\n"
+        f"         If that held the city, postcode or country, the transfer may be "
+        f"refused. Shorten --beneficiary-address yourself.",
+        file=sys.stderr,
+    )
+    return kept
+
+
 def read_token(path):
     tok = os.environ.get("PAYSERA_PAT")
     if tok:
@@ -537,7 +561,9 @@ def _purpose_quotes_invoice(purpose, invoice_id):
     return re.search(rf"(?<![0-9A-Za-z]){re.escape(inv)}(?![0-9A-Za-z])", purpose or "", re.I) is not None
 
 
-def find_blocking(invoice_id, token, payer=None, ibans=None, amount=None, invoice_date=None):
+def find_blocking(
+    invoice_id, token, payer=None, ibans=None, amount=None, invoice_date=None, currency=None
+):
     """Return (blocking, seen_to_ibans).
 
     `blocking` = [(hash, status, source)] that block re-creating a payment for this
@@ -627,12 +653,23 @@ def find_blocking(invoice_id, token, payer=None, ibans=None, amount=None, invoic
             h = t.get("id")
             seen_to_ibans.append((h, t.get("status"), t_amt, t_iban, purpose))
             # Block if amount matches OR the invoice id is quoted in the purpose.
+            # The amount must match in the SAME currency — 100.00 USD is not a duplicate
+            # of 100.00 EUR.
+            t_ccy = (
+                ((t.get("amount") or {}).get("currency") or "")
+                if isinstance(t.get("amount"), dict)
+                else ""
+            )
             amount_match = False
             if amount is not None and t_amt is not None:
                 try:
-                    amount_match = Decimal(str(t_amt)) == Decimal(str(amount))
+                    same_amount = Decimal(str(t_amt)) == Decimal(str(amount))
                 except InvalidOperation:
-                    amount_match = False
+                    same_amount = False
+                # An absent currency on either side is treated as "cannot rule it out",
+                # keeping the check fail-safe rather than fail-open.
+                same_currency = not currency or not t_ccy or t_ccy.upper() == currency.upper()
+                amount_match = same_amount and same_currency
             id_match = _purpose_quotes_invoice(purpose, invoice_id)
             if (
                 h
@@ -667,6 +704,16 @@ def _end_of_today_epoch():
     return epoch if epoch > now + 600 else None
 
 
+def _vilnius_midnight_epoch():
+    """Epoch of the next Vilnius midnight — the boundary that moves operation_date."""
+    tomorrow = _vilnius_today() + datetime.timedelta(days=1)
+    return int(
+        datetime.datetime(
+            tomorrow.year, tomorrow.month, tomorrow.day, tzinfo=_VILNIUS
+        ).timestamp()
+    )
+
+
 def parse_perform_at(spec):
     """Resolve --perform-at to a FUTURE epoch — SAME-DAY allowed.
 
@@ -699,6 +746,16 @@ def parse_perform_at(spec):
                     file=sys.stderr,
                 )
                 epoch = end_today
+            elif end_today is None and epoch > _vilnius_midnight_epoch():
+                # No same-day window left to clamp to, so the deadline genuinely falls
+                # tomorrow. Say so instead of silently changing where it can be signed.
+                print(
+                    f"NOTE: it is nearly midnight in Vilnius, so {spec} lands tomorrow — "
+                    f"operation_date moves to the next day and the transfer will be "
+                    f"signable in the WEB BANK ONLY, not the mobile app. Use --advance to "
+                    f"sign right now instead.",
+                    file=sys.stderr,
+                )
     else:
         try:
             d = datetime.datetime.strptime(spec, "%Y-%m-%d").date()
@@ -974,6 +1031,14 @@ def main():
         "transfers are instant and free) — the chosen IBAN is always printed. Pass every "
         "account printed on the invoice, in invoice order.",
     )
+    ap.add_argument(
+        "--beneficiary-type",
+        choices=["natural", "legal"],
+        default=None,
+        help="Is the beneficiary a private person ('natural') or a company ('legal')? "
+        "Goes on the regulated payment message for cross-border transfers, so it is NOT "
+        "guessed — required whenever the beneficiary is outside Lithuania.",
+    )
     ap.add_argument("--amount", required=True, help="Decimal string, e.g. 12.34")
     ap.add_argument("--currency", default="EUR", help="ISO currency (default EUR)")
     ap.add_argument("--purpose", required=True, help="Payment purpose / details")
@@ -1079,6 +1144,7 @@ def main():
             ibans=candidate_ibans,
             amount=args.amount,
             invoice_date=args.invoice_date,
+            currency=currency,
         )
         # Show EVERY payment to any candidate IBAN in the period, for human review.
         period = f"since {args.invoice_date}" if args.invoice_date else "(full account history)"
@@ -1113,11 +1179,50 @@ def main():
     perform_at, mode = compute_schedule(args)
 
     payer_name = args.payer_name or ALLOWED_ACCOUNTS[payer]
+    # The shipped ALLOWED_ACCOUNTS labels are placeholders. The label becomes the payer
+    # NAME the beneficiary sees, so sending one means a real transfer arrives from
+    # "Company A (example — replace me)".
+    if re.search(r"example|replace me", payer_name, re.I):
+        sys.exit(
+            f"ERROR: the payer name for {payer} is still the placeholder label "
+            f"{payer_name!r}. The beneficiary would see it on the transfer.\n"
+            f"  Set a real label in ALLOWED_ACCOUNTS, or pass --payer-name."
+        )
 
     # Recipient country (ISO-2) from the BIC (chars 5-6, reliable for non-IBAN
     # accounts too) or the IBAN prefix. Drives both the address.country field and
     # the SEPA-vs-international routing below.
     benef_country = beneficiary_country(args.iban, args.beneficiary_bic)
+    is_international = bool(benef_country) and benef_country != "LT"
+    is_sepa_zone = benef_country is None or benef_country in SEPA_COUNTRIES
+
+    # Pre-flight the fields the API demands for a cross-border transfer, instead of
+    # letting a clean dry-run turn into a 'mapper_*_not_set' rejection the operator has
+    # to decode. Checked here so it fails BEFORE anything is sent.
+    if is_international and not args.beneficiary_type:
+        sys.exit(
+            f"ERROR: beneficiary is in {benef_country} (cross-border), so "
+            f"--beneficiary-type is required.\n"
+            f"  Pass 'legal' for a company or 'natural' for a private person — it goes on "
+            f"the regulated payment message and must not be guessed."
+        )
+    if not is_sepa_zone:
+        missing = [
+            flag
+            for flag, value in [
+                ("--beneficiary-bic", args.beneficiary_bic),
+                ("--beneficiary-address", args.beneficiary_address),
+                ("--beneficiary-city", args.beneficiary_city),
+            ]
+            if not value
+        ]
+        if missing:
+            sys.exit(
+                f"ERROR: {benef_country} is outside the SEPA zone, so this is an "
+                f"international wire and the API requires: {', '.join(missing)}.\n"
+                f"  Without them the transfer is rejected with a 'mapper_*_not_set' error "
+                f"after it is sent."
+            )
     # A real IBAN goes in bank_account.iban; a non-IBAN national account number (e.g.
     # Armenia "2050…") goes in bank_account_number (the API rejects it as iban).
     acct = (args.iban or "").replace(" ", "").upper()
@@ -1134,10 +1239,11 @@ def main():
     # The international mapper reads the recipient country from
     # beneficiary.additional_information.country (ISO 3166-1 alpha-2), per the Paysera
     # Transfers API spec — NOT from beneficiary.country or address.country. Without it
-    # a non-SEPA transfer fails 'mapper_beneficiary_country_not_set'. `type` = natural
-    # (these contractors are individuals / FOP).
+    # a non-SEPA transfer fails 'mapper_beneficiary_country_not_set'.
     if benef_country and benef_country != "LT":
-        addl = {"type": "natural", "country": benef_country}
+        # `type` declares the beneficiary as a private person or a company on a regulated
+        # payment message, so it is NOT guessable — the tool refuses rather than assume.
+        addl = {"type": args.beneficiary_type, "country": benef_country}
         if args.beneficiary_city:
             addl["city"] = args.beneficiary_city.strip()
         beneficiary["additional_information"] = addl
@@ -1148,8 +1254,9 @@ def main():
     if args.beneficiary_address:
         # Clip the address line — the API rejects long ones with
         # 'mapper_beneficiary_address_too_long' (SWIFT address lines are short). 70 is
-        # the safe single-line cap.
-        addr = {"address_line": args.beneficiary_address.strip()[:70].rstrip()}
+        # the safe single-line cap. Loud, like the purpose: a silently dropped city or
+        # postcode can get an international wire refused.
+        addr = {"address_line": _clip_address(args.beneficiary_address)}
         if benef_country:
             addr["country"] = benef_country
         beneficiary["address"] = addr
@@ -1183,7 +1290,7 @@ def main():
     # moment the transfer is signed (EUR SEPA Instant rail: bank=lt_lb_sepa_inst).
     # The instant rail only reaches SEPA-zone banks — a EUR transfer to a non-SEPA
     # country (UA/AM/GE/…) is a regular international SWIFT transfer, NOT instant.
-    is_sepa = benef_country is None or benef_country in SEPA_COUNTRIES
+    is_sepa = is_sepa_zone
     if args.priority == "urgent":
         instant = True
     elif args.priority == "normal":
@@ -1207,6 +1314,9 @@ def main():
             args.invoice_id,
             f"(issued {args.invoice_date})" if args.invoice_date else "",
         )
+    if is_international:
+        kind = "company (legal)" if args.beneficiary_type == "legal" else "private person (natural)"
+        print(f"Beneficiary: {benef_country}, declared as a {kind}")
     print("Priority:", "SEPA Instant (urgent)" if instant else "normal")
     print("Charge  :", payload["charge_type"], "(mobile app needs this set)")
     # Same-day if the perform_at timestamp lands on today's Vilnius date — drives whether the

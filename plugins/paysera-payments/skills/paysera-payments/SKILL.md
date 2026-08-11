@@ -43,10 +43,14 @@ Scopes on the token: `accounts:read`, `transfers:read`, `transfers:create`,
 - Created against the public Personal Access Token API, authenticated with a
   `bank.paysera.com` session bearer token (`$AUTH`):
 
+  The session token goes in on stdin, not in the command line (see "Checking a transfer
+  afterwards" for why):
+
   ```bash
-  curl -s -X POST \
+  printf 'header = "Authorization: Bearer %s"\n' "$AUTH" |
+  curl -sS -K - -X POST \
     "https://auth-api.paysera.com/personal-access-token/rest/v1/personal-access-tokens" \
-    -H "Authorization: Bearer $AUTH" -H "Content-Type: application/json" \
+    -H "Content-Type: application/json" \
     -d '{
       "name": "paysera-payments",
       "resources": [
@@ -65,7 +69,9 @@ Scopes on the token: `accounts:read`, `transfers:read`, `transfers:create`,
 ## Scoped accounts (payer must be one of these)
 
 The PAT is scoped to a fixed set of accounts. Configure them in `create-payment.py` →
-`ALLOWED_ACCOUNTS` (the `EVP…` account_number, NOT the IBAN). Example:
+`ALLOWED_ACCOUNTS` (the `EVP…` account_number, NOT the IBAN). **The label is the payer
+name the beneficiary sees on the transfer**, so replace the placeholder text too — the
+tool refuses to send a label still containing "example" or "replace me". Example:
 
 | account_number     | label                          |
 |--------------------|--------------------------------|
@@ -257,6 +263,18 @@ timed-out transfer is terminal and cannot be deleted (`DELETE` → 409); harmles
 > transfer is signed only in the **web bank** (bank.paysera.com → account → awaiting signature)
 > until its scheduled day.
 
+### Cross-border transfers
+
+A beneficiary outside Lithuania needs `--beneficiary-type`, which declares them on the
+regulated payment message as either a company (`legal`) or a private person (`natural`).
+The tool does **not** guess it — an invoice from a company must not go out declaring that
+company as a private individual. The chosen value is printed before the payload.
+
+Outside the SEPA zone entirely (UA, AM, GE, …) the API also requires
+`--beneficiary-bic`, `--beneficiary-address` and `--beneficiary-city`. The tool checks for
+them **before** sending, so you get a plain message instead of a `mapper_*_not_set`
+rejection after the fact.
+
 ## Idempotency — avoid double-paying an invoice
 
 Pass `--invoice-id <id>` (and optionally `--invoice-date YYYY-MM-DD`) when creating.
@@ -338,30 +356,41 @@ does the one DELETE operation.)
 
 The token also has `transfers:read` and `accounts:read`:
 
+**Pass the token on stdin, never in the command.** `-H "Authorization: Bearer $PAT"` puts
+your token in the process arguments, where any local user can read it with `ps auxww` or
+from `/proc/<pid>/cmdline`. curl reads a config file from stdin with `-K -`; a helper
+keeps that out of your way:
+
 ```bash
-PAT=$(cat ~/.config/paysera-payments/token)
+# Define once (add it to your shell profile if you use these often).
+pcurl() {  # pcurl <url> [curl args...] — sends the PAT via stdin, not argv
+  printf 'header = "Authorization: Bearer %s"\n' "$(cat ~/.config/paysera-payments/token)" |
+    curl -sS -K - "$@"
+}
+
 # read one transfer (status moves to e.g. "signed"/"done" after you sign in the app)
-curl -s "https://api.paysera.com/public/transfer/rest/v1/transfers/{transferHash}" \
-  -H "Authorization: Bearer $PAT"
+pcurl "https://api.paysera.com/public/transfer/rest/v1/transfers/{transferHash}"
+
 # list transfers with filters — ACCOUNTING semantics (verified 2026-07-08):
 #   credit_account_number = account is the PAYER (outgoing transfers)
 #   debit_account_number  = account is the BENEFICIARY (incoming transfers)
 # dates are Unix timestamps; also: created_date_to, status (status is ignored in practice)
-curl -s "https://api.paysera.com/public/transfer/rest/v1/transfers?credit_account_number={accountNumber}&created_date_from=1780261200" \
-  -H "Authorization: Bearer $PAT"
+pcurl "https://api.paysera.com/public/transfer/rest/v1/transfers?credit_account_number={accountNumber}&created_date_from=1780261200"
+
 # account balance
-curl -s "https://api.paysera.com/public/account/rest/v1/accounts/{accountNumber}/full-balance" \
-  -H "Authorization: Bearer $PAT"
+pcurl "https://api.paysera.com/public/account/rest/v1/accounts/{accountNumber}/full-balance"
 ```
 
 ## Revoking the token
 
 ```bash
 JTI=$(cat ~/.config/paysera-payments/jti.txt)
-# needs a fresh bank.paysera.com session bearer token ($AUTH):
-curl -s -X DELETE \
-  "https://auth-api.paysera.com/personal-access-token/rest/v1/personal-access-tokens/$JTI" \
-  -H "Authorization: Bearer $AUTH"
+# Needs a fresh bank.paysera.com session bearer token in $AUTH. That session token is
+# MORE powerful than the PAT (it is not scope-limited), so keeping it out of argv matters
+# even more here.
+printf 'header = "Authorization: Bearer %s"\n' "$AUTH" |
+  curl -sS -K - -X DELETE \
+    "https://auth-api.paysera.com/personal-access-token/rest/v1/personal-access-tokens/$JTI"
 ```
 
 ## Notes / gotchas

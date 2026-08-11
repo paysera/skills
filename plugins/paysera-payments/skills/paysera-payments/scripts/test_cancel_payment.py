@@ -85,6 +85,20 @@ class TestCancelableStates(unittest.TestCase):
             self.assertNotIn(state, cancel.CANCELABLE_STATES)
 
 
+class TestTransferHashValidation(unittest.TestCase):
+    """The hash goes straight into a URL path, so its shape is checked first."""
+
+    def test_accepts_realistic_hashes(self):
+        for good in ["H1", "abc123", "AB-cd_12", "a" * 128]:
+            with self.subTest(hash=good):
+                self.assertTrue(cancel.TRANSFER_HASH.match(good))
+
+    def test_rejects_path_and_query_characters(self):
+        for bad in ["../../admin", "a/b", "abc?x=1", "abc#frag", "a" * 129, "", "a b", "a%2Fb/c"]:
+            with self.subTest(hash=bad):
+                self.assertFalse(cancel.TRANSFER_HASH.match(bad))
+
+
 class TestCommandLine(unittest.TestCase):
     """Driven end to end with a stubbed curl, so the DELETE gate is tested for real."""
 
@@ -162,6 +176,12 @@ class TestCommandLine(unittest.TestCase):
         self.assertNotEqual(out.returncode, 0)
         self.assertNotIn("Traceback", out.stderr)
         self.assertIn("cannot read", out.stdout)
+
+    def test_a_malformed_hash_reaches_no_request(self):
+        self.write_stub('{"id":"H1","status":"new","amount":{"amount":"5.00","currency":"EUR"}}')
+        out = self.run_script("../../admin", "--confirm")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertEqual(self.calls(), [], "a malformed hash must not be sent anywhere")
 
     def test_multiple_hashes_are_all_processed(self):
         self.write_stub('{"id":"H1","status":"new","amount":{"amount":"5.00","currency":"EUR"}}')

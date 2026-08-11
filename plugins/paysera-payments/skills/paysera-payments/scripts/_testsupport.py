@@ -32,6 +32,11 @@ def frozen_clock(module, when):
 
     Both `datetime.datetime.now()` and `time.time()` are pinned, because the scheduling
     code cross-checks one against the other.
+
+    NOTE: the scripts call `datetime.datetime.now()` through the imported module, so this
+    patches the shared `datetime`/`time` modules for the whole process, not a script-local
+    alias. It is restored on exit, but it is NOT safe to run these tests in parallel
+    within one process (e.g. `pytest -n`). CI runs them serially for that reason.
     """
     real = module.datetime.datetime
 

@@ -18,6 +18,8 @@ SKIP_DIRS = {".git", "__pycache__", ".pytest_cache"}
 # This is an allowlist on purpose: naming the hosts that are *not* public would
 # put them in this repository, which is exactly what the check exists to prevent.
 HOSTNAME = re.compile(r"\b(?:[a-z0-9-]+\.)+[a-z]{2,}\b", re.IGNORECASE)
+# The host portion of an explicit URL — unambiguous, unlike a bare dotted token.
+URL_HOST = re.compile(r"https?://([a-z0-9.-]+)", re.IGNORECASE)
 PAYSERA_HOST = re.compile(r"(?:^|\.)paysera\.[a-z]{2,}$", re.IGNORECASE)
 PUBLIC_PAYSERA_HOSTS = frozenset(
     {
@@ -32,8 +34,9 @@ PUBLIC_PAYSERA_HOSTS = frozenset(
 
 # An allowlist keyed on "paysera.*" cannot see an internal host on some other domain, so
 # these patterns cover the shapes an internal link takes regardless of its domain. They
-# match HOSTNAMES only (never prose), so a sentence containing the word "internal" is
-# fine while a link to `wiki.internal` is not.
+# are applied only where a dotted token is really a hostname (see looks_like_prose), so
+# `from pkg.internal.helpers import x`, `internal.md` and `app/config.test` do not trip
+# them, while `https://wiki.internal/page` does.
 # "intranet"/"internal" anywhere in the name (paysera.intranet.lt, wiki.internal), ...
 INTERNAL_HOST_LABEL = re.compile(r"(?:^|\.)(?:intranet|internal)(?:\.|$)", re.IGNORECASE)
 # ... and these only as the final label, where they are non-routable by convention.
@@ -64,7 +67,15 @@ def validate() -> list:
     marketplace = json.loads((ROOT / ".claude-plugin/marketplace.json").read_text(encoding="utf-8"))
 
     listed = set()
-    for entry in marketplace["plugins"]:
+    for index, entry in enumerate(marketplace.get("plugins", [])):
+        # A missing key is a manifest error to report, not a traceback: this runs as a CI
+        # gate, and a KeyError tells a contributor nothing useful.
+        missing = [k for k in ("name", "source", "version", "description") if k not in entry]
+        if missing:
+            errors.append(
+                f"marketplace.json plugins[{index}]: missing {', '.join(missing)}"
+            )
+            continue
         name = entry["name"]
         listed.add(name)
         source = ROOT / entry["source"]
@@ -72,7 +83,16 @@ def validate() -> list:
             errors.append(f"{name}: source {entry['source']} does not exist")
             continue
 
-        manifest = json.loads((source / ".claude-plugin/plugin.json").read_text(encoding="utf-8"))
+        manifest_path = source / ".claude-plugin/plugin.json"
+        if not manifest_path.is_file():
+            errors.append(f"{name}: {manifest_path.relative_to(ROOT)} is missing")
+            continue
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest_missing = [k for k in ("name", "version", "description") if k not in manifest]
+        if manifest_missing:
+            errors.append(f"{name}: plugin.json missing {', '.join(manifest_missing)}")
+            continue
+
         if manifest["name"] != name:
             errors.append(f"{name}: plugin.json name is {manifest['name']!r}")
         if manifest["version"] != entry["version"]:
@@ -82,6 +102,13 @@ def validate() -> list:
             )
         if manifest["description"] != entry["description"]:
             errors.append(f"{name}: description differs between plugin.json and marketplace.json")
+        # Discovery metadata is duplicated across the two manifests; nothing else keeps
+        # them in step, so they drift silently.
+        if sorted(manifest.get("keywords", [])) != sorted(entry.get("tags", [])):
+            errors.append(
+                f"{name}: plugin.json keywords {sorted(manifest.get('keywords', []))} "
+                f"differ from marketplace.json tags {sorted(entry.get('tags', []))}"
+            )
 
         skills = sorted((source / "skills").glob("*/SKILL.md"))
         if not skills:
@@ -112,6 +139,33 @@ def published_files():
         yield path
 
 
+def looks_like_prose(line, match):
+    """True when a dotted token is code or a filename rather than a hostname.
+
+    The host patterns below use words that occur naturally in source and documentation, so
+    without this a contributor gets a CI failure that names the wrong cause.
+    """
+    before = line[: match.start()]
+    after = line[match.end() :]
+    # Wrapped in backticks: inline code or a filename in documentation. A genuine internal
+    # link is written as a URL and is matched by the in_url branch instead.
+    if before.endswith("`") and after.startswith("`"):
+        return True
+    # A module path in an import statement.
+    if re.match(r"\s*(?:from|import)\s", line):
+        return True
+    # A filename: the final label is a known extension.
+    if re.search(r"\.(?:md|py|json|ya?ml|txt|cfg|ini|toml|sh|lock)\Z", match.group(0), re.I):
+        return True
+    # A filesystem path, or an attribute chain hanging off something.
+    if before.endswith(("/", "\\")) or re.search(r"[\w)\]]\Z", before):
+        return True
+    # A dotted name continuing into a call or subscript.
+    if re.match(r"\s*[(\[]", after):
+        return True
+    return False
+
+
 def scan_published_content():
     """Flag internal references in anything this repository publishes.
 
@@ -123,18 +177,25 @@ def scan_published_content():
             continue
         rel = path.relative_to(ROOT)
         for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            for host in HOSTNAME.findall(line):
-                host = host.lower()
+            url_hosts = {h.lower() for h in URL_HOST.findall(line)}
+            for match in HOSTNAME.finditer(line):
+                host = match.group(0).lower()
+                in_url = host in url_hosts
                 if PAYSERA_HOST.search(host) and host not in PUBLIC_PAYSERA_HOSTS:
+                    # A Paysera hostname is unambiguous whether or not it sits in a URL.
                     errors.append(
                         f"{rel}:{number}: '{host}' is not a public Paysera host — "
                         f"published content may only reference "
                         f"{', '.join(sorted(PUBLIC_PAYSERA_HOSTS))}"
                     )
                 elif INTERNAL_HOST_LABEL.search(host) or INTERNAL_HOST_TLD.search(host):
-                    errors.append(
-                        f"{rel}:{number}: '{host}' looks like an internal-only hostname"
-                    )
+                    # These markers are ordinary words in code and prose ("internal.md",
+                    # `pkg.internal.helpers`, `config.test`), so only flag them where the
+                    # token is actually being used as a host.
+                    if in_url or not looks_like_prose(line, match):
+                        errors.append(
+                            f"{rel}:{number}: '{host}' looks like an internal-only hostname"
+                        )
             for url in TRACKER_URL.findall(line):
                 errors.append(
                     f"{rel}:{number}: '{url}' links into an issue tracker or forge — "

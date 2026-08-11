@@ -13,14 +13,15 @@
       "name": "paysera-payments",
       "source": "./plugins/paysera-payments",
       "description": "Create (draft) or cancel/delete a Paysera payment/transfer via the public Transfer API using a scoped Personal Access Token — the \"do a payment / pay this invoice\" action. Use when asked to create, cancel, or delete a payment, transfer, pavedimas, or mokėjimas on a configured Paysera account. Create is drafts-only — it does NOT sign/execute; signing happens in the Paysera app (2FA). Cancel/delete removes a live (unsigned) draft. Keywords — payment, transfer, pavedimas, mokėjimas, SEPA, invoice. Do NOT use for — diagnosing why an existing payment failed or is stuck, or handling a support ticket about one; contact Paysera support instead.",
-      "version": "1.5.1",
+      "version": "1.6.0",
       "category": "payments",
       "tags": [
         "payments",
         "transfers",
         "banking",
         "sepa",
-        "invoices"
+        "invoices",
+        "paysera"
       ],
       "author": {
         "name": "Paysera",

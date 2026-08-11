@@ -1,5 +1,45 @@
 # Changelog
 
+## 1.6.0 (2026-08-11)
+
+Final review round.
+
+**Documentation taught the insecure pattern**
+- Every `curl` example in SKILL.md put the token in `-H "Authorization: Bearer ..."` —
+  exactly the argv exposure the scripts were fixed to avoid in 1.4.0. Two of them used the
+  `bank.paysera.com` session token, which is not scope-limited and is more dangerous than
+  the PAT. All now pass the token on stdin, and the slash command tells the agent the same.
+
+**Cross-border transfers**
+- Every non-Lithuanian beneficiary was declared to the API as a **natural person**,
+  hard-coded. A transfer to a foreign company therefore misdeclared it on a regulated
+  payment message. Added `--beneficiary-type natural|legal`, required for cross-border
+  transfers and never guessed; the value is printed before the payload.
+- Non-SEPA transfers now check for `--beneficiary-bic`, `--beneficiary-address` and
+  `--beneficiary-city` before sending, instead of failing afterwards on a `mapper_*` error.
+- The beneficiary address is no longer trimmed silently — a dropped city or postcode can
+  get an international wire refused.
+
+**Other correctness**
+- The tool refuses to send a placeholder account label as the payer name; the label is what
+  the beneficiary sees, so an unedited config would have shown "example — replace me".
+- The duplicate amount match now compares currency too: 100.00 USD is not a duplicate of
+  100.00 EUR.
+- `--perform-at +Nh` in the last minutes before midnight can no longer change where the
+  transfer is signable without saying so.
+- `cancel-payment.py` validates the transferHash shape before putting it in a URL path.
+
+**Checks and tests**
+- The published-content scan no longer flags import paths, filenames or file paths that
+  merely contain `internal`/`test`; CONTRIBUTING.md describes the real behaviour.
+- The validator reports an incomplete manifest as an error instead of a `KeyError`, and
+  now catches `tags`/`keywords` drift between the two manifests (which had already drifted).
+- Tests added for the write-ahead ledger ORDER (the 1.5.0 fix, previously unpinned —
+  removing it now fails 4 tests), `resolve_payer()`'s refusal paths, `list_transfers()`
+  direction and pagination, the timezone fallback itself, and address clipping.
+- CI runs the suite on Python 3.8 as well as 3.11; 3.8 is the claimed minimum and the only
+  configuration where the built-in timezone fallback is exercised.
+
 ## 1.5.1 (2026-08-11)
 - Added a test suite for both scripts (89 tests): the Vilnius day boundary and every
   scheduling path, beneficiary IBAN selection, invoice-id matching, purpose clipping,

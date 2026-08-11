@@ -7,6 +7,7 @@ transfer is signable on a phone, beneficiary selection, and the duplicate-match 
 
 from __future__ import annotations
 
+import argparse
 import datetime
 import json
 import os
@@ -49,14 +50,76 @@ class TestVilniusTimezone(unittest.TestCase):
                 offset = vilnius(*date, 12).utcoffset()
                 self.assertEqual(offset, datetime.timedelta(hours=expected_hours))
 
-    def test_never_falls_back_to_utc(self):
-        # The bug this replaced: _VILNIUS = None meant UTC, a 2-3 hour error.
-        self.assertIsNotNone(cp._VILNIUS)
-        self.assertNotEqual(vilnius(2026, 8, 10, 12).utcoffset(), datetime.timedelta(0))
-
     def test_tzname_matches_offset(self):
         self.assertEqual(vilnius(2026, 8, 10, 12).tzname(), "EEST")
         self.assertEqual(vilnius(2026, 1, 15, 12).tzname(), "EET")
+
+
+class TestVilniusFallback(unittest.TestCase):
+    """The project's OWN timezone rule, tested directly.
+
+    `_VILNIUS` is `ZoneInfo` wherever tzdata exists, so on a modern CI image the tests
+    above exercise Python's tz database rather than this code. These build the fallback
+    explicitly, so the rule is covered on every interpreter.
+    """
+
+    def setUp(self):
+        self.tz = cp._VilniusFallback()
+
+    def test_offsets_across_transitions(self):
+        for date, expected_hours in [
+            ((2026, 1, 15), 2),
+            ((2026, 3, 28), 2),
+            ((2026, 3, 30), 3),
+            ((2026, 8, 10), 3),
+            ((2026, 10, 24), 3),
+            ((2026, 10, 26), 2),
+        ]:
+            with self.subTest(date=date):
+                moment = datetime.datetime(*date, 12, tzinfo=self.tz)
+                self.assertEqual(moment.utcoffset(), datetime.timedelta(hours=expected_hours))
+
+    def test_last_sunday_matches_the_eu_rule(self):
+        # Independently checkable: the EU switches on the last Sunday of March/October.
+        for year, march, october in [
+            (2024, 31, 27),
+            (2025, 30, 26),
+            (2026, 29, 25),
+            (2027, 28, 31),
+        ]:
+            with self.subTest(year=year):
+                self.assertEqual(cp._VilniusFallback._last_sunday(year, 3).day, march)
+                self.assertEqual(cp._VilniusFallback._last_sunday(year, 10).day, october)
+                self.assertEqual(cp._VilniusFallback._last_sunday(year, 3).weekday(), 6)
+
+    def test_never_behaves_like_utc(self):
+        # The bug this replaced: no tzdata meant plain UTC, a 2-3 hour error that moved
+        # the day boundary and hid transfers from the mobile app.
+        for month in (1, 8):
+            with self.subTest(month=month):
+                moment = datetime.datetime(2026, month, 15, 12, tzinfo=self.tz)
+                self.assertNotEqual(moment.utcoffset(), datetime.timedelta(0))
+
+    def test_agrees_with_zoneinfo_when_zoneinfo_is_available(self):
+        try:
+            from zoneinfo import ZoneInfo
+
+            real = ZoneInfo("Europe/Vilnius")
+        except Exception:  # pragma: no cover - depends on the host having tzdata
+            self.skipTest("no tzdata on this interpreter")
+        for month in range(1, 13):
+            for day in (1, 15, 28):
+                with self.subTest(month=month, day=day):
+                    naive = datetime.datetime(2026, month, day, 12)
+                    self.assertEqual(
+                        naive.replace(tzinfo=self.tz).utcoffset(),
+                        naive.replace(tzinfo=real).utcoffset(),
+                    )
+
+    def test_the_module_reports_which_implementation_is_in_use(self):
+        self.assertIsInstance(cp._VILNIUS_IS_FALLBACK, bool)
+        if cp._VILNIUS_IS_FALLBACK:
+            self.assertIsInstance(cp._VILNIUS, cp._VilniusFallback)
 
 
 class TestSameDayWindow(unittest.TestCase):
@@ -133,9 +196,17 @@ class TestParsePerformAt(unittest.TestCase):
 
 class TestComputeSchedule(unittest.TestCase):
     def _args(self, **over):
+        # argparse.Namespace, not mock.Mock: a Mock invents truthy attributes on demand,
+        # so a newly added option would silently read as set and every test here would
+        # follow the new branch while still passing.
         base = dict(perform_at=None, advance=False, today=False, due_date=None, invoice_id=None)
         base.update(over)
-        return mock.Mock(**base)
+        return argparse.Namespace(**base)
+
+    def test_namespace_rejects_unknown_options(self):
+        # Guards the guard: proves _args() has no Mock-style auto-attributes.
+        with self.assertRaises(AttributeError):
+            self._args().some_option_that_does_not_exist
 
     def test_no_invoice_id_defaults_to_today(self):
         with frozen_clock(cp, vilnius(2026, 8, 10, 9, 0)):
@@ -250,8 +321,19 @@ class TestPurposeClipping(unittest.TestCase):
         self.assertTrue(err.write.called, "clipping must not be silent")
 
     def test_clip_respects_word_boundaries(self):
-        clipped = cp._clip_purpose("word " * 40)
+        with mock.patch("sys.stderr"):  # the warning is expected; keep it out of the output
+            clipped = cp._clip_purpose("word " * 40)
         self.assertFalse(clipped.endswith("wor"))
+
+    def test_long_address_is_clipped_and_warns(self):
+        address = "Very Long Street Name 123, Apartment 45, Some District, Big City, 01234 Country"
+        with mock.patch("sys.stderr") as err:
+            clipped = cp._clip_address(address)
+        self.assertLessEqual(len(clipped), cp.ADDRESS_MAX)
+        self.assertTrue(err.write.called, "address clipping must not be silent")
+
+    def test_short_address_is_untouched(self):
+        self.assertEqual(cp._clip_address("Gedimino pr. 1, Vilnius"), "Gedimino pr. 1, Vilnius")
 
 
 class TestLedgerStateMachine(unittest.TestCase):
@@ -341,6 +423,161 @@ class TestLedgerStateMachine(unittest.TestCase):
 
     def test_attempt_ids_are_unique(self):
         self.assertNotEqual(cp._new_attempt_id(), cp._new_attempt_id())
+
+
+class TestResolvePayer(unittest.TestCase):
+    """resolve_payer() decides whose money moves. Every refusal path is a guard against
+    paying an invoice from the wrong company's account."""
+
+    ACCOUNTS = {"EVP0000000000001": "Company A", "EVP0000000000002": "Company B"}
+
+    def setUp(self):
+        self.patches = [
+            mock.patch.object(cp, "ALLOWED_ACCOUNTS", dict(self.ACCOUNTS)),
+            mock.patch.object(cp, "BUYER_CODE_TO_ACCOUNT", {"111": "EVP0000000000001"}),
+            mock.patch.object(cp, "BUYER_NAME_TO_ACCOUNT", {"COMPANY A UAB": "EVP0000000000001"}),
+        ]
+        for p in self.patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in self.patches])
+
+    def _args(self, **over):
+        base = dict(buyer_code=None, buyer_name=None, payer=None)
+        base.update(over)
+        return argparse.Namespace(**base)
+
+    def test_known_code_resolves_the_payer(self):
+        self.assertEqual(cp.resolve_payer(self._args(buyer_code="111")), "EVP0000000000001")
+
+    def test_known_name_resolves_when_the_code_is_absent(self):
+        with mock.patch("sys.stderr"):
+            payer = cp.resolve_payer(self._args(buyer_name="Company A, UAB"))
+        self.assertEqual(payer, "EVP0000000000001")
+
+    def test_name_resolution_is_announced(self):
+        # The name path is the safety-sensitive one; it must leave an audit trail.
+        with mock.patch("sys.stderr") as err:
+            cp.resolve_payer(self._args(buyer_name="Company A, UAB"))
+        self.assertTrue(err.write.called)
+
+    def test_code_and_name_disagreement_is_refused(self):
+        with mock.patch.object(cp, "BUYER_NAME_TO_ACCOUNT", {"COMPANY B UAB": "EVP0000000000002"}):
+            with self.assertRaises(SystemExit) as ctx:
+                cp.resolve_payer(self._args(buyer_code="111", buyer_name="Company B, UAB"))
+        self.assertIn("mismatch", str(ctx.exception))
+
+    def test_code_and_explicit_payer_disagreement_is_refused(self):
+        with self.assertRaises(SystemExit) as ctx:
+            cp.resolve_payer(self._args(buyer_code="111", payer="EVP0000000000002"))
+        self.assertIn("wrong account", str(ctx.exception))
+
+    def test_unresolvable_buyer_is_refused_rather_than_guessed(self):
+        with self.assertRaises(SystemExit) as ctx:
+            cp.resolve_payer(self._args(buyer_code="999"))
+        self.assertIn("could not resolve", str(ctx.exception))
+
+    def test_payer_outside_the_token_scope_is_refused(self):
+        with mock.patch("sys.stderr"):
+            with self.assertRaises(SystemExit):
+                cp.resolve_payer(self._args(payer="EVP9999999999999"))
+
+    def test_unmapped_code_with_explicit_payer_is_allowed_but_announced(self):
+        with mock.patch("sys.stderr") as err:
+            payer = cp.resolve_payer(self._args(buyer_code="999", payer="EVP0000000000002"))
+        self.assertEqual(payer, "EVP0000000000002")
+        self.assertTrue(err.write.called, "an unverified guard must not be silent")
+
+    def test_no_buyer_information_at_all_is_refused(self):
+        with self.assertRaises(SystemExit):
+            cp.resolve_payer(self._args())
+
+
+class TestListTransfers(unittest.TestCase):
+    """Two shipped defects lived here — the wrong direction parameter and broken
+    pagination — and both made the duplicate check silently incomplete."""
+
+    def test_queries_the_payer_side_not_the_beneficiary_side(self):
+        # credit_account_number = the account is the PAYER (outgoing). Querying
+        # debit_ instead returns INCOMING transfers and never sees a duplicate.
+        seen = []
+
+        def fake(method, url, token):
+            seen.append(url)
+            return "200", {"items": []}
+
+        with mock.patch.object(cp, "http_json", fake):
+            cp.list_transfers("tok", "EVP1", 0)
+        self.assertIn("credit_account_number=EVP1", seen[0])
+        self.assertNotIn("debit_account_number", seen[0])
+
+    def test_uses_offset_pagination_and_walks_every_page(self):
+        pages = {0: [{"id": f"a{i}"} for i in range(100)], 100: [{"id": "b1"}]}
+
+        def fake(method, url, token):
+            offset = int(url.split("offset=")[1])
+            return "200", {"items": pages.get(offset, [])}
+
+        with mock.patch.object(cp, "http_json", fake):
+            items = cp.list_transfers("tok", "EVP1", 0)
+        self.assertEqual(len(items), 101)
+
+    def test_duplicate_ids_across_pages_are_collapsed(self):
+        page = [{"id": f"a{i}"} for i in range(100)]
+
+        def fake(method, url, token):
+            offset = int(url.split("offset=")[1])
+            # Page 2 repeats page 1 — the shape the broken cursor pagination produced.
+            return "200", {"items": page if offset < 200 else []}
+
+        with mock.patch.object(cp, "http_json", fake):
+            items = cp.list_transfers("tok", "EVP1", 0)
+        self.assertEqual(len({i["id"] for i in items}), 100)
+
+    def test_a_failed_page_warns_rather_than_looking_empty(self):
+        with mock.patch.object(cp, "http_json", return_value=("ERR", {})):
+            with mock.patch("sys.stderr") as err:
+                items = cp.list_transfers("tok", "EVP1", 0)
+        self.assertEqual(items, [])
+        self.assertTrue(err.write.called, "an incomplete dup-check must announce itself")
+
+    def test_transfer_items_accepts_the_shapes_the_api_returns(self):
+        self.assertEqual(cp._transfer_items([{"id": "a"}]), [{"id": "a"}])
+        self.assertEqual(cp._transfer_items({"items": [{"id": "a"}]}), [{"id": "a"}])
+        self.assertEqual(cp._transfer_items({"transfers": [{"id": "a"}]}), [{"id": "a"}])
+        self.assertEqual(cp._transfer_items({"unexpected": 1}), [])
+        self.assertEqual(cp._transfer_items(None), [])
+
+
+class TestCurrencyAwareDuplicateMatch(unittest.TestCase):
+    def _find(self, transfer_currency, our_currency):
+        row = {
+            "id": "H1",
+            "status": "done",
+            "purpose": {"details": "unrelated"},
+            "amount": {"amount": "100.00", "currency": transfer_currency},
+            "beneficiary": {"iban": "LT121000011101001000"},
+        }
+        with temp_ledger(cp):
+            with mock.patch.object(cp, "list_transfers", return_value=[row]):
+                blocking, _ = cp.find_blocking(
+                    "INV-1",
+                    token="t",
+                    payer="EVP1",
+                    ibans=["LT121000011101001000"],
+                    amount="100.00",
+                    currency=our_currency,
+                )
+        return blocking
+
+    def test_same_amount_same_currency_blocks(self):
+        self.assertEqual(len(self._find("EUR", "EUR")), 1)
+
+    def test_same_amount_different_currency_does_not_block(self):
+        self.assertEqual(self._find("USD", "EUR"), [])
+
+    def test_unknown_currency_is_treated_as_possible_duplicate(self):
+        # Fail-safe: if we cannot tell, assume it might be the same payment.
+        self.assertEqual(len(self._find(None, "EUR")), 1)
 
 
 class TestTokenHandling(unittest.TestCase):
@@ -448,15 +685,27 @@ class TestCommandLineValidation(unittest.TestCase):
     """End-to-end argument checks: these live in main(), so they are exercised by running
     the script with a stubbed curl on PATH."""
 
-    @classmethod
-    def setUpClass(cls):
-        cls.tmp = tempfile.mkdtemp(prefix="paysera-cli-test-")
-        cls.bin = os.path.join(cls.tmp, "bin")
-        os.makedirs(cls.bin)
-        stub = os.path.join(cls.bin, "curl")
+    # A fresh HOME per test: a shared one lets an earlier test's ledger change what a
+    # later one observes, and makes "assert no ledger was written" quietly meaningless.
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="paysera-cli-test-")
+        self.bin = os.path.join(self.tmp, "bin")
+        os.makedirs(self.bin)
+        self.write_stub('printf \'{"items":[]}\\nHTTP:200\'')
+
+    def write_stub(self, shell_body):
+        stub = os.path.join(self.bin, "curl")
         with open(stub, "w") as f:
-            f.write('#!/bin/sh\nprintf \'{"items":[]}\\nHTTP:200\'\n')
+            f.write("#!/bin/sh\n" + shell_body + "\n")
         os.chmod(stub, 0o755)
+
+    @property
+    def ledger_path(self):
+        return os.path.join(self.tmp, ".config", "paysera-payments", "ledger.json")
+
+    def read_ledger(self):
+        with open(self.ledger_path) as f:
+            return json.load(f)
 
     def run_script(self, *extra):
         env = dict(os.environ)
@@ -467,6 +716,9 @@ class TestCommandLineValidation(unittest.TestCase):
             sys.executable,
             str(SCRIPTS / "create-payment.py"),
             "--payer", "EVP0000000000001",
+            # The shipped ALLOWED_ACCOUNTS labels are placeholders, and the script now
+            # refuses to send one as the payer display name — so supply a real one.
+            "--payer-name", "Test Company, UAB",
             "--beneficiary-name", "Acme UAB",
             "--iban", "LT121000011101001000",
             "--purpose", "test",
@@ -520,11 +772,66 @@ class TestCommandLineValidation(unittest.TestCase):
         self.assertIn("SKIPPED", out.stderr)
 
     def test_dry_run_writes_no_ledger_entry(self):
-        ledger = os.path.join(self.tmp, ".config", "paysera-payments", "ledger.json")
-        before = os.path.exists(ledger)
+        # Unconditional: setUp gives this test its own HOME, so the ledger cannot
+        # pre-exist and the assertion cannot silently turn itself off.
+        self.assertFalse(os.path.exists(self.ledger_path))
         self.run_script("--amount", "12.34", "--invoice-id", "INV-DRY")
-        if not before:
-            self.assertFalse(os.path.exists(ledger), "a dry run must not record an attempt")
+        self.assertFalse(os.path.exists(self.ledger_path), "a dry run must not record an attempt")
+
+
+class TestWriteAheadLedger(TestCommandLineValidation):
+    """The 1.5.0 fix is the ORDER of the write relative to the POST.
+
+    Moving append_ledger() after http_json_post() leaves every unit test green while
+    restoring the double-payment defect, so it has to be pinned end to end.
+    """
+
+    def test_attempt_is_recorded_even_when_the_answer_never_arrives(self):
+        self.write_stub("exit 28")  # curl's timeout exit code
+        out = self.run_script("--amount", "100.00", "--invoice-id", "INV-WA", "--confirm")
+
+        self.assertNotEqual(out.returncode, 0)
+        self.assertTrue(
+            os.path.exists(self.ledger_path),
+            "a request that was sent but not answered must still be recorded — "
+            "otherwise a retry creates a second draft",
+        )
+        rows = self.read_ledger()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["state"], "unknown")
+        self.assertIsNone(rows[0]["transfer_hash"])
+        self.assertIn("NOT known whether the transfer was created", out.stderr)
+
+    def test_the_retry_after_an_unanswered_request_is_refused(self):
+        self.write_stub("exit 28")
+        self.run_script("--amount", "100.00", "--invoice-id", "INV-WA", "--confirm")
+
+        # Second run, API healthy again: it must NOT create another draft.
+        self.write_stub('printf \'{"items":[]}\\nHTTP:200\'')
+        retry = self.run_script("--amount", "100.00", "--invoice-id", "INV-WA", "--confirm")
+
+        self.assertEqual(retry.returncode, 3, "an unconfirmed attempt must block the retry")
+        self.assertIn("UNCONFIRMED", retry.stdout)
+        self.assertEqual(len(self.read_ledger()), 1, "no second row may be written")
+
+    def test_a_definite_refusal_does_not_block_the_retry(self):
+        self.write_stub('printf \'{"error":"bad_request"}\\nHTTP:400\'')
+        first = self.run_script("--amount", "100.00", "--invoice-id", "INV-400", "--confirm")
+        self.assertNotEqual(first.returncode, 0)
+        self.assertEqual(self.read_ledger()[0]["state"], "failed")
+
+        self.write_stub('printf \'{"items":[]}\\nHTTP:200\'')
+        retry = self.run_script("--amount", "100.00", "--invoice-id", "INV-400")
+        self.assertNotIn("SKIP", retry.stdout)
+
+    def test_a_successful_create_is_recorded_with_its_hash(self):
+        self.write_stub('printf \'{"id":"HASH123","status":"new"}\\nHTTP:201\'')
+        out = self.run_script("--amount", "100.00", "--invoice-id", "INV-OK", "--confirm")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        rows = self.read_ledger()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["state"], "created")
+        self.assertEqual(rows[0]["transfer_hash"], "HASH123")
 
 
 if __name__ == "__main__":

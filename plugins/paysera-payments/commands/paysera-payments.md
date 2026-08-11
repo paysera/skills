@@ -22,7 +22,9 @@ Then carry out the request:
 - **Cancel / delete a draft** → use `scripts/cancel-payment.py <transferHash>` (dry-run by
   default; `--confirm` performs the `DELETE`). Only unsigned/live drafts are removable.
 - **Check status / balance** → use the read-only `GET /transfers/{hash}`, `GET /transfers`,
-  or `GET /accounts/{n}/full-balance` endpoints with the PAT.
+  or `GET /accounts/{n}/full-balance` endpoints with the PAT. Pass the token to curl on
+  **stdin** (`-K -`), never as `-H "Authorization: Bearer $PAT"` — command arguments are
+  readable by any local user via `ps` / `/proc/<pid>/cmdline`. SKILL.md has the exact form.
 
 Never move real money on your own and never `--confirm` without explicit user confirmation.
 

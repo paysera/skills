@@ -26,9 +26,11 @@ Only client-facing skills. A skill qualifies when all of the following hold:
 `scripts/validate.py` scans **every** `.md`, `.py`, `.json` and `.yml` file in the
 repository (not just `plugins/`) and fails on:
 
-- a `paysera.*` hostname that is not on its allowlist of public hosts;
+- a `paysera.*` hostname that is not on its allowlist of public hosts, wherever it appears;
 - a hostname containing `intranet`/`internal`, or ending in `.local`, `.lan`, `.corp`,
-  `.localdomain`, `.home`, `.test`, `.invalid`;
+  `.localdomain`, `.home`, `.test`, `.invalid` — but only where the token is genuinely
+  used as a host. Import paths (`pkg.internal.helpers`), filenames (`internal.md`) and
+  file paths (`app/config.test`) are not flagged;
 - a URL that looks like an issue tracker or forge link (`/browse/KEY-123`, `/jira/`,
   `/confluence/`, `/-/merge_requests/`).
 
@@ -75,7 +77,11 @@ for t in $(find plugins -name 'test_*.py'); do python3 "$t"; done
 
 Tests are **required** for anything that moves money or decides whether a payment is a
 duplicate. CI fails if no tests are collected, so a green pipeline cannot be reached by
-deleting them.
+deleting them. CI runs them on Python 3.8 and 3.11 — 3.8 is the supported minimum and the
+configuration where the built-in timezone fallback runs instead of `zoneinfo`.
+
+Run them serially. `frozen_clock` in `_testsupport.py` patches the shared `datetime` and
+`time` modules for the whole process, so parallel runners (`pytest -n`) are not supported.
 
 ## Releasing
 
