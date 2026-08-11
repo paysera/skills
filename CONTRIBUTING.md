@@ -59,17 +59,23 @@ skills are added here deliberately, one at a time.
 
 ## Checks
 
-The same two commands CI runs on every pull request:
+The same commands CI runs on every pull request:
 
 ```bash
 python3 scripts/validate.py     # manifests, skill frontmatter, published-content scan
-python3 -m pytest plugins -q    # exit code 5 (no tests collected) is tolerated for now
+python3 -m pytest plugins -q    # the skill tests
 ```
 
-> **The payment scripts currently have no automated tests.** `pytest` collects nothing, so
-> it exits 5 and CI treats that as a pass. Do not read a green pipeline as "the behaviour
-> is tested" — it means the manifests are consistent and nothing internal leaked. New
-> skills should ship with tests, and tests for the existing scripts are welcome.
+The tests are plain `unittest`, so they also run without pytest installed — which is how
+CI double-checks them:
+
+```bash
+for t in $(find plugins -name 'test_*.py'); do python3 "$t"; done
+```
+
+Tests are **required** for anything that moves money or decides whether a payment is a
+duplicate. CI fails if no tests are collected, so a green pipeline cannot be reached by
+deleting them.
 
 ## Releasing
 

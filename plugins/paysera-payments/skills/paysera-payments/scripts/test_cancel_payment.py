@@ -1,0 +1,173 @@
+"""Tests for cancel-payment.py.
+
+Cancelling is destructive and irreversible, so the emphasis is on: never delete without
+--confirm, never expose the token, and never act on a transfer whose state could not be
+read.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+# Work regardless of the runner's rootdir/sys.path handling (pytest from the repo root,
+# unittest from this directory, or a plain `python3 test_cancel_payment.py`).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _testsupport import SCRIPTS, capture_curl, load
+
+cancel = load("cancel-payment.py", "cancel_payment")
+
+
+class TestTokenHandling(unittest.TestCase):
+    def test_token_never_appears_in_argv(self):
+        secret = "SUPERSECRET-TOKEN"
+        with capture_curl(cancel) as calls:
+            cancel.curl_json("GET", "https://api.paysera.com/x", secret)
+        self.assertNotIn(secret, " ".join(calls[0]["argv"]))
+        self.assertIn(secret, calls[0]["input"])
+
+    def test_requests_carry_a_timeout(self):
+        with capture_curl(cancel) as calls:
+            cancel.curl_json("GET", "https://api.paysera.com/x", "tok")
+        self.assertEqual(calls[0]["kwargs"].get("timeout"), cancel.HTTP_TIMEOUT)
+
+    def test_tokens_that_could_break_config_quoting_are_refused(self):
+        for bad in ['has"quote', "has\\backslash"]:
+            with self.subTest(token=bad):
+                with mock.patch.dict(os.environ, {"PAYSERA_PAT": bad}):
+                    with self.assertRaises(SystemExit):
+                        cancel.read_token("/nonexistent")
+
+    def test_empty_token_is_refused(self):
+        with mock.patch.dict(os.environ, {"PAYSERA_PAT": "   "}):
+            with self.assertRaises(SystemExit):
+                cancel.read_token("/nonexistent")
+
+
+class TestTransportFailures(unittest.TestCase):
+    def test_missing_curl_raises_http_error(self):
+        with mock.patch.object(cancel.subprocess, "run", side_effect=FileNotFoundError):
+            with self.assertRaises(cancel.HttpError):
+                cancel.curl_json("GET", "https://api.paysera.com/x", "tok")
+
+    def test_timeout_raises_http_error(self):
+        exc = subprocess.TimeoutExpired(cmd="curl", timeout=30)
+        with mock.patch.object(cancel.subprocess, "run", side_effect=exc):
+            with self.assertRaises(cancel.HttpError):
+                cancel.curl_json("GET", "https://api.paysera.com/x", "tok")
+
+    def test_nonzero_exit_raises_http_error(self):
+        with capture_curl(cancel, returncode=7):
+            with self.assertRaises(cancel.HttpError):
+                cancel.curl_json("GET", "https://api.paysera.com/x", "tok")
+
+    def test_non_json_body_is_returned_verbatim(self):
+        with capture_curl(cancel, stdout="not json\nHTTP:502"):
+            code, body = cancel.curl_json("GET", "https://api.paysera.com/x", "tok")
+        self.assertEqual(code, "502")
+        self.assertEqual(body, "not json")
+
+
+class TestCancelableStates(unittest.TestCase):
+    def test_live_states_are_cancelable(self):
+        for state in ["new", "reserved", "registered", "waiting_funds", "signing"]:
+            self.assertIn(state, cancel.CANCELABLE_STATES)
+
+    def test_terminal_states_are_not(self):
+        for state in ["done", "failed", "rejected", "canceled", "expired"]:
+            self.assertNotIn(state, cancel.CANCELABLE_STATES)
+
+
+class TestCommandLine(unittest.TestCase):
+    """Driven end to end with a stubbed curl, so the DELETE gate is tested for real."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="paysera-cancel-test-")
+        self.bin = os.path.join(self.tmp, "bin")
+        os.makedirs(self.bin)
+        self.log = os.path.join(self.tmp, "calls.log")
+
+    def write_stub(self, body, http="200"):
+        stub = os.path.join(self.bin, "curl")
+        with open(stub, "w") as f:
+            f.write(
+                "#!/bin/sh\n"
+                f'echo "$@" >> {self.log}\n'
+                f"printf '%s\\nHTTP:%s' '{body}' '{http}'\n"
+            )
+        os.chmod(stub, 0o755)
+
+    def run_script(self, *args):
+        env = dict(os.environ)
+        env["PATH"] = self.bin + os.pathsep + env["PATH"]
+        env["PAYSERA_PAT"] = "test-token"
+        return subprocess.run(
+            [sys.executable, str(SCRIPTS / "cancel-payment.py"), *args],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60,
+        )
+
+    def calls(self):
+        if not os.path.exists(self.log):
+            return []
+        with open(self.log) as f:
+            return f.read().splitlines()
+
+    def test_dry_run_does_not_delete(self):
+        self.write_stub('{"id":"H1","status":"new","amount":{"amount":"5.00","currency":"EUR"}}')
+        out = self.run_script("H1")
+        self.assertIn("DRY-RUN", out.stdout)
+        self.assertFalse(any("DELETE" in c for c in self.calls()), "dry run must not DELETE")
+
+    def test_confirm_deletes(self):
+        self.write_stub('{"id":"H1","status":"new","amount":{"amount":"5.00","currency":"EUR"}}')
+        out = self.run_script("H1", "--confirm")
+        self.assertTrue(any("DELETE" in c for c in self.calls()))
+        self.assertIn("CANCELED", out.stdout)
+
+    def test_terminal_transfer_is_skipped_even_with_confirm(self):
+        self.write_stub('{"id":"H1","status":"done","amount":{"amount":"5.00","currency":"EUR"}}')
+        out = self.run_script("H1", "--confirm")
+        self.assertIn("not cancelable", out.stdout)
+        self.assertFalse(any("DELETE" in c for c in self.calls()))
+
+    def test_null_amount_does_not_crash(self):
+        # The API can return the key present with a null value.
+        self.write_stub('{"id":"H1","status":"new","amount":null}')
+        out = self.run_script("H1")
+        self.assertNotIn("Traceback", out.stderr)
+        self.assertIn("DRY-RUN", out.stdout)
+
+    def test_unreadable_transfer_is_not_deleted(self):
+        self.write_stub('{"error":"nope"}', http="404")
+        out = self.run_script("H1", "--confirm")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertFalse(any("DELETE" in c for c in self.calls()))
+
+    def test_transport_failure_is_reported_without_a_traceback(self):
+        stub = os.path.join(self.bin, "curl")
+        with open(stub, "w") as f:
+            f.write("#!/bin/sh\nexit 7\n")
+        os.chmod(stub, 0o755)
+        out = self.run_script("H1", "--confirm")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertNotIn("Traceback", out.stderr)
+        self.assertIn("cannot read", out.stdout)
+
+    def test_multiple_hashes_are_all_processed(self):
+        self.write_stub('{"id":"H1","status":"new","amount":{"amount":"5.00","currency":"EUR"}}')
+        self.run_script("H1", "H2", "H3")
+        self.assertGreaterEqual(len(self.calls()), 3)
+
+
+if __name__ == "__main__":
+    unittest.main()

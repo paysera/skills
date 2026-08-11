@@ -16,8 +16,24 @@ jobs:
       - name: Validate marketplace and plugin manifests
         run: python3 scripts/validate.py
       - name: Run skill script tests
+        # No exit-5 tolerance: tests exist, so "nothing collected" is a failure, not a
+        # pass. A green pipeline must not be reachable by losing the tests.
         run: |
           pip install pytest
-          if [ -d plugins ]; then
-            pytest plugins -q || [ $? -eq 5 ]   # 5 = no tests collected yet
+          pytest plugins -q
+
+      - name: Run the same tests without pytest
+        # The tests are plain unittest, so they must also pass under the stdlib runner.
+        # This is the backstop against a collection problem hiding real failures.
+        run: |
+          found=0
+          for t in $(find plugins -name 'test_*.py' | sort); do
+            echo "--- $t"
+            python3 "$t" || exit 1
+            found=$((found + 1))
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "No test files found — refusing to report success." >&2
+            exit 1
           fi
+          echo "Ran $found test module(s)."

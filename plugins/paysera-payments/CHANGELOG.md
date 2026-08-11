@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.5.1 (2026-08-11)
+- Added a test suite for both scripts (89 tests): the Vilnius day boundary and every
+  scheduling path, beneficiary IBAN selection, invoice-id matching, purpose clipping,
+  the ledger state machine including the unconfirmed-attempt block, token handling
+  (asserting the token never reaches argv), transport failures, and the cancel gate
+  (dry-run never issues a DELETE; a terminal or unreadable transfer is never deleted).
+- CI no longer tolerates "no tests collected", and runs the suite a second time without
+  pytest, so a green pipeline cannot be reached by losing the tests.
+
 ## 1.5.0 (2026-08-11)
 
 Second review round.
