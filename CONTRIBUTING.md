@@ -30,12 +30,15 @@ repository (not just `plugins/`) and fails on:
 - a hostname containing `intranet`/`internal`, or ending in `.local`, `.lan`, `.corp`,
   `.localdomain`, `.home`, `.test`, `.invalid` — but only where the token is genuinely
   used as a host. Not flagged: import paths (`pkg.internal.helpers`), filenames
-  (`internal.md`), file paths (`app/config.test`), dotted calls, the unquoted right-hand
-  side of an assignment (`handler = pkg.internal.io`), and any dotted name whose last label
-  cannot be a TLD. A *quoted* host in an assignment is still checked. **Backticks are not
-  an exemption** — a hostname in backticks is checked exactly as a bare one is, because
-  backticks are how this repository normally writes hostnames. `.test` and `.invalid` are
-  reserved TLDs but also ordinary file suffixes, so they count only inside a URL;
+  (`internal.md`), file paths (`app/config.test`), dotted calls, and any dotted name whose
+  last label cannot be a TLD. **In Python source only**, a spaced assignment whose
+  right-hand side is a bare dotted module chain is also exempt — a shell assignment
+  (`NAME=value`, no spaces) never is, in any file, because that is a realistic way to write
+  a real internal host in a bash block or a workflow `run:` step. A *quoted* host is always
+  checked. **Backticks are not an exemption** — a hostname in backticks is checked exactly
+  as a bare one is, because backticks are how this repository normally writes hostnames.
+  `.test` and `.invalid` are reserved TLDs but also ordinary file suffixes, so they count
+  only inside a URL;
 - a URL that looks like an issue tracker or forge link (`/browse/KEY-123`, `/jira/`,
   `/confluence/`, `/-/merge_requests/`).
 

@@ -149,7 +149,7 @@ def published_files():
         yield path
 
 
-def looks_like_prose(line, match):
+def looks_like_prose(line, match, is_python=False):
     """True when a dotted token is code or a filename rather than a hostname.
 
     The host patterns below use words that occur naturally in source and documentation, so
@@ -171,11 +171,18 @@ def looks_like_prose(line, match):
     # A filesystem path, or an attribute chain hanging off something.
     if before.endswith(("/", "\\")) or re.search(r"[\w)\]]\Z", before):
         return True
-    # The right-hand side of an assignment, unquoted: `handler = pkg.internal.io` is code.
-    # A quoted host — HOST = "db.corp.local" — is not exempt, because `before` then ends
-    # with the quote character rather than the assignment.
-    # (`=` only, never `:` — a YAML value like `host: db.corp.local` IS a hostname.)
-    if re.search(r"=\s*\Z", before) and not before.rstrip().endswith(("'", '"', "`")):
+    # The right-hand side of a PYTHON assignment: `handler = pkg.internal.io` is code.
+    # Deliberately narrow, because a shell assignment is a realistic way to write a real
+    # internal host (`HOST=wiki.example` in a bash block or a workflow `run:` step):
+    #   * Python files only — shell assignments do not appear in .py source;
+    #   * whitespace on BOTH sides of `=`, which shell assignment syntax forbids;
+    #   * no quote earlier on the line, so a host inside a string stays checked.
+    # `=` only, never `:` — a YAML value like `host: db.corp.local` IS a hostname.
+    if (
+        is_python
+        and re.search(r"\s=\s+\Z", before)
+        and not re.search(r"['\"`]", before)
+    ):
         return True
     # A dotted name continuing into a call or subscript.
     if re.match(r"\s*[(\[]", after):
@@ -227,6 +234,7 @@ def scan_published_content():
         if path.name in SELF_EXEMPT and path.resolve().parent == here:
             continue
         rel = path.relative_to(ROOT)
+        is_python = path.suffix.lower() == ".py"
         for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             for match in HOSTNAME.finditer(line):
                 host = match.group(0).lower()
@@ -241,7 +249,7 @@ def scan_published_content():
                         f"{', '.join(sorted(PUBLIC_PAYSERA_HOSTS))}"
                     )
                 elif is_internal_host(host, in_url) and (
-                    in_url or not looks_like_prose(line, match)
+                    in_url or not looks_like_prose(line, match, is_python)
                 ):
                     # These markers are ordinary words in code and prose
                     # ("pkg.internal.helpers", "config.test"), so they are only flagged

@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.6.3 (2026-08-11)
+
+Sixth review round — publication checker only; the shipped skill is unchanged.
+
+- **Closed a hole introduced in 1.6.2.** The Python-assignment exemption also matched a
+  SHELL assignment (`NAME=value`), which is a realistic way to write a real internal host
+  in a bash block or a workflow `run:` step — so those bypassed the gate entirely. The
+  exemption is now restricted to Python source, to assignments with whitespace on both
+  sides of `=` (shell syntax forbids the spaces), and to lines with no quote before the
+  token. Dropping any part of that restriction fails nine tests.
+
 ## 1.6.2 (2026-08-11)
 
 Fifth review round — publication checker only; the shipped skill is unchanged.
@@ -9,8 +20,9 @@ Fifth review round — publication checker only; the shipped skill is unchanged.
   writes real files, including a decoy with the same name in another directory, and pins
   both halves of the rule. Breaking the exemption either way now fails it.
 - Removed the residual false positives on dotted code chains whose last label happens to be
-  a real TLD (`handler = pkg.internal.io`): the unquoted right-hand side of an assignment
-  is code. A quoted host in an assignment, and a YAML `host:` value, are still checked.
+  a real TLD (Python module names such as `io`, `app` and `net` all are): in Python source,
+  a spaced assignment to a bare dotted module chain is code. A quoted host, a YAML `host:`
+  value, and a shell assignment anywhere are all still checked.
 - `.test` and `.invalid` are reserved TLDs but also ordinary file suffixes, so they now
   count only inside a URL: `config.test` in prose is a filename, while the same name after
   a scheme is a host. "Inside a URL" is now judged per occurrence rather than per line,

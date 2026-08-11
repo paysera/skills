@@ -48,16 +48,18 @@ SAMPLES = [
     ("`bank.paysera.com`", False, "public Paysera host in backticks"),
     ("https://github.com/paysera/skills", False, "public third-party host"),
     ("https://code.claude.com/docs/en/plugin-marketplaces", False, "public docs link"),
-    # --- dotted code chains whose last label happens to be a plausible TLD -----------
-    # Python module names like io/app/net/dev are all real TLDs, so the last-label rule
-    # alone is not enough; an unquoted right-hand side is code.
-    ("handler = mypkg.internal.io", False, "assignment, module name that is also a TLD"),
-    ("cfg = mypkg.internal.app", False, "assignment, module name that is also a TLD"),
-    ("client = pkg.internal.net", False, "assignment, module name that is also a TLD"),
-    ("value = pkg.internal.helpers", False, "assignment, ordinary module name"),
-    # ...but a quoted host on the right-hand side is still a host.
+    # --- shell assignments are a realistic way to write a REAL internal host ---------
+    # (in a bash block or a workflow `run:` step) and must never be exempt.
+    ("HOST=wiki.internal", True, "shell assignment, no spaces"),
+    ("  HOST=db.corp.local", True, "indented shell assignment"),
+    ("export API_HOST=paysera.intranet.lt", True, "exported shell assignment"),
+    ("HOST=wiki.internal  # a comment", True, "shell assignment with a trailing comment"),
+    # In a .md or .yml file, a spaced assignment is still checked — only Python source
+    # gets the code-chain exemption (see TestPythonAssignmentExemption).
+    ("handler = mypkg.internal.io", True, "spaced assignment outside Python source"),
     ('HOST = "db.corp.local"', True, "quoted internal host in an assignment"),
     ("host: db.corp.local", True, "YAML value is a host, not an assignment"),
+    ("value = pkg.internal.helpers", False, "last label cannot be a TLD"),
     # `.test` is a reserved TLD and a common file suffix; only a URL settles it.
     ("config.test holds the fixture", False, "bare fixture filename"),
     ("`config.test`", False, "bare fixture filename in backticks"),
@@ -146,6 +148,55 @@ class TestPublishedContentScan(unittest.TestCase):
             flagged,
             "a file that merely shares the name must still be scanned",
         )
+
+
+class TestPythonAssignmentExemption(unittest.TestCase):
+    """`handler = pkg.internal.io` is code, but the same shape in a shell context is a
+    real hostname. The exemption is therefore restricted to Python source, to spaced
+    assignments (shell forbids the spaces), and to lines with no quote before the token."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="paysera-pyassign-test-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        (self.root / "plugins").mkdir()
+        self._real_root = validate.ROOT
+        validate.ROOT = self.root
+        self.addCleanup(setattr, validate, "ROOT", self._real_root)
+
+    def scan_as(self, filename, line):
+        path = self.root / filename
+        path.write_text(line + "\n", encoding="utf-8")
+        errors = validate.scan_published_content()
+        path.unlink()
+        return errors
+
+    def test_python_code_chain_is_exempt(self):
+        for line in [
+            "handler = mypkg.internal.io",
+            "cfg = mypkg.internal.app",
+            "client = pkg.internal.net",
+        ]:
+            with self.subTest(line=line):
+                self.assertEqual(self.scan_as("thing.py", line), [])
+
+    def test_the_same_line_in_markdown_is_checked(self):
+        self.assertTrue(self.scan_as("doc.md", "handler = mypkg.internal.io"))
+
+    def test_the_same_line_in_a_workflow_is_checked(self):
+        self.assertTrue(self.scan_as("ci.yml", "handler = mypkg.internal.io"))
+
+    def test_shell_assignment_in_python_is_still_checked(self):
+        # No spaces around '=' is shell syntax, not a Python assignment.
+        self.assertTrue(self.scan_as("thing.py", "HOST=wiki.internal"))
+
+    def test_quoted_host_in_python_is_still_checked(self):
+        for line in ['HOST = "wiki.internal"', "cmd = 'HOST=db.corp.local run'"]:
+            with self.subTest(line=line):
+                self.assertTrue(self.scan_as("thing.py", line), line)
+
+    def test_shell_block_inside_a_markdown_file_is_checked(self):
+        block = "```bash\nexport HOST=wiki.internal\ncurl -s $HOST\n```"
+        self.assertTrue(self.scan_as("doc.md", block))
 
 
 class TestPlausibleTld(unittest.TestCase):
