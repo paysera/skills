@@ -267,6 +267,23 @@ anything outside `NONBLOCKING_STATES` in `create-payment.py` (currently `failed`
 `rejected`, `canceled`/`cancelled`, `expired`, `declined`). A previously failed/canceled
 attempt does NOT block (you can retry). Override with `--force`.
 
+### Unconfirmed attempts (`UNCONFIRMED create attempt`)
+
+The ledger row is written **before** the POST, not after. If the request is sent but no
+answer comes back — a timeout, a killed process, a dropped connection — the transfer may
+well have been created, and `GET /transfers` **cannot** tell you: it does not list unsigned
+drafts. The row stays in state `unknown` and **blocks further runs for that invoice**, and
+the tool tells you to go and look.
+
+When you hit `SKIP — ... UNCONFIRMED create attempt`:
+
+1. Open the Paysera app and look for a draft matching that beneficiary and amount.
+2. If a draft exists — sign it or cancel it. Do not re-run.
+3. If no draft exists — re-run with `--force`, which proceeds and says loudly that the
+   duplicate check was skipped.
+
+A definite API refusal (HTTP 4xx) is recorded as `failed` instead and never blocks a retry.
+
 ```bash
 python3 ${CLAUDE_PLUGIN_ROOT}/skills/paysera-payments/scripts/create-payment.py \
   --payer EVP0000000000001 --beneficiary-name "Acme UAB" \

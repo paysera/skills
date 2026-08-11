@@ -357,9 +357,26 @@ def load_ledger():
         return []
 
 
-def append_ledger(entry):
+def _new_attempt_id():
+    """A unique id for one create attempt, so a pending ledger row can be found and
+    updated after the POST returns (or fails to)."""
+    return f"{int(time.time())}-{os.getpid()}-{os.urandom(4).hex()}"
+
+
+def update_ledger(attempt_id, **fields):
+    """Merge `fields` into the ledger row with this attempt_id, rewriting the file."""
     data = load_ledger()
-    data.append(entry)
+    for e in data:
+        if e.get("attempt_id") == attempt_id:
+            e.update(fields)
+            break
+    else:
+        return False
+    _write_ledger(data)
+    return True
+
+
+def _write_ledger(data):
     # The ledger holds IBANs, amounts and invoice numbers. Create the directory 0700 and
     # set 0600 on the TEMP file before it is renamed into place — setting the mode after
     # os.replace() leaves a window where the finished file is world-readable.
@@ -369,6 +386,12 @@ def append_ledger(entry):
     with os.fdopen(fd, "w") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     os.replace(tmp, LEDGER_FILE)
+
+
+def append_ledger(entry):
+    data = load_ledger()
+    data.append(entry)
+    _write_ledger(data)
 
 
 def _transfer_items(doc):
@@ -494,6 +517,26 @@ def select_beneficiary_iban(primary, also):
     return chosen, others, reason
 
 
+# An invoice id shorter than this is too generic to match on inside free text — "12"
+# appears in half of all payment purposes. Below it, only the amount check applies.
+MIN_INVOICE_ID_MATCH_LEN = 4
+
+
+def _purpose_quotes_invoice(purpose, invoice_id):
+    """True if `purpose` quotes `invoice_id` as a distinct token.
+
+    A bare substring test made short ids ("12", "A1") match unrelated purposes and refuse
+    perfectly good payments, which pushes the operator towards --force — and --force
+    disables the whole duplicate check, not just this one rule.
+    """
+    inv = str(invoice_id or "").strip()
+    if len(inv) < MIN_INVOICE_ID_MATCH_LEN:
+        return False
+    # Boundaries are non-alphanumeric rather than \b: an id like "EX000123" sits next to
+    # punctuation far more often than whitespace, and \b would also fire mid-token.
+    return re.search(rf"(?<![0-9A-Za-z]){re.escape(inv)}(?![0-9A-Za-z])", purpose or "", re.I) is not None
+
+
 def find_blocking(invoice_id, token, payer=None, ibans=None, amount=None, invoice_date=None):
     """Return (blocking, seen_to_ibans).
 
@@ -521,7 +564,20 @@ def find_blocking(invoice_id, token, payer=None, ibans=None, amount=None, invoic
         if str(e.get("invoice_id")) != str(invoice_id):
             continue
         h = e.get("transfer_hash")
+        state = e.get("state")
         if not h:
+            # A create attempt with no hash: either it never got an answer (state
+            # pending/unknown — a draft MAY exist and is invisible to GET /transfers), or
+            # the API definitely refused it (state failed — safe to retry). Only the
+            # latter is safe to ignore.
+            if state in ("pending", "unknown"):
+                key = e.get("attempt_id") or f"attempt@{e.get('created_at')}"
+                blocking[key] = (
+                    key,
+                    f"UNCONFIRMED create attempt at {e.get('created_at_iso')} "
+                    f"(HTTP {e.get('http_code', 'no answer')}) — check the Paysera app",
+                    "ledger",
+                )
             continue
         code, doc = http_json("GET", f"{TRANSFER_API}/{h}", token)
         if code == "200" and isinstance(doc, dict) and doc.get("id"):
@@ -577,7 +633,7 @@ def find_blocking(invoice_id, token, payer=None, ibans=None, amount=None, invoic
                     amount_match = Decimal(str(t_amt)) == Decimal(str(amount))
                 except InvalidOperation:
                     amount_match = False
-            id_match = bool(invoice_id) and str(invoice_id).lower() in (purpose or "").lower()
+            id_match = _purpose_quotes_invoice(purpose, invoice_id)
             if (
                 h
                 and (amount_match or id_match)
@@ -628,6 +684,21 @@ def parse_perform_at(spec):
     elif spec.startswith("+") and spec[1:-1].isdigit() and spec[-1] in "dh":
         n = int(spec[1:-1])
         epoch = now + n * (86400 if spec[-1] == "d" else 3600)
+        # +Nh is the one same-day spelling that could silently cross midnight (e.g. +6h at
+        # 20:00), which moves operation_date to tomorrow and hides the transfer from the
+        # mobile app. Every other same-day path is held inside today by
+        # _end_of_today_epoch(); hold this one too, and say so.
+        if spec[-1] == "h":
+            end_today = _end_of_today_epoch()
+            if end_today is not None and epoch > end_today:
+                print(
+                    f"NOTE: {spec} would land tomorrow (Vilnius), which makes the transfer "
+                    f"web-bank-only. Holding the deadline at 23:00 tonight so it stays "
+                    f"signable in the mobile app. Pass an explicit date if you really want "
+                    f"a future day.",
+                    file=sys.stderr,
+                )
+                epoch = end_today
     else:
         try:
             d = datetime.datetime.strptime(spec, "%Y-%m-%d").date()
@@ -641,9 +712,9 @@ def parse_perform_at(spec):
             epoch = _end_of_today_epoch()
             if epoch is None:
                 sys.exit(
-                    f"ERROR: --perform-at {d} is today, but it is past 23:00 in Vilnius — "
-                    f"there is no same-day signing window left. Use --advance to sign right "
-                    f"now, or pick tomorrow."
+                    f"ERROR: --perform-at {d} is today, but less than 10 minutes of the "
+                    f"same-day window remains (it closes at 23:00 Vilnius) — too little to "
+                    f"be useful. Use --advance to sign right now, or pick tomorrow."
                 )
         else:
             epoch = _noon_epoch(d)
@@ -749,7 +820,8 @@ def _noon_epoch(d):
 
 
 _NO_WINDOW_LEFT = (
-    "NOTE: past 23:00 in Vilnius — no same-day signing window left, so this is being sent "
+    "NOTE: less than 10 minutes of today's signing window remains (it closes at 23:00 "
+    "Vilnius) — too little to be useful, so this is being sent "
     "ASAP instead (operation_date is still today, so it stays visible in the mobile app). "
     "The deadline is immediate: sign it now, or re-run tomorrow."
 )
@@ -858,8 +930,11 @@ def main():
     ap.add_argument(
         "--charge-type",
         default="sha",
-        help="Charge bearer (SEPA standard 'sha'). REQUIRED for the mobile app to show the "
-        "transfer — without it the row has charge_type=NULL and mobile hides it.",
+        type=str.lower,
+        choices=["sha", "our"],
+        help="Charge bearer: 'sha' (shared, the SEPA standard) or 'our' (payer bears all "
+        "fees). The API accepts only these two — there is no 'ben'. REQUIRED for the "
+        "mobile app to show the transfer; unset, mobile hides it.",
     )
     ap.add_argument("--beneficiary-name", required=True, help="Beneficiary full name")
     ap.add_argument(
@@ -972,6 +1047,14 @@ def main():
     if amount_dec >= Decimal("1e12"):
         sys.exit(f"ERROR: --amount {args.amount} is implausibly large. Check the value.")
 
+    # Normalise ONCE: the routing decision below upper-cases it, so sending the raw
+    # spelling would let `--currency eur` pick the instant rail while the payload and the
+    # ledger say "eur".
+    currency = args.currency.strip().upper()
+    if not re.fullmatch(r"[A-Z]{3}", currency):
+        sys.exit(f"ERROR: --currency {args.currency!r} must be a 3-letter ISO code, e.g. EUR.")
+    args.currency = currency
+
     token = read_token(args.token_file)
 
     # --- Beneficiary IBAN selection (multi-IBAN invoices) -----------------------
@@ -1017,6 +1100,15 @@ def main():
             sys.exit(3)
     elif not args.invoice_id:
         print("NOTE: no --invoice-id given — duplicate check is OFF for this run.")
+    else:
+        # --force with an invoice id. Every other bypass in this script announces itself;
+        # disabling the primary double-payment guard must not be the quiet one.
+        print(
+            f"NOTE: --force given — the duplicate check for invoice '{args.invoice_id}' "
+            f"was SKIPPED ENTIRELY. Neither the ledger nor the live transfer list was "
+            f"consulted. If this invoice was already paid, this will pay it again.",
+            file=sys.stderr,
+        )
 
     perform_at, mode = compute_schedule(args)
 
@@ -1146,7 +1238,9 @@ def main():
         if instant:
             print("         Executes INSTANTLY the moment it is signed (EUR SEPA Instant).")
     else:
-        perform_day = datetime.datetime.fromtimestamp(perform_at, datetime.timezone.utc).date()
+        # Vilnius, like every other date decision here — a UTC calendar disagrees with it
+        # between midnight and 02:00/03:00 Vilnius and would print a day too early.
+        perform_day = datetime.datetime.fromtimestamp(perform_at, _VILNIUS).date()
         deadline_day = perform_day - datetime.timedelta(days=1)
         print(
             f"Schedule: execute {perform_day} — sign/cancel until end of {deadline_day} "
@@ -1167,6 +1261,31 @@ def main():
     if not args.confirm:
         print("\nDRY-RUN — nothing sent. Re-run with --confirm to register the draft transfer.")
         return
+
+    # WRITE-AHEAD: record the attempt BEFORE sending it. If the POST is accepted by the
+    # API but the answer never reaches us (timeout, killed process, dropped connection),
+    # a draft exists on the server that nothing here knows about — and GET /transfers
+    # does not list unsigned drafts, so the live cross-check cannot find it either. The
+    # pending row is what stops the next run from creating a second draft for the same
+    # invoice. Recorded whenever we have an invoice id to key it on.
+    attempt_id = _new_attempt_id()
+    if args.invoice_id:
+        append_ledger(
+            {
+                "attempt_id": attempt_id,
+                "state": "pending",
+                "invoice_id": args.invoice_id,
+                "invoice_date": args.invoice_date,
+                "transfer_hash": None,
+                "payer": payer,
+                "amount": args.amount,
+                "currency": currency,
+                "beneficiary_iban": args.iban,
+                "beneficiary_name": args.beneficiary_name,
+                "created_at": int(time.time()),
+                "created_at_iso": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }
+        )
 
     code, j = http_json_post(TRANSFER_API, payload, token)
 
@@ -1197,20 +1316,11 @@ def main():
             print("  registered       : skipped (--no-register) — stays 'new' (invisible).")
 
         if args.invoice_id:
-            append_ledger(
-                {
-                    "invoice_id": args.invoice_id,
-                    "invoice_date": args.invoice_date,
-                    "transfer_hash": j.get("id"),
-                    "status_at_create": j.get("status"),
-                    "payer": payer,
-                    "amount": args.amount,
-                    "currency": args.currency,
-                    "beneficiary_iban": args.iban,
-                    "beneficiary_name": args.beneficiary_name,
-                    "created_at": int(time.time()),
-                    "created_at_iso": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                }
+            update_ledger(
+                attempt_id,
+                state="created",
+                transfer_hash=transfer_hash,
+                status_at_create=j.get("status"),
             )
             print("  ledger           : recorded for invoice", args.invoice_id)
         print("\nNOT executed — this token has no sign scope. Open the Paysera app and SIGN the")
@@ -1218,6 +1328,29 @@ def main():
     else:
         print(f"\nFAILED (HTTP {code})")
         print(str(j)[:1500])
+        # Did the transfer get created or not? A 4xx is a definite refusal — the pending
+        # row can be cleared so it never blocks a legitimate retry. Anything else
+        # (transport failure, 5xx, unparseable answer) leaves it GENUINELY UNKNOWN: the
+        # API may have accepted the POST and only the answer went missing. Keep the row
+        # blocking and tell the operator to reconcile by hand.
+        definitely_not_created = code.isdigit() and 400 <= int(code) < 500
+        if args.invoice_id:
+            if definitely_not_created:
+                update_ledger(attempt_id, state="failed", http_code=code)
+            else:
+                update_ledger(attempt_id, state="unknown", http_code=code)
+                print(
+                    f"\nWARNING: it is NOT known whether the transfer was created — the "
+                    f"request failed with '{code}' after being sent.\n"
+                    f"  A draft may exist on the server. GET /transfers does NOT list "
+                    f"unsigned drafts, so this tool cannot check for you.\n"
+                    f"  CHECK THE PAYSERA APP for a draft to '{args.beneficiary_name}' "
+                    f"for {args.amount} {currency} before retrying.\n"
+                    f"  Until then this invoice is treated as already attempted and "
+                    f"further runs will refuse (override with --force once you have "
+                    f"confirmed no draft exists).",
+                    file=sys.stderr,
+                )
         sys.exit(1)
 
 

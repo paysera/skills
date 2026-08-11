@@ -1,5 +1,46 @@
 # Changelog
 
+## 1.5.0 (2026-08-11)
+
+Second review round.
+
+**Duplicate payments**
+- The ledger row is now written **before** the POST, not after. Previously a request that
+  was sent but never answered (timeout, killed process) left a draft on the server that
+  nothing recorded — and `GET /transfers` does not list unsigned drafts, so neither dedup
+  source could see it. A retry, e.g. an hourly cron, created a second signable draft for
+  the same invoice. An unanswered attempt is now kept as `unknown`, blocks further runs,
+  and prints instructions to check the Paysera app. A definite HTTP 4xx is recorded as
+  `failed` and does not block a legitimate retry.
+- `--force` with an invoice id now says on stderr that the duplicate check was skipped
+  entirely. It was the only bypass in the script that stayed silent.
+- The invoice-id match against a transfer purpose requires token boundaries and a minimum
+  id length. `12` or `A1` previously matched unrelated purposes and refused good payments.
+
+**Scheduling**
+- The future-dated schedule line printed the day in UTC while every other date decision
+  used Vilnius, so a run between midnight and 03:00 printed both the execution day and the
+  deadline day one day early — the deadline appearing already past.
+- `--perform-at +Nh` is now held inside today like every other same-day path. `+6h` at
+  20:00 previously rolled `operation_date` to tomorrow, hiding the transfer from the
+  mobile app, which is the opposite of what the help text promised.
+- The "no window left" messages said "past 23:00" when the cutoff is 10 minutes earlier.
+
+**Validation**
+- `--currency` is normalised and checked once, so `--currency eur` no longer selects the
+  instant rail while sending `"eur"` in the payload and the ledger.
+- `--charge-type` accepts only `sha` and `our`, the two values the API takes.
+
+**Publication checks**
+- `scripts/validate.py` now scans the whole repository, not just `plugins/`. The
+  marketplace catalogue duplicates each skill description verbatim, and the README is just
+  as public; neither was being checked.
+- Added detection of internal hostnames on non-Paysera domains (`intranet`/`internal`
+  labels, `.local`/`.lan`/`.corp`/... suffixes) and of issue-tracker/forge URLs. The host
+  allowlist alone could only see `paysera.*`.
+- CONTRIBUTING.md now states exactly what the automated check covers and what only a human
+  can catch, and its test command matches CI.
+
 ## 1.4.0 (2026-08-10)
 
 Security and correctness fixes from the pre-publication review.

@@ -11,8 +11,7 @@ Only client-facing skills. A skill qualifies when all of the following hold:
   that a client can call with their own credentials.
 - It references **only publicly reachable Paysera hosts**. Any Paysera hostname that a
   client outside the company network cannot resolve does not belong here, and neither do
-  links to internal source control, issue trackers, or wikis. `scripts/validate.py`
-  enforces this with an allowlist of public hosts.
+  links to internal source control, issue trackers, or wikis.
 - It contains **no internal database, service, or infrastructure names**, and no references
   to internal-only tooling or skills.
 - It contains **no internal issue-tracker keys or ticket references**, in files, commit
@@ -21,6 +20,23 @@ Only client-facing skills. A skill qualifies when all of the following hold:
   — examples must use obvious placeholders (`EVP0000000000001`, `LT000000000000000000`).
 - Any operation that moves money is **gated**: dry-run by default, explicit `--confirm`, and
   no `transfers:sign` scope.
+
+### What the automated check does and does not cover
+
+`scripts/validate.py` scans **every** `.md`, `.py`, `.json` and `.yml` file in the
+repository (not just `plugins/`) and fails on:
+
+- a `paysera.*` hostname that is not on its allowlist of public hosts;
+- a hostname containing `intranet`/`internal`, or ending in `.local`, `.lan`, `.corp`,
+  `.localdomain`, `.home`, `.test`, `.invalid`;
+- a URL that looks like an issue tracker or forge link (`/browse/KEY-123`, `/jira/`,
+  `/confluence/`, `/-/merge_requests/`).
+
+It is a **backstop, not the review**. It cannot see an internal service or database name
+written in prose, an internal tool referred to by name, an internal wiki link on a domain
+it does not recognise, a real account number that looks like a placeholder, or a ticket key
+in a commit message. A human reviewer must check those, and must state in the pull request
+that they did.
 
 Internal tooling stays in the internal repository. This repository is not a mirror of it —
 skills are added here deliberately, one at a time.
@@ -43,12 +59,17 @@ skills are added here deliberately, one at a time.
 
 ## Checks
 
+The same two commands CI runs on every pull request:
+
 ```bash
-python3 scripts/validate.py                                   # manifests + skill frontmatter
-python3 -m pytest plugins/paysera-payments/skills/paysera-payments/scripts -q
+python3 scripts/validate.py     # manifests, skill frontmatter, published-content scan
+python3 -m pytest plugins -q    # exit code 5 (no tests collected) is tolerated for now
 ```
 
-Both also run in CI on every pull request.
+> **The payment scripts currently have no automated tests.** `pytest` collects nothing, so
+> it exits 5 and CI treats that as a pass. Do not read a green pipeline as "the behaviour
+> is tested" — it means the manifests are consistent and nothing internal leaked. New
+> skills should ship with tests, and tests for the existing scripts are welcome.
 
 ## Releasing
 
