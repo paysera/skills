@@ -950,7 +950,16 @@ def find_blocking(
         if code == "200" and isinstance(doc, dict) and doc.get("id"):
             st = (doc.get("status") or "").lower()
             if st not in NONBLOCKING_STATES:
-                blocking[h] = (h, doc.get("status"), "ledger", "recorded for this invoice id")
+                why = "recorded for this invoice id"
+                if e.get("registered") is False:
+                    # Otherwise this invoice is simply stuck: the draft blocks a re-run,
+                    # and it is invisible in the app, so the operator sees no way forward.
+                    why += (
+                        f"; that draft was never REGISTERED, so it is not visible for "
+                        f"signing — finish it with --register-only {h} --confirm "
+                        f"(do not --force, which would create a second draft)"
+                    )
+                blocking[h] = (h, doc.get("status"), "ledger", why)
         else:
             # Could not confirm it's dead -> be conservative, treat as blocking.
             blocking[h] = (
@@ -1355,7 +1364,7 @@ def _main(guard):
         "fees). The API accepts only these two — there is no 'ben'. REQUIRED for the "
         "mobile app to show the transfer; unset, mobile hides it.",
     )
-    ap.add_argument("--beneficiary-name", required=True, help="Beneficiary full name")
+    ap.add_argument("--beneficiary-name", help="Beneficiary full name")
     ap.add_argument(
         "--beneficiary-address",
         default=None,
@@ -1363,7 +1372,7 @@ def _main(guard):
         "Paysera API for cross-border / international transfers (non-SEPA-Instant); "
         "the API rejects them with 'mapper_empty_beneficiary_address' otherwise.",
     )
-    ap.add_argument("--iban", required=True, help="Beneficiary IBAN/account (the one to pay TO)")
+    ap.add_argument("--iban", help="Beneficiary IBAN/account (the one to pay TO)")
     ap.add_argument(
         "--beneficiary-bic",
         default=None,
@@ -1401,9 +1410,9 @@ def _main(guard):
         "Goes on the regulated payment message for cross-border transfers, so it is NOT "
         "guessed — required whenever the beneficiary is outside Lithuania.",
     )
-    ap.add_argument("--amount", required=True, help="Decimal string, e.g. 12.34")
+    ap.add_argument("--amount", help="Decimal string, e.g. 12.34")
     ap.add_argument("--currency", default="EUR", help="ISO currency (default EUR)")
-    ap.add_argument("--purpose", required=True, help="Payment purpose / details")
+    ap.add_argument("--purpose", help="Payment purpose / details")
     ap.add_argument(
         "--no-preserve",
         dest="preserve",
@@ -1449,11 +1458,39 @@ def _main(guard):
         "Without registering, the transfer stays in the validation-only 'new' state (invisible).",
     )
     ap.add_argument(
+        "--register-only",
+        metavar="TRANSFER_HASH",
+        help="Do not create anything: register an EXISTING draft so it becomes visible "
+        "for signing. Use this after a create whose register step failed (exit "
+        f"{EXIT_UNREGISTERED}), or after --no-register. Needs --confirm.",
+    )
+    ap.add_argument(
         "--confirm", action="store_true", help="Actually POST. Without it, dry-run only."
     )
     args = ap.parse_args()
 
     _warn_tz_once()
+
+    # Finishing an existing draft: no payer, no payload, no duplicate check — it creates
+    # nothing, so none of that applies.
+    if args.register_only:
+        return register_only(args)
+
+    # Enforced here rather than by argparse's required=True, because --register-only
+    # needs none of them and argparse would reject that call before it reached the
+    # branch above. A missing one is still an error, with the same wording argparse used.
+    missing = [
+        flag
+        for flag, value in [
+            ("--beneficiary-name", args.beneficiary_name),
+            ("--iban", args.iban),
+            ("--amount", args.amount),
+            ("--purpose", args.purpose),
+        ]
+        if not value
+    ]
+    if missing:
+        ap.error(f"the following arguments are required: {', '.join(missing)}")
     payer = resolve_payer(args)
 
     try:
@@ -1635,8 +1672,13 @@ def _main(guard):
             for h, st, src, why in blocking:
                 print(f"  transfer {h}  status={st}  [{src}]\n    matched because: {why}")
             amount_only = all(src == "live-list" and "SAME AMOUNT" in why for _, _, src, why in blocking)
+            unregistered = any("--register-only" in why for _, _, _, why in blocking)
             print("Not creating another.")
-            if amount_only:
+            if unregistered:
+                # The remedy is above, and it is the opposite of --force. Printing the
+                # generic "use --force to override" here would contradict it.
+                pass
+            elif amount_only:
                 # Do not point at --force first. --force disables the ledger source too,
                 # including the write-ahead row that catches an unanswered POST.
                 print(
@@ -1849,31 +1891,64 @@ def _main(guard):
         # is NOT shown anywhere for signing (the cause of the old "invisible draft" problem).
         # PUT /transfers/{hash}/register (scope transfers:create) moves it to a registered,
         # signable state. Skip with --no-register.
+        # None = not attempted (--no-register); True/False = the outcome of the PUT.
+        registered = None
         if not args.no_register:
-            rcode, rj = http_json("PUT", f"{TRANSFER_API}/{transfer_hash}/register", token)
-            if rcode in ("200", "201", "204"):
+            ok, rcode, rj = register_transfer(transfer_hash, token)
+            registered = ok
+            if ok:
                 reg_status = rj.get("status") if isinstance(rj, dict) else None
                 print("  registered       : yes (visible for manual signing)", end="")
                 print(f" — status={reg_status}" if reg_status else "")
             else:
                 print(
                     f"  registered       : FAILED (HTTP {rcode}) — transfer stays in 'new' "
-                    f"(invisible). Retry: PUT {TRANSFER_API}/{transfer_hash}/register"
+                    f"(invisible)."
                 )
                 print("   ", str(rj)[:400])
         else:
             print("  registered       : skipped (--no-register) — stays 'new' (invisible).")
 
         if args.invoice_id:
+            # `registered` is recorded so a later run can tell a signable draft from an
+            # invisible one. Both used to be written as state="created", indistinguishable.
             update_ledger(
                 attempt_id,
                 state="created",
                 transfer_hash=transfer_hash,
                 status_at_create=j.get("status"),
+                registered=registered,
             )
             print("  ledger           : recorded for invoice", args.invoice_id)
-        print("\nNOT executed — this token has no sign scope. Open the Paysera app and SIGN the")
-        print("transfer (2FA) to actually send the money.")
+
+        if registered is False:
+            # Do NOT end on "open the app and sign it": there is nothing there to sign.
+            # The transfer exists, so this is not a failure to retry — exiting 1 would
+            # invite exactly the retry that creates a second draft.
+            print(
+                f"\nNOT SIGNABLE — the transfer was created but could NOT be registered, "
+                f"so it does not appear in the Paysera app or web bank.\n"
+                f"  Finish it (does not create anything new):\n"
+                f"    {sys.argv[0]} --register-only {transfer_hash} --confirm\n"
+                f"  Do NOT re-run the payment — the draft already exists, and --force "
+                f"would create a second one.",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_UNREGISTERED)
+
+        if registered is None:
+            print(
+                f"\nNOT executed, and NOT yet signable: --no-register leaves the transfer "
+                f"in 'new', which is not shown for signing.\n"
+                f"When you want it signable, run:\n"
+                f"  {sys.argv[0]} --register-only {transfer_hash} --confirm"
+            )
+        else:
+            print(
+                "\nNOT executed — this token has no sign scope. Open the Paysera app and "
+                "SIGN the"
+            )
+            print("transfer (2FA) to actually send the money.")
     else:
         print(f"\nFAILED (HTTP {code})")
         print(str(j)[:1500])
@@ -1905,6 +1980,74 @@ def _main(guard):
 
 def http_json_post(url, payload, token):
     return http_json("POST", url, token, payload=payload)
+
+
+# Exit code for "the transfer exists but is not signable". Distinct from 1 (nothing was
+# created) because the remedies are opposite: 1 invites a retry, this one must not — the
+# draft is already there and needs finishing, not repeating.
+EXIT_UNREGISTERED = 4
+
+TRANSFER_HASH_SHAPE = re.compile(r"\A[A-Za-z0-9_-]{1,128}\Z")
+
+
+def register_transfer(transfer_hash, token):
+    """PUT /transfers/{hash}/register — make an existing draft visible for signing.
+
+    Returns (ok, http_code, body). A bare POST leaves the transfer in the validation-only
+    `new` state, which is not shown anywhere for signing.
+    """
+    code, body = http_json("PUT", f"{TRANSFER_API}/{transfer_hash}/register", token)
+    return code in ("200", "201", "204"), code, body
+
+
+def mark_registered(transfer_hash, registered):
+    """Record on every ledger row for this hash whether the draft is signable."""
+    with ledger_lock():
+        data = load_ledger()
+        changed = False
+        for entry in data:
+            if entry.get("transfer_hash") == transfer_hash:
+                entry["registered"] = registered
+                changed = True
+        if changed:
+            _write_ledger(data)
+        return changed
+
+
+def register_only(args):
+    """--register-only: finish a draft that was created but never registered.
+
+    Without this the only ways out of a failed register step were a hand-written PUT
+    carrying the token, or --force — which creates a SECOND draft instead of fixing the
+    first. The remedy belongs in the tool.
+    """
+    transfer_hash = (args.register_only or "").strip()
+    if not TRANSFER_HASH_SHAPE.match(transfer_hash):
+        sys.exit(
+            f"ERROR: --register-only {transfer_hash!r} is not a transferHash "
+            f"(alphanumeric, '_' or '-', up to 128 chars)."
+        )
+    token = read_token(args.token_file)
+    if not args.confirm:
+        print(
+            f"DRY-RUN — would register transfer {transfer_hash} so it becomes visible "
+            f"for signing.\nRe-run with --confirm to send the request."
+        )
+        return
+    ok, code, body = register_transfer(transfer_hash, token)
+    if not ok:
+        mark_registered(transfer_hash, False)
+        sys.exit(
+            f"ERROR: register FAILED (HTTP {code}) for {transfer_hash}.\n"
+            f"  {str(body)[:400]}\n"
+            f"  The transfer still exists and is still NOT visible for signing. "
+            f"Re-run this command when the API is healthy."
+        )
+    status = body.get("status") if isinstance(body, dict) else None
+    print(f"OK registered {transfer_hash}" + (f" — status={status}" if status else ""))
+    if mark_registered(transfer_hash, True):
+        print("  ledger           : marked as registered")
+    print("\nIt is now visible for MANUAL SIGNING in the Paysera app / web bank (2FA).")
 
 
 if __name__ == "__main__":

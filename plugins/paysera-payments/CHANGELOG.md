@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.8.0 (2026-08-12)
+
+Twelfth review round.
+
+- **A failed register step reported success.** After creating a transfer the tool calls
+  `PUT /transfers/{hash}/register`; without it the transfer stays in `new`, which is shown
+  nowhere for signing. When that call failed the run printed the failure and then carried
+  on down the success path: the process exited **0**, the ledger row was written as
+  `state="created"` — the same value a registered transfer gets, so nothing downstream
+  could tell them apart — and the closing line, four lines after saying the transfer was
+  invisible, told the operator to open the app and sign it. A wrapper or an agent reading
+  the exit code reported the payment as ready.
+
+  Now: exit **4** (distinct from `1`, because `1` invites a retry and this draft must not
+  be created again), a closing message that says it is not signable, and `registered` on
+  the ledger row.
+- **Added `--register-only <hash>`**, so the remedy lives in the tool. Previously the only
+  ways out were a hand-written PUT carrying the token, or `--force` — which creates a
+  second draft instead of fixing the first, while the duplicate guard correctly refuses a
+  plain re-run. A later run for the same invoice now names this command in its `SKIP`
+  output, and suppresses the usual "use --force to override" line, which would contradict
+  it. `--register-only` creates nothing, so it needs none of the payment arguments; it is
+  dry-run by default like every other sending path, and validates the hash shape before
+  putting it in a URL.
+- `--no-register` now says the transfer is not yet signable, and how to make it signable,
+  instead of ending on the same "open the app and sign" line.
+- The register step had **no test coverage at all** — the one test reaching that code
+  stubbed a curl answering 201 to everything, so the register call succeeded by accident
+  of the stub. It now has twelve, covering both outcomes, both exit codes, the ledger
+  field, the remedy path, and the argument handling.
+
 ## 1.7.4 (2026-08-12)
 
 Eleventh review round.

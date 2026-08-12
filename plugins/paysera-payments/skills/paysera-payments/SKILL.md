@@ -21,6 +21,24 @@ in the validation-only `new` state, invisible everywhere), the tool calls
 app/UI. Without that register step (scope `transfers:create`) the draft stays invisible.
 Skip it with `--no-register`.
 
+If the register call **fails**, the transfer exists but cannot be seen or signed. The tool
+says so and exits **4** — distinct from `1` (nothing was created) because the remedies are
+opposite: `1` invites a retry, `4` must not, since the draft is already there. Finish it
+with the hash the run printed:
+
+```bash
+python3 ${CLAUDE_PLUGIN_ROOT}/skills/paysera-payments/scripts/create-payment.py \
+  --register-only <transferHash> --confirm
+```
+
+That creates nothing — it registers the draft you already have. It is also how to make a
+`--no-register` transfer signable later. **Do not** re-run the payment with `--force`:
+that creates a second draft instead of fixing the first. A later run for the same invoice
+is blocked as usual and points at this command.
+
+Exit codes: `0` fine · `1` nothing was created · `3` duplicate, nothing created ·
+`4` created but not registered (use `--register-only`).
+
 Scopes on the token: `accounts:read`, `transfers:read`, `transfers:create`,
 `transfers:cancel` (each scoped to the accounts you configure below).
 

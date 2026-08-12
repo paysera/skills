@@ -897,6 +897,19 @@ class ScriptHarness:
         ]
         return subprocess.run(base + list(extra), capture_output=True, text=True, env=env, timeout=60)
 
+    def run_script_bare(self, *argv):
+        """Run the script with ONLY the given arguments — no payment defaults.
+
+        --register-only creates nothing, so it must work without --amount/--iban/etc;
+        run_script's defaults would hide that.
+        """
+        env = dict(os.environ)
+        env["PATH"] = self.bin + os.pathsep + env["PATH"]
+        env["HOME"] = self.tmp
+        env["PAYSERA_PAT"] = "test-token"
+        cmd = [sys.executable, str(SCRIPTS / "create-payment.py")] + list(argv)
+        return subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=60)
+
 
 class TestCommandLineValidation(ScriptHarness, unittest.TestCase):
     """End-to-end argument checks: these live in main(), so they are exercised by running
@@ -1370,6 +1383,129 @@ class TestAccountNormalisation(unittest.TestCase):
         cleaned, note = cp.clean_account("LT12-1000-0111-0100-1000")
         self.assertEqual(cleaned, "LT121000011101001000")
         self.assertIn("LT121000011101001000", note)
+
+
+class TestRegisterStep(ScriptHarness, unittest.TestCase):
+    """A transfer that is created but not registered stays in `new`, which is shown
+    nowhere for signing — the original "invisible draft" problem.
+
+    There was no coverage here at all: the one test that reached this code stubbed a curl
+    answering 201 to everything, so the register call succeeded by accident of the stub.
+    """
+
+    def _stub(self, register_status):
+        self.write_stub(
+            'case "$*" in\n'
+            '  *register*) printf \'{"error":"e"}\\nHTTP:%s\';;\n'
+            '  *credit_account_number*) printf \'{"items":[]}\\nHTTP:200\';;\n'
+            '  *transfers/HASH123*) printf \'{"id":"HASH123","status":"new"}\\nHTTP:200\';;\n'
+            '  *) printf \'{"id":"HASH123","status":"new"}\\nHTTP:201\';;\n'
+            'esac' % register_status
+        )
+
+    def _create(self, *extra):
+        return self.run_script(
+            "--amount", "10.00", "--invoice-id", "INV-REG", "--confirm", *extra
+        )
+
+    def test_a_failed_register_does_not_report_success(self):
+        self._stub("500")
+        out = self._create()
+        self.assertEqual(
+            out.returncode, 4,
+            "exit 0 tells a wrapper the payment is ready to sign when it is invisible",
+        )
+        combined = out.stdout + out.stderr
+        self.assertIn("NOT SIGNABLE", combined)
+        self.assertIn("--register-only HASH123", combined)
+        # The old run ended on this sentence, four lines after saying it was invisible.
+        self.assertNotIn("Open the Paysera app and SIGN", out.stdout)
+
+    def test_a_failed_register_is_recorded_in_the_ledger(self):
+        self._stub("500")
+        self._create()
+        row = self.read_ledger()[0]
+        self.assertEqual(row["transfer_hash"], "HASH123")
+        self.assertIs(row["registered"], False)
+
+    def test_a_successful_register_is_recorded_in_the_ledger(self):
+        # Both outcomes used to be written as state="created", indistinguishable.
+        self.write_stub('printf \'{"id":"HASH123","status":"new"}\\nHTTP:201\'')
+        out = self._create()
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIs(self.read_ledger()[0]["registered"], True)
+        self.assertIn("Open the Paysera app and SIGN", out.stdout)
+
+    def test_the_exit_code_distinguishes_unregistered_from_not_created(self):
+        # 1 invites a retry; this draft exists and must NOT be created again.
+        self._stub("500")
+        self.assertEqual(self._create().returncode, cp.EXIT_UNREGISTERED)
+        self.assertNotEqual(cp.EXIT_UNREGISTERED, 1)
+
+    def test_a_later_run_points_at_the_remedy_and_not_at_force(self):
+        self._stub("500")
+        self._create()
+        second = self._create()
+        self.assertEqual(second.returncode, 3)
+        self.assertIn("never REGISTERED", second.stdout)
+        self.assertIn("--register-only HASH123", second.stdout)
+        self.assertNotIn(
+            "Use --force to override.", second.stdout,
+            "--force creates a second draft; it is the opposite of the remedy above",
+        )
+
+    def test_no_register_says_the_transfer_is_not_yet_signable(self):
+        self.write_stub('printf \'{"id":"HASH123","status":"new"}\\nHTTP:201\'')
+        out = self._create("--no-register")
+        self.assertEqual(out.returncode, 0, "an explicit choice is not an error")
+        self.assertIn("NOT yet signable", out.stdout)
+        self.assertIn("--register-only HASH123", out.stdout)
+        self.assertNotIn("Open the Paysera app and SIGN", out.stdout)
+
+    def test_register_only_finishes_the_draft(self):
+        self._stub("500")
+        self._create()
+        self.write_stub('printf \'{"id":"HASH123","status":"registered"}\\nHTTP:200\'')
+        out = self.run_script_bare("--register-only", "HASH123", "--confirm")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("OK registered HASH123", out.stdout)
+        self.assertIs(self.read_ledger()[0]["registered"], True)
+
+    def test_register_only_is_dry_run_by_default(self):
+        self.write_stub('echo "$@" >> %s/calls.log; printf \'{}\\nHTTP:200\'' % self.tmp)
+        out = self.run_script_bare("--register-only", "HASH123")
+        self.assertEqual(out.returncode, 0)
+        self.assertIn("DRY-RUN", out.stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "calls.log")))
+
+    def test_register_only_needs_no_payment_arguments(self):
+        # It creates nothing, so --amount/--iban/--purpose do not apply. argparse used to
+        # demand them, which made the documented remedy impossible to run.
+        self.write_stub('printf \'{"id":"HASH123","status":"registered"}\\nHTTP:200\'')
+        out = self.run_script_bare("--register-only", "HASH123", "--confirm")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+
+    def test_the_payment_arguments_are_still_required_for_a_payment(self):
+        out = self.run_script_bare("--payer", "EVP0000000000001", "--amount", "10.00")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("the following arguments are required", out.stderr)
+        for flag in ("--beneficiary-name", "--iban", "--purpose"):
+            self.assertIn(flag, out.stderr)
+
+    def test_a_malformed_hash_is_refused_before_any_request(self):
+        self.write_stub('echo "$@" >> %s/calls.log; printf \'{}\\nHTTP:200\'' % self.tmp)
+        for bad in ["../../etc/passwd", "HASH 123", "a/b", ""]:
+            with self.subTest(hash=bad):
+                out = self.run_script_bare("--register-only", bad, "--confirm")
+                self.assertNotEqual(out.returncode, 0)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "calls.log")))
+
+    def test_a_failed_register_only_reports_and_does_not_claim_success(self):
+        self.write_stub('printf \'{"error":"e"}\\nHTTP:500\'')
+        out = self.run_script_bare("--register-only", "HASH123", "--confirm")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("register FAILED", out.stdout + out.stderr)
+        self.assertNotIn("OK registered", out.stdout)
 
 
 class TestDuplicateCheckWindow(ScriptHarness, unittest.TestCase):
