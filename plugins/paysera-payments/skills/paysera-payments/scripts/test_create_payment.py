@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import io
 import json
 import os
 import re
@@ -613,6 +614,53 @@ class TestResolvePayer(unittest.TestCase):
 class TestListTransfers(unittest.TestCase):
     """Two shipped defects lived here — the wrong direction parameter and broken
     pagination — and both made the duplicate check silently incomplete."""
+
+    def _paged_api(self, total, with_metadata_total=False):
+        """A stub endpoint holding `total` transfers, answered 100 to a page."""
+        def fake(method, url, token, payload=None):
+            offset = int(url.split("offset=")[1])
+            rows = [{"id": f"T{i}"} for i in range(offset, min(offset + 100, total))]
+            body = {"items": rows}
+            if with_metadata_total:
+                body["_metadata"] = {"total": total}
+            return "200", body
+        return fake
+
+    def test_hitting_the_page_cap_is_reported_not_silent(self):
+        # Every other incomplete path warns; running out of pages returned a partial list
+        # that the caller could not tell from a complete one. It then prints its usual
+        # "scanned payments … since <date>" line over a truncated result.
+        with mock.patch.object(cp, "http_json", self._paged_api(12000)):
+            with mock.patch.object(sys, "stderr", io.StringIO()) as err:
+                got = cp.list_transfers("t", "EVP1", 0)
+        self.assertEqual(len(got), 5000, "the cap itself is unchanged")
+        message = err.getvalue()
+        self.assertIn("INCOMPLETE", message)
+        self.assertIn("5000", message, "the operator needs to know how much was read")
+        self.assertIn("--invoice-date", message, "and what to do about it")
+
+    def test_a_complete_scan_says_nothing(self):
+        # The warning must not fire on an ordinary run, or it becomes noise and stops
+        # being read. Exercised for each of the three honest ways the walk can end.
+        for label, total, meta in [
+            ("short final page", 250, False),
+            ("exact page boundary", 200, False),
+            ("total reported in metadata", 500, True),
+        ]:
+            with self.subTest(ending=label):
+                with mock.patch.object(cp, "http_json", self._paged_api(total, meta)):
+                    with mock.patch.object(sys, "stderr", io.StringIO()) as err:
+                        got = cp.list_transfers("t", "EVP1", 0)
+                self.assertEqual(len(got), total)
+                self.assertEqual(err.getvalue(), "", f"{label} warned when complete")
+
+    def test_a_scan_that_exactly_fills_the_cap_is_not_a_false_alarm(self):
+        # 5000 rows in 50 full pages: page 51 comes back empty, which is an honest end.
+        with mock.patch.object(cp, "http_json", self._paged_api(5000)):
+            with mock.patch.object(sys, "stderr", io.StringIO()) as err:
+                got = cp.list_transfers("t", "EVP1", 0, max_pages=51)
+        self.assertEqual(len(got), 5000)
+        self.assertEqual(err.getvalue(), "")
 
     def test_queries_the_payer_side_not_the_beneficiary_side(self):
         # credit_account_number = the account is the PAYER (outgoing). Querying

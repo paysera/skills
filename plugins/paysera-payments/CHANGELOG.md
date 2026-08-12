@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.7.4 (2026-08-12)
+
+Eleventh review round.
+
+- **The duplicate scan's page cap truncated the result without saying so.**
+  `list_transfers()` reads at most 50 pages of 100. Every other way that walk can end is
+  honest — an empty page, a short page and a reached total all mean the end of the data,
+  and an HTTP error prints a loud warning — but running out of pages returned a partial
+  list the caller could not tell from a complete one, and the run then printed its usual
+  "scanned payments … since \<date\>" line over it. Verified with a stubbed 12000-transfer
+  window: 5000 read, 7000 dropped, nothing on stderr. Reaching the cap now warns in the
+  same terms as the HTTP-error path, naming how many rows were read and pointing at
+  `--invoice-date` to narrow the window. Raising the cap would not have fixed it — the
+  silence was the defect.
+
+  It needs a busy payer account together with an old `--invoice-date` to bite, and the
+  ledger source is unaffected. It is fixed because it is the same shape as the last three
+  rounds' findings: a partial check reporting as complete.
+
 ## 1.7.3 (2026-08-12)
 
 Tenth review round.

@@ -383,6 +383,12 @@ falls back to the ledger, which remains the guaranteed guard against e.g. an hou
 firing twice. Take that warning seriously — with only the ledger, a duplicate made by
 hand in the Paysera app is invisible.
 
+The scan also stops after 5000 transfers (50 pages of 100), which a busy payer account can
+exceed over a long window. **That, too, warns on stderr**, naming how many rows were read:
+every way this check can come back incomplete says so, because a partial scan that reports
+as complete is worse than one that fails outright. Narrow the window with `--invoice-date`
+if you see it.
+
 > **Pass all the invoice's IBANs.** The check is only as complete as the IBANs you give
 > it. If the invoice lists two banks, `--also-iban` the second one — otherwise a prior
 > payment to that other account would be missed.

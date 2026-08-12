@@ -628,6 +628,10 @@ def list_transfers(token, payer_account, created_from, max_pages=50):
     page 2 (39 < limit=100), so the breakage went unseen. Rows are deduped by id —
     page boundaries can shift while new transfers land.
 
+    PAGE CAP: at most `max_pages` pages are read. Reaching that cap is REPORTED on
+    stderr (see the `else` below) — a truncated list that reads as a complete one is the
+    same defect class as a scan window that disagrees with its own report.
+
     LIMITATION (verified 2026-06-29): this endpoint returns only EXECUTED/terminal
     transfers (done/revoked/failed/rejected); it does NOT list unsigned drafts
     (new/registered/signed), and its `status` query param is ignored. So the live
@@ -671,6 +675,19 @@ def list_transfers(token, payer_account, created_from, max_pages=50):
             break
         if isinstance(total, int) and (page + 1) * page_size >= total:
             break
+    else:
+        # Reached only when the loop ran out of pages: every honest end (empty page,
+        # short page, total reached) and the HTTP-error path all `break`. Without this,
+        # hitting the cap returned a partial list indistinguishable from a complete one —
+        # the same shape as the defects fixed in 1.7.1 and 1.7.2, a partial check
+        # reporting as complete. Raising the cap would not fix it; the silence is the bug.
+        print(
+            f"WARNING: live duplicate check INCOMPLETE — stopped at the {max_pages}-page "
+            f"cap after reading {len(items)} transfers, and there are more in this "
+            f"window. A duplicate older than those may not be detected.\n"
+            f"         Narrow the window with --invoice-date, or verify manually.",
+            file=sys.stderr,
+        )
     return items
 
 
