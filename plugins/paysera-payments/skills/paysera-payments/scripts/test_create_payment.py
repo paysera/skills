@@ -1016,6 +1016,40 @@ class TestCommandLineValidation(ScriptHarness, unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertNotIn("outside the SEPA zone", out.stdout)
 
+    def test_a_paysera_iban_wins_even_when_written_with_separators(self):
+        # 1.7.1 stripped separators at one call site, AFTER the payee had been chosen,
+        # and never touched --also-iban at all. A Paysera IBAN pasted from an invoice
+        # therefore lost the payment while the printed reason said none was listed.
+        out = self.run_script(
+            "--amount", "10.00",
+            "--iban", "LT121000011101001000",
+            "--also-iban", "LT60-3500-0100-0123-4567",
+        )
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("Paysera IBAN (bank code 35000)", out.stdout)
+        self.assertEqual(
+            self._payload(out)["beneficiary"]["bank_account"]["iban"], "LT603500010001234567"
+        )
+        self.assertNotIn("-", self._payload(out)["beneficiary"]["bank_account"]["iban"])
+
+    def test_every_listed_iban_is_normalised_not_just_the_first(self):
+        out = self.run_script(
+            "--amount", "10.00",
+            "--iban", "LT12-1000-0111-0100-1000",
+            "--also-iban", "LT74 4010 0510 0324 1521",
+            "--also-iban", "LT36.7300.0101.2345.6789",
+        )
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        listed = out.stdout.split("dup-check only:", 1)[1].splitlines()[0]
+        # Split on the display separator first — the remaining accounts must each be bare.
+        accounts = [a.strip() for a in listed.split(",") if a.strip()]
+        self.assertEqual(len(accounts), 2, listed)
+        for account in accounts:
+            with self.subTest(account=account):
+                self.assertRegex(account, r"\A[A-Z]{2}[0-9A-Z]+\Z")
+        self.assertIn("LT744010051003241521", accounts)
+        self.assertIn("LT367300010123456789", accounts)
+
     def test_a_malformed_invoice_date_is_refused_not_quietly_ignored(self):
         # It used to warn on stderr, keep the default window, and then print "since
         # <the malformed value>" on stdout — two streams disagreeing about the period a
@@ -1046,6 +1080,30 @@ class TestCommandLineValidation(ScriptHarness, unittest.TestCase):
             sent = int(re.search(r"created_date_from=(\d+)", f.read()).group(1))
         expected = cp.parse_invoice_date("2026-06-15") - 86400
         self.assertEqual(sent, expected)
+
+    def test_a_future_invoice_date_is_refused(self):
+        # A window starting after today can hold no transfer, so the live half of the
+        # duplicate check is disabled — and it then reports "no prior payments", which
+        # reads as an all-clear. A mistyped year is the usual way in.
+        self.write_stub(
+            'echo "$@" >> %s/calls.log; printf \'{"items":[]}\\nHTTP:200\'' % self.tmp
+        )
+        future = (datetime.date.today() + datetime.timedelta(days=400)).isoformat()
+        out = self.run_script(
+            "--amount", "10.00", "--invoice-id", "INV-1", "--invoice-date", future
+        )
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("is in the future", out.stdout + out.stderr)
+        self.assertNotIn("No prior payments", out.stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "calls.log")))
+
+    def test_todays_invoice_date_is_accepted(self):
+        # The boundary: an invoice issued today is ordinary, and must not be refused.
+        out = self.run_script(
+            "--amount", "10.00", "--invoice-id", "INV-1",
+            "--invoice-date", datetime.date.today().isoformat(),
+        )
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
 
     def test_an_iban_written_with_separators_is_normalised_not_rejected(self):
         # A hyphenated IBAN is a formatting slip. Telling the operator it "is not an
@@ -1137,6 +1195,65 @@ class TestWriteAheadLedger(ScriptHarness, unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["state"], "created")
         self.assertEqual(rows[0]["transfer_hash"], "HASH123")
+
+
+class TestAccountNormalisation(unittest.TestCase):
+    """_norm_iban drives three decisions — which listed IBAN is paid, the duplicate
+    check's candidate set, and de-duplication of the listed IBANs — so a spelling it
+    cannot see through breaks all three at once."""
+
+    def test_norm_iban_sees_through_every_separator(self):
+        for spelling in [
+            "LT60 3500 0100 0123 4567",
+            "LT60-3500-0100-0123-4567",
+            "LT60.3500.0100.0123.4567",
+            "lt6035000100 0123-4567",
+            "LT60‐3500‑0100–0123—4567",  # unicode dashes
+        ]:
+            with self.subTest(spelling=spelling):
+                self.assertEqual(cp._norm_iban(spelling), "LT603500010001234567")
+
+    def test_a_paysera_iban_is_recognised_through_separators(self):
+        for spelling in ["LT60-3500-0100-0123-4567", "LT60 3500 0100 0123 4567"]:
+            with self.subTest(spelling=spelling):
+                self.assertTrue(cp.is_paysera_iban(spelling))
+
+    def test_the_duplicate_check_matches_a_separated_candidate(self):
+        # Scenario B of the report: the API returns the IBAN without separators, so an
+        # unnormalised candidate could never match, and the account contributed nothing
+        # to the check while still being counted as scanned.
+        rows = [
+            {
+                "id": "OLD1",
+                "status": "done",
+                "amount": {"amount": "250.00", "currency": "EUR"},
+                "beneficiary": {"bank_account": {"iban": "LT603500010001234567"}},
+                "purpose": {"details": "unrelated"},
+            }
+        ]
+        for spelling in ["LT60-3500-0100-0123-4567", "LT603500010001234567"]:
+            with self.subTest(spelling=spelling):
+                with mock.patch.object(cp, "list_transfers", lambda *a, **k: rows), \
+                        mock.patch.object(cp, "load_ledger", lambda: []):
+                    blocking, seen = cp.find_blocking(
+                        "INV-1", "t", payer="EVP1",
+                        ibans=["LT121000011101001000", spelling],
+                        amount="250.00", currency="EUR",
+                    )
+                self.assertTrue(blocking, "a prior payment to this account was missed")
+                self.assertTrue(seen)
+
+    def test_clean_account_leaves_a_non_iban_number_alone(self):
+        # Stripping punctuation from a national account number is not safe — there is no
+        # rule saying its separators are decorative.
+        cleaned, note = cp.clean_account("2050-7231-0000-12345")
+        self.assertEqual(cleaned, "2050-7231-0000-12345")
+        self.assertIsNone(note)
+
+    def test_clean_account_reports_what_it_changed(self):
+        cleaned, note = cp.clean_account("LT12-1000-0111-0100-1000")
+        self.assertEqual(cleaned, "LT121000011101001000")
+        self.assertIn("LT121000011101001000", note)
 
 
 class TestDuplicateCheckWindow(ScriptHarness, unittest.TestCase):

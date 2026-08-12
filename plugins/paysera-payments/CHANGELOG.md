@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.7.2 (2026-08-12)
+
+Ninth review round.
+
+- **The 1.7.1 separator fix was applied at one call site, and was the wrong one.** It
+  stripped separators from `--iban` only, and only *after* `select_beneficiary_iban()`
+  had already chosen the payee, leaving `--also-iban` untouched entirely. Two consequences,
+  both verified: a Paysera IBAN pasted as `LT60-3500-…` in `--also-iban` lost the payment
+  while the run printed "no Paysera IBAN listed" on the line above it; and, worse, the
+  duplicate check compared candidates with `_norm_iban()`, which stripped spaces only, so
+  a separated account could never match what the API returns and contributed nothing to
+  the check — while the run still counted it as scanned. SKILL.md tells the operator to
+  pass every IBAN the invoice lists; one of them was silently doing nothing.
+
+  The normalisation now lives in `_norm_iban()`, which is the shared helper behind all
+  three decisions that read an IBAN, and every listed account is cleaned before any of
+  them is compared or chosen. Unicode dashes are handled too. The narrower rule for the
+  value actually **sent** is unchanged: separators are removed only when what remains is
+  a well-formed IBAN, so a national account number keeps its punctuation.
+- A **future** `--invoice-date` is now refused. The window would start after today, hold
+  no transfer, and the run would then report "no prior payments to those IBANs" — an
+  all-clear from a check that could not have found anything. A mistyped year is the usual
+  way in. Today's date is still accepted, which is the boundary that matters.
+- The publication gate now flags a **bare issue-tracker key**, not just a tracker URL.
+  CONTRIBUTING.md forbids ticket references in files and commit messages outright, so the
+  gate's narrower rule made the documented promise stronger than the check behind it.
+  Standards and formats share the exact shape (`ISO-2`, `RFC-1918`, `UTF-8`, `SHA-256`),
+  so a prefix allowlist carries those and this repository's placeholders; anything else
+  is treated as a possible ticket. Both halves are pinned by samples.
+
 ## 1.7.1 (2026-08-12)
 
 Eighth review round.

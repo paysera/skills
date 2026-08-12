@@ -674,8 +674,66 @@ def list_transfers(token, payer_account, created_from, max_pages=50):
     return items
 
 
+# An IBAN's canonical form has no separators. People paste them from invoices with
+# spaces, hyphens or dots, and every comparison in this file has to see through all three.
+IBAN_SHAPE = re.compile(r"\A[A-Z]{2}[0-9A-Z]{13,32}\Z")
+ACCOUNT_SEPARATORS = re.compile(r"[\s.\-‐‑‒–—―]")
+
+
 def _norm_iban(s):
-    return (s or "").replace(" ", "").upper()
+    """Canonical form for COMPARING account numbers.
+
+    Strips every separator, not just spaces. This helper drives three decisions — which
+    listed IBAN gets paid (via is_paysera_iban), the duplicate check's candidate set, and
+    the de-duplication of the listed IBANs — so a spelling it cannot see through silently
+    breaks all three. 1.7.1 stripped separators at ONE call site instead of here, which
+    left `--also-iban LT60-3500-…` invisible to the payee rule and to the duplicate check
+    while the run still reported it as scanned.
+    """
+    return ACCOUNT_SEPARATORS.sub("", (s or "")).upper()
+
+
+def clean_account(value):
+    """Canonical form for the account number actually SENT, plus a note if it changed.
+
+    Deliberately narrower than _norm_iban: separators are removed only when what remains
+    is a well-formed IBAN. A national account number that is not an IBAN (the Armenian
+    "2050…" format) keeps whatever punctuation it was given, because there is no rule
+    saying its separators are decorative.
+    """
+    raw = (value or "").strip().upper()
+    squeezed = raw.replace(" ", "")
+    if IBAN_SHAPE.match(squeezed):
+        return squeezed, None
+    stripped = ACCOUNT_SEPARATORS.sub("", squeezed)
+    if stripped != squeezed and IBAN_SHAPE.match(stripped):
+        return stripped, f"{raw} -> {stripped}"
+    return squeezed, None
+
+
+def clean_accounts(primary, also):
+    """Normalise every listed account BEFORE any of them is compared or chosen.
+
+    Must run ahead of select_beneficiary_iban(): that is where a Paysera IBAN wins the
+    payment, and an unnormalised one loses it while the printed reason says no Paysera
+    IBAN was listed at all.
+    """
+    notes = []
+    cleaned_primary, note = clean_account(primary)
+    if note:
+        notes.append(note)
+    cleaned_also = []
+    for account in also or []:
+        cleaned, note = clean_account(account)
+        cleaned_also.append(cleaned)
+        if note:
+            notes.append(note)
+    if notes:
+        print(
+            "NOTE: an IBAN has no separators; using " + "; ".join(notes),
+            file=sys.stderr,
+        )
+    return cleaned_primary, cleaned_also
 
 
 def is_paysera_iban(s):
@@ -1366,6 +1424,11 @@ def _main(guard):
     token = read_token(args.token_file)
 
     # --- Beneficiary IBAN selection (multi-IBAN invoices) -----------------------
+    # Normalise EVERY listed account first. This has to precede the selection below: that
+    # is where a Paysera IBAN wins the payment, and one written with separators would lose
+    # it while the printed reason claimed no Paysera IBAN was listed.
+    args.iban, args.also_iban = clean_accounts(args.iban, args.also_iban)
+
     # An invoice may list several beneficiary IBANs (e.g. SEB AND Luminor). Pay to the
     # Paysera one (LTkk35000…) if any is listed, else the first listed. This is enforced
     # here so it holds no matter the order --iban/--also-iban were given in. Every listed
@@ -1397,14 +1460,30 @@ def _main(guard):
     # the default window on a parse failure made the duplicate scan narrower than the
     # printed report claimed — and for an invoice older than the default window, a real
     # duplicate could sit outside the scan while stdout said it had been covered.
-    if args.invoice_date and parse_invoice_date(args.invoice_date) is None:
-        sys.exit(
-            f"ERROR: --invoice-date {args.invoice_date!r} is not YYYY-MM-DD.\n"
-            f"  It sets the period the duplicate check scans, so it is not guessed — "
-            f"a day-first date like 06/07/2026 is ambiguous.\n"
-            f"  Write it as 2026-07-06, or omit it to scan the last "
-            f"{DEFAULT_LOOKBACK_DAYS} days."
-        )
+    if args.invoice_date:
+        parsed_invoice_date = parse_invoice_date(args.invoice_date)
+        if parsed_invoice_date is None:
+            sys.exit(
+                f"ERROR: --invoice-date {args.invoice_date!r} is not YYYY-MM-DD.\n"
+                f"  It sets the period the duplicate check scans, so it is not guessed — "
+                f"a day-first date like 06/07/2026 is ambiguous.\n"
+                f"  Write it as 2026-07-06, or omit it to scan the last "
+                f"{DEFAULT_LOOKBACK_DAYS} days."
+            )
+        # A window that starts in the future can hold no transfer, so the live half of
+        # the duplicate check is disabled — and it reports "no prior payments", which
+        # reads as an all-clear. A mistyped year is the usual way in. `--perform-at`
+        # already refuses a past date for the same class of reason.
+        if parsed_invoice_date > int(datetime.datetime.now(_VILNIUS).timestamp()):
+            sys.exit(
+                f"ERROR: --invoice-date {args.invoice_date} is in the future "
+                f"(today is {_vilnius_today()} in Vilnius).\n"
+                f"  It is the date the invoice was ISSUED, and it sets the start of the "
+                f"duplicate scan — a future date scans an empty period and then reports "
+                f"no prior payments, which looks like an all-clear.\n"
+                f"  Check the year, or omit it to scan the last "
+                f"{DEFAULT_LOOKBACK_DAYS} days."
+            )
 
     # A national account number that is not an IBAN (e.g. the Armenian "2050…" format,
     # supported further down) starts with digits, so neither the IBAN prefix nor an
@@ -1415,22 +1494,10 @@ def _main(guard):
     # then refuses the transfer with 'mapper_beneficiary_country_not_set' — exactly the
     # late, cryptic failure these pre-flight checks exist to replace. An unknown country
     # is not domestic; ask for the BIC, which carries the country in chars 5-6.
-    acct_raw = (args.iban or "").replace(" ", "").upper()
-    is_iban = bool(re.fullmatch(r"[A-Z]{2}[0-9A-Z]{13,32}", acct_raw))
-    if not is_iban:
-        # An IBAN written with separators is a formatting slip, not a foreign account
-        # number: telling the operator it "is not an IBAN" and demanding a BIC sends them
-        # after the wrong problem. Spaces are already normalised away above; hyphens and
-        # dots are the other spellings people paste from invoices.
-        stripped = re.sub(r"[-.‐-―]", "", acct_raw)
-        if stripped != acct_raw and re.fullmatch(r"[A-Z]{2}[0-9A-Z]{13,32}", stripped):
-            print(
-                f"NOTE: --iban {args.iban!r} contains separators; using {stripped}. "
-                f"An IBAN has none.",
-                file=sys.stderr,
-            )
-            args.iban = acct_raw = stripped
-            is_iban = True
+    # Separators were already removed by clean_accounts() above — for EVERY listed
+    # account, not just this one, and before the payee was chosen from among them.
+    acct_raw = args.iban or ""
+    is_iban = bool(IBAN_SHAPE.match(acct_raw))
     if not is_iban and not args.beneficiary_bic:
         sys.exit(
             f"ERROR: {acct_raw!r} is not an IBAN, so the beneficiary's country cannot be "

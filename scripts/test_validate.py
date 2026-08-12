@@ -85,6 +85,23 @@ SAMPLES = [
     ("11.0.0.1 is public", False, "just past 10/8"),
     ("192.169.0.1 is public", False, "just past 192.168/16"),
     ("requires version 10.0.0.5 or later", True, "a version string reads as an address"),
+    # --- bare issue-tracker keys ----------------------------------------------------
+    # CONTRIBUTING.md forbids ticket references outright, not merely tracker links: a
+    # bare key in a comment says as much about internal work as a URL does.
+    ("see ABC-1234 for the rationale", True, "bare ticket key in prose"),
+    ("fixes XYZ-99", True, "bare ticket key, short number"),
+    ("see `PROJ-42`", True, "bare ticket key in backticks"),
+    ("# workaround for QWERTY-7", True, "bare ticket key in a code comment"),
+    # Standards and formats are spelled exactly like ticket keys, so the prefix
+    # allowlist is what separates them. Each of these must stay quiet.
+    ("the ISO-2 country code", False, "standards prefix"),
+    ("RFC-1918 private ranges", False, "standards prefix"),
+    ("UTF-8 encoding throughout", False, "format prefix"),
+    ("SHA-256 digest", False, "algorithm prefix"),
+    ("CVE-2024-1234 is public", False, "public vulnerability id"),
+    ("tracks INV-2026-001", False, "this repository's invoice placeholder"),
+    ("a KEY-123 placeholder", False, "the documented tracker-URL placeholder"),
+    ("version 2.1-3 here", False, "not a key: does not start with a letter"),
 ]
 
 

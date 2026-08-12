@@ -310,7 +310,10 @@ Pass `--invoice-id <id>` when creating, and **pass `--invoice-date YYYY-MM-DD` t
 whenever you have it. It is optional but not merely cosmetic: it sets the window the live
 cross-check scans, so it must be ISO — a day-first `15/06/2026` is **refused**, not
 guessed at, because a date the operator typed is a date they expect to be used, and a
-scan narrower than the one reported is worse than a stop. Without it the tool scans the
+scan narrower than the one reported is worse than a stop. A date in the **future** is
+refused for the same reason: the window would start after today, hold nothing, and then
+report "no prior payments" — an all-clear from a check that never ran. Without it the
+tool scans the
 **last 90 days**, and in that window a
 prior transfer to the same IBAN for the **same amount** blocks even when its purpose names
 a different invoice — which is exactly what a supplier billed the same sum every month
@@ -381,6 +384,12 @@ hand in the Paysera app is invisible.
 > **Pass all the invoice's IBANs.** The check is only as complete as the IBANs you give
 > it. If the invoice lists two banks, `--also-iban` the second one — otherwise a prior
 > payment to that other account would be missed.
+>
+> Paste them however the invoice prints them. Spaces, hyphens and dots are stripped from
+> every listed IBAN before anything compares or chooses between them, and the tool says
+> on stderr what it changed. That normalisation is shared by all three decisions that
+> read an IBAN — which one gets paid, which count as duplicates, and de-duplication of
+> the list itself — so no spelling can be visible to one and invisible to another.
 
 ## Cancel / delete a transfer
 

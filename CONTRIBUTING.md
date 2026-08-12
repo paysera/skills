@@ -41,6 +41,16 @@ repository (not just `plugins/`) and fails on:
   only inside a URL;
 - a URL that looks like an issue tracker or forge link (`/browse/KEY-123`, `/jira/`,
   `/confluence/`, `/-/merge_requests/`);
+- a **bare issue-tracker key** anywhere, with no URL around it — an uppercase project
+  prefix, a hyphen and a number, the shape every tracker uses. A key in a comment or a
+  commit message references internal work just as a link does, and the rule above forbids
+  ticket references, not merely tracker links. (This paragraph describes the shape instead
+  of giving an example, because the gate checks its own documentation and a realistic
+  example would fail it — same as the IP ranges above.) Standards and formats are
+  spelled identically (`ISO-2`, `RFC-1918`, `UTF-8`, `SHA-256`), so a prefix allowlist,
+  `NON_TICKET_PREFIXES`, carries those plus this repository's own placeholders. Anything
+  not on it is treated as a possible ticket: if you trip the gate on a genuine standard,
+  add the prefix there, with the same scrutiny as a new sample;
 - a private or loopback IPv4 address (`10/8`, `172.16/12`, `192.168/16`, `127/8`,
   `169.254/16`), anywhere, in or out of a URL. Hostname matching cannot see these — an
   address has no letters-only final label — and naming an internal dashboard, database or

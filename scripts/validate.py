@@ -74,6 +74,25 @@ TRACKER_URL = re.compile(
     re.IGNORECASE,
 )
 
+# A ticket key needs no URL around it to be a leak — "see ABC-1234 for the rationale" in a
+# comment or a commit message says just as much about internal work as a link does, and
+# CONTRIBUTING.md forbids ticket references outright, not merely tracker links.
+TICKET_KEY = re.compile(r"(?<![\w-])([A-Z][A-Z0-9]{1,9})-(\d{1,6})(?![\w-])")
+# Prefixes that are not project keys. Standards and formats are spelled exactly like a
+# ticket key, and so are this repository's own placeholder families. Anything NOT listed
+# here is treated as a possible ticket, so the gate fails closed: a contributor who trips
+# it on a genuine standard adds the prefix here, with the same scrutiny as a new sample.
+NON_TICKET_PREFIXES = frozenset(
+    {
+        # standards, formats and algorithms
+        "ISO", "UTF", "RFC", "PEP", "CVE", "CWE", "SHA", "MD", "AES", "RSA", "TLS",
+        "SSL", "HTTP", "HTTPS", "IPV", "ASCII", "UTC", "GMT", "EET", "EEST", "SEPA",
+        "SWIFT", "BIC", "IBAN", "EUR", "USD", "GBP", "PSD", "API", "SPDX",
+        # placeholders used in this repository's own examples
+        "INV", "KEY", "EX", "EVP", "LT",
+    }
+)
+
 
 def load_json(path: Path, errors: list):
     """Parse a manifest, reporting a syntax error the way every other failure here is
@@ -310,6 +329,14 @@ def scan_published_content():
                 errors.append(
                     f"{rel}:{number}: '{match.group(0)}' is a private/loopback IP "
                     f"address — it names a host only reachable inside a network"
+                )
+            for match in TICKET_KEY.finditer(line):
+                if match.group(1).upper() in NON_TICKET_PREFIXES:
+                    continue
+                errors.append(
+                    f"{rel}:{number}: '{match.group(0)}' looks like an issue-tracker key "
+                    f"— published content must not reference internal tickets. If this is "
+                    f"a standard or a placeholder, add its prefix to NON_TICKET_PREFIXES"
                 )
             for url in TRACKER_URL.findall(line):
                 errors.append(
