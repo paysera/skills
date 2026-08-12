@@ -40,16 +40,28 @@ repository (not just `plugins/`) and fails on:
   `.test` and `.invalid` are reserved TLDs but also ordinary file suffixes, so they count
   only inside a URL;
 - a URL that looks like an issue tracker or forge link (`/browse/KEY-123`, `/jira/`,
-  `/confluence/`, `/-/merge_requests/`).
+  `/confluence/`, `/-/merge_requests/`);
+- a private or loopback IPv4 address (`10/8`, `172.16/12`, `192.168/16`, `127/8`,
+  `169.254/16`), anywhere, in or out of a URL. Hostname matching cannot see these — an
+  address has no letters-only final label — and naming an internal dashboard, database or
+  CI box by IP is at least as common as naming it by hostname. Public addresses are not
+  flagged, since an example may legitimately use one. A four-part version string that
+  falls inside one of those ranges is flagged too; that is the right way round for a
+  backstop, and it is why this paragraph describes the ranges instead of spelling one out
+  — the gate checks its own documentation.
 
 It is a **backstop, not the review**. It cannot see an internal service or database name
 written in prose, an internal tool referred to by name, an internal wiki link on a domain
 it does not recognise, a real account number that looks like a placeholder, or a ticket key
-in a commit message. One limit is deliberate and worth knowing: an `internal`/`intranet`
-label under an *uncommon* gTLD is not detected, because at that point a hostname and a
-dotted code path are indistinguishable. Widening it would bring the code false positives
-back. A human reviewer must check those, and must state in the pull request
-that they did.
+in a commit message. Two limits are deliberate and worth knowing:
+
+- an `internal`/`intranet` label under an *uncommon* gTLD is not detected, because at that
+  point a hostname and a dotted code path are indistinguishable. Widening it would bring
+  the code false positives back;
+- only IPv4 is matched, and only the private ranges above. An IPv6 address, or an internal
+  service on a routable address, is not detected.
+
+A human reviewer must check those, and must state in the pull request that they did.
 
 The gate has its own tests in `scripts/test_validate.py`, table-driven over the samples it
 must flag and the samples it must not. Add to that table whenever you change the rules —

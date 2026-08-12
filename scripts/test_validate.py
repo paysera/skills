@@ -66,6 +66,25 @@ SAMPLES = [
     ("https://config.test/path", True, "reserved TLD used as a real host"),
     # Both spellings on one line: "in a URL" is decided per occurrence, not per line.
     ("`config.test` is a file; https://config.test/x is a host", True, "URL wins on its own"),
+    # --- private IP addresses -------------------------------------------------------
+    # The HOSTNAME pattern requires a letters-only last label, so it can never match an
+    # address. Naming an internal box by IP is at least as common as naming it by host.
+    ("see http://10.20.30.40/dashboard for the queue", True, "RFC1918 10/8 in a URL"),
+    ("see https://192.168.1.50:8080/jenkins", True, "RFC1918 192.168/16 with a port"),
+    ("DB_HOST=172.16.4.9", True, "RFC1918 172.16/12 in a shell assignment"),
+    ("ssh deploy@10.0.0.5", True, "private address outside any URL"),
+    ("https://127.0.0.1:9000/admin", True, "loopback address"),
+    ("host: 169.254.10.1", True, "link-local address in a YAML value"),
+    ("`10.1.2.3`", True, "private address in backticks"),
+    ("grafana at https://wiki.localhost/panel", True, "reserved .localhost TLD"),
+    # A public address may legitimately appear in an example, and 172.32 is outside the
+    # RFC 1918 block — the boundaries have to be exact or the gate cries wolf.
+    ("connect to 8.8.8.8 for DNS", False, "public address"),
+    ("172.32.0.1 is outside the private range", False, "just past 172.16/12"),
+    ("172.15.0.1 is outside the private range", False, "just before 172.16/12"),
+    ("11.0.0.1 is public", False, "just past 10/8"),
+    ("192.169.0.1 is public", False, "just past 192.168/16"),
+    ("requires version 10.0.0.5 or later", True, "a version string reads as an address"),
 ]
 
 

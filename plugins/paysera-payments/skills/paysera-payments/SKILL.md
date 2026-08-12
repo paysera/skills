@@ -308,7 +308,10 @@ in `SEPA_COUNTRIES` in `create-payment.py`, with the date it was last checked.
 
 Pass `--invoice-id <id>` when creating, and **pass `--invoice-date YYYY-MM-DD` too**
 whenever you have it. It is optional but not merely cosmetic: it sets the window the live
-cross-check scans. Without it the tool scans the **last 90 days**, and in that window a
+cross-check scans, so it must be ISO — a day-first `15/06/2026` is **refused**, not
+guessed at, because a date the operator typed is a date they expect to be used, and a
+scan narrower than the one reported is worse than a stop. Without it the tool scans the
+**last 90 days**, and in that window a
 prior transfer to the same IBAN for the **same amount** blocks even when its purpose names
 a different invoice — which is exactly what a supplier billed the same sum every month
 looks like. The `SKIP` output says which rule matched, so an amount-only match is

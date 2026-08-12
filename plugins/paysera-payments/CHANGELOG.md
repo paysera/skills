@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.7.1 (2026-08-12)
+
+Eighth review round.
+
+- **The duplicate-check report could name a window that was not scanned.** A malformed
+  `--invoice-date` warned on stderr and fell back to the 90-day window, while stdout said
+  "since \<the malformed value\>" — two streams disagreeing about the period a
+  money-safety check covered, and for an invoice older than the default window a real
+  duplicate could sit outside the scan that stdout claimed had covered it. A day-first
+  date is now refused outright: a date the operator typed is one they expect to be used.
+  The window and the sentence describing it also come from one helper now, so they cannot
+  drift again.
+- The lock guard was an `ExitStack` that nothing closed, so its release depended on
+  refcounting collecting the stack rather than on the scope the comments claimed. Nothing
+  failed in practice — the process exits immediately after and the kernel drops the flock
+  — but `main()` now owns the stack explicitly and releases it on every exit path.
+- **The publication gate could not see an IP address at all.** Hostname matching requires
+  a letters-only final label, so a private-address URL — a usual way to name an internal
+  dashboard, database or CI server — passed cleanly, and CONTRIBUTING.md's list of blind
+  spots did not mention it, so a reviewer trusting that list would think the class was
+  covered. Private and loopback IPv4 ranges are now flagged wherever they appear, and
+  `.localhost` was added to the reserved-TLD list. The remaining limits (IPv6, internal
+  services on routable addresses) are now written down.
+- An IBAN written with separators (`LT12-1000-…`) was rejected as "not an IBAN" with a
+  demand for a BIC, sending the operator after the wrong problem. Separators are stripped
+  when what remains is a valid IBAN, with a note; a genuine non-IBAN account number is
+  still refused as before.
+
 ## 1.7.0 (2026-08-12)
 
 Seventh review round — the first since 1.6.0 to change the shipped skill rather than the

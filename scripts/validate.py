@@ -40,7 +40,23 @@ PUBLIC_PAYSERA_HOSTS = frozenset(
 # "intranet"/"internal" anywhere in the name (paysera.intranet.lt, wiki.internal), ...
 INTERNAL_HOST_LABEL = re.compile(r"(?:^|\.)(?:intranet|internal)(?:\.|$)", re.IGNORECASE)
 # ... and these only as the final label, where they are non-routable by convention.
-INTERNAL_HOST_TLD = re.compile(r"\.(?:local|lan|corp|localdomain|home|test|invalid)$", re.IGNORECASE)
+INTERNAL_HOST_TLD = re.compile(
+    r"\.(?:local|localhost|lan|corp|localdomain|home|test|invalid)$", re.IGNORECASE
+)
+# HOSTNAME cannot match an IP address — its last label must be letters — so a private
+# address was invisible to every rule above. Naming an internal dashboard, database or CI
+# server by IP is at least as common as naming it by hostname, so these are matched
+# separately: RFC 1918 (10/8, 172.16/12, 192.168/16), loopback (127/8) and link-local
+# (169.254/16). Public IPs are NOT flagged — a published example may legitimately use one.
+PRIVATE_IPV4 = re.compile(
+    r"(?<![\w.])(?:"
+    r"10(?:\.\d{1,3}){3}"
+    r"|127(?:\.\d{1,3}){3}"
+    r"|192\.168(?:\.\d{1,3}){2}"
+    r"|169\.254(?:\.\d{1,3}){2}"
+    r"|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}"
+    r")(?![\w.])"
+)
 # `.test` and `.invalid` are reserved TLDs, but they are also ordinary file suffixes
 # ("config.test"), so outside a URL they are treated as filenames. The rest have no such
 # collision and are flagged wherever they appear.
@@ -285,6 +301,16 @@ def scan_published_content():
                     errors.append(
                         f"{rel}:{number}: '{host}' looks like an internal-only hostname"
                     )
+            for match in PRIVATE_IPV4.finditer(line):
+                # No prose exemption: unlike `internal`/`test`, a dotted quad in a
+                # published file is not a word that occurs naturally in code, and the
+                # numbers here are reserved — 10.0.0.5 is never a version or an ordinary
+                # decimal. A version string like 10.20.30.40 would be a false positive,
+                # which is the right way round for a backstop.
+                errors.append(
+                    f"{rel}:{number}: '{match.group(0)}' is a private/loopback IP "
+                    f"address — it names a host only reachable inside a network"
+                )
             for url in TRACKER_URL.findall(line):
                 errors.append(
                     f"{rel}:{number}: '{url}' links into an issue tracker or forge — "

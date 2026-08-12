@@ -1016,6 +1016,55 @@ class TestCommandLineValidation(ScriptHarness, unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertNotIn("outside the SEPA zone", out.stdout)
 
+    def test_a_malformed_invoice_date_is_refused_not_quietly_ignored(self):
+        # It used to warn on stderr, keep the default window, and then print "since
+        # <the malformed value>" on stdout — two streams disagreeing about the period a
+        # money-safety check covered. A day-first date is the realistic way to hit it.
+        self.write_stub(
+            'echo "$@" >> %s/calls.log; printf \'{"items":[]}\\nHTTP:200\'' % self.tmp
+        )
+        out = self.run_script(
+            "--amount", "10.00", "--invoice-id", "INV-1", "--invoice-date", "15/06/2026"
+        )
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("is not YYYY-MM-DD", out.stdout + out.stderr)
+        self.assertNotIn("since 15/06/2026", out.stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "calls.log")))
+
+    def test_the_reported_period_is_the_period_actually_scanned(self):
+        # The report and the scan must come from one source. Checked by comparing the
+        # printed period against the created_date_from the request really carried.
+        self.write_stub(
+            'echo "$@" >> %s/calls.log; printf \'{"items":[]}\\nHTTP:200\'' % self.tmp
+        )
+        out = self.run_script(
+            "--amount", "10.00", "--invoice-id", "INV-1", "--invoice-date", "2026-06-15"
+        )
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("since 2026-06-15", out.stdout)
+        with open(os.path.join(self.tmp, "calls.log")) as f:
+            sent = int(re.search(r"created_date_from=(\d+)", f.read()).group(1))
+        expected = cp.parse_invoice_date("2026-06-15") - 86400
+        self.assertEqual(sent, expected)
+
+    def test_an_iban_written_with_separators_is_normalised_not_rejected(self):
+        # A hyphenated IBAN is a formatting slip. Telling the operator it "is not an
+        # IBAN" and demanding a BIC sends them after the wrong problem entirely.
+        out = self.run_script("--amount", "10.00", "--iban", "LT12-1000-0111-0100-1000")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("separators", out.stderr)
+        self.assertEqual(
+            self._payload(out)["beneficiary"]["bank_account"]["iban"],
+            "LT121000011101001000",
+        )
+
+    def test_a_genuine_non_iban_account_is_still_refused(self):
+        # The separator rule must not swallow the case it sits in front of: stripping
+        # hyphens from an Armenian account number does not make it an IBAN.
+        out = self.run_script("--amount", "10.00", "--iban", "2050-7231-0000-12345")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("is not an IBAN", out.stdout + out.stderr)
+
     def test_the_config_directory_is_tightened_to_0700(self):
         # os.makedirs(mode=...) only applies the mode to a directory it CREATES, and the
         # user normally creates this one first, for the token, under umask 022.
@@ -1213,6 +1262,59 @@ class TestConcurrentRuns(ScriptHarness, unittest.TestCase):
                 cp.append_ledger({"attempt_id": "x", "state": "pending", "invoice_id": "I"})
                 self.assertTrue(cp.update_ledger("x", state="created"))
             self.assertEqual(cp.load_ledger()[0]["state"], "created")
+
+    def test_the_lock_is_released_when_the_run_exits_early(self):
+        """main() must own the lock's lifetime, not the garbage collector.
+
+        The ExitStack was a bare local with nothing closing it, so the release depended on
+        CPython refcounting collecting the stack — and through it closing the ledger_lock
+        generator. Run in-process, because a subprocess would exit and let the kernel drop
+        the flock regardless, which is the interpreter detail this is meant to stop
+        relying on.
+
+        The traceback is kept alive on purpose. A live traceback holds the frames, and
+        the frames hold the ExitStack, so refcounting cannot collect it — which is what
+        an implementation without refcounting looks like from here. (`assertRaises` is no
+        good for this: it calls traceback.clear_frames(), which drops the locals and
+        releases the lock by itself, hiding the difference.)
+        """
+        with temp_ledger(cp):
+            cp.append_ledger(
+                {
+                    "attempt_id": "a1",
+                    "state": "pending",
+                    "invoice_id": "INV-EXIT",
+                    "transfer_hash": None,
+                    "created_at_iso": "2026-08-12T00:00:00+00:00",
+                }
+            )
+            argv = [
+                "create-payment.py",
+                "--payer", "EVP0000000000001",
+                "--payer-name", "Test Company, UAB",
+                "--beneficiary-name", "Acme UAB",
+                "--iban", "LT121000011101001000",
+                "--purpose", "test",
+                "--amount", "10.00",
+                "--invoice-id", "INV-EXIT",
+                "--confirm",
+            ]
+            held = None
+            with mock.patch.object(sys, "argv", argv), mock.patch.dict(
+                os.environ, {"PAYSERA_PAT": "t"}
+            ), mock.patch.object(cp, "list_transfers", lambda *a, **k: []):
+                try:
+                    cp.main()
+                except SystemExit as exit_:
+                    # Keeping the traceback referenced pins every frame below main(),
+                    # so nothing here can be released by refcounting alone.
+                    held = (exit_.code, exit_.__traceback__)
+            self.assertIsNotNone(held, "the run was expected to exit")
+            # The pending row blocks, so the run exits 3 while still holding the lock.
+            self.assertEqual(held[0], 3)
+            self.assertEqual(cp._lock_depth, 0, "the lock outlived the run that took it")
+            self.assertIsNone(cp._lock_fd)
+            del held
 
     def test_the_lock_file_is_private(self):
         with temp_ledger(cp):

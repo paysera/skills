@@ -743,6 +743,38 @@ def _purpose_quotes_invoice(purpose, invoice_id):
 # that stops a real double payment. Pass --invoice-date for an exact window.
 DEFAULT_LOOKBACK_DAYS = 90
 
+INVOICE_DATE_FORMAT = "%Y-%m-%d"
+
+
+def parse_invoice_date(spec):
+    """Epoch for the start of `spec` (YYYY-MM-DD), or None if it is not that format."""
+    try:
+        parsed = datetime.datetime.strptime(spec, INVOICE_DATE_FORMAT)
+    except ValueError:
+        return None
+    return int(parsed.replace(tzinfo=datetime.timezone.utc).timestamp())
+
+
+def scan_window(invoice_date):
+    """Return (from_epoch, human description) for the live duplicate scan.
+
+    ONE source of truth for the window, used both to run the scan and to report it. They
+    were computed separately, and disagreed whenever --invoice-date failed to parse: the
+    scan quietly fell back to the default window while stdout said "since <the malformed
+    value>". A money-safety check whose report is less reliable than the check itself is
+    worse than one that simply stops, which is why main() now refuses a bad date outright
+    — but the two must be incapable of drifting regardless.
+    """
+    if invoice_date:
+        parsed = parse_invoice_date(invoice_date)
+        if parsed is not None:
+            # 1-day grace before the issue date.
+            return parsed - 86400, f"since {invoice_date}"
+    return (
+        int(time.time()) - DEFAULT_LOOKBACK_DAYS * 86400,
+        f"over the last {DEFAULT_LOOKBACK_DAYS} days (no --invoice-date given)",
+    )
+
 
 def find_blocking(
     invoice_id, token, payer=None, ibans=None, amount=None, invoice_date=None, currency=None
@@ -808,20 +840,9 @@ def find_blocking(
     #    the transfer (app or tool).
     cand = {_norm_iban(i) for i in (ibans or []) if i}
     if payer and cand:
-        # Never 0 (= the full account history): see DEFAULT_LOOKBACK_DAYS.
-        from_epoch = int(time.time()) - DEFAULT_LOOKBACK_DAYS * 86400
-        if invoice_date:
-            try:
-                d = datetime.datetime.strptime(invoice_date, "%Y-%m-%d").replace(
-                    tzinfo=datetime.timezone.utc
-                )
-                from_epoch = int(d.timestamp()) - 86400  # 1-day grace before issue date
-            except ValueError:
-                print(
-                    f"WARNING: --invoice-date {invoice_date!r} is not YYYY-MM-DD — "
-                    f"scanning the last {DEFAULT_LOOKBACK_DAYS} days instead.",
-                    file=sys.stderr,
-                )
+        # Never 0 (= the full account history): see DEFAULT_LOOKBACK_DAYS. Computed by
+        # the same helper main() reports from, so the two cannot disagree.
+        from_epoch, _ = scan_window(invoice_date)
         for t in list_transfers(token, payer, from_epoch):
             if not isinstance(t, dict):
                 continue
@@ -1139,6 +1160,20 @@ def compute_schedule(args):
 
 
 def main():
+    """Own the lock's lifetime explicitly.
+
+    The ExitStack used to be a bare local in the body below, with nothing closing it: the
+    release then depended on CPython's reference counting collecting the stack and, through
+    it, the ledger_lock generator. Nothing failed in practice — the process exits straight
+    after, and the kernel drops a flock with the process — but the scope the comments claim
+    has to be enforced by the code, not by an interpreter detail. Held here, the lock is
+    released on every exit path, SystemExit included.
+    """
+    with contextlib.ExitStack() as guard:
+        return _main(guard)
+
+
+def _main(guard):
     ap = argparse.ArgumentParser(
         description="Create a draft Paysera transfer (dry-run unless --confirm)."
     )
@@ -1358,6 +1393,19 @@ def main():
             f"  Set a real label in ALLOWED_ACCOUNTS, or pass --payer-name."
         )
 
+    # A date the operator typed is a date they expect to be used. Silently falling back to
+    # the default window on a parse failure made the duplicate scan narrower than the
+    # printed report claimed — and for an invoice older than the default window, a real
+    # duplicate could sit outside the scan while stdout said it had been covered.
+    if args.invoice_date and parse_invoice_date(args.invoice_date) is None:
+        sys.exit(
+            f"ERROR: --invoice-date {args.invoice_date!r} is not YYYY-MM-DD.\n"
+            f"  It sets the period the duplicate check scans, so it is not guessed — "
+            f"a day-first date like 06/07/2026 is ambiguous.\n"
+            f"  Write it as 2026-07-06, or omit it to scan the last "
+            f"{DEFAULT_LOOKBACK_DAYS} days."
+        )
+
     # A national account number that is not an IBAN (e.g. the Armenian "2050…" format,
     # supported further down) starts with digits, so neither the IBAN prefix nor an
     # absent BIC yields a country. beneficiary_country() then returns None, and an
@@ -1369,6 +1417,20 @@ def main():
     # is not domestic; ask for the BIC, which carries the country in chars 5-6.
     acct_raw = (args.iban or "").replace(" ", "").upper()
     is_iban = bool(re.fullmatch(r"[A-Z]{2}[0-9A-Z]{13,32}", acct_raw))
+    if not is_iban:
+        # An IBAN written with separators is a formatting slip, not a foreign account
+        # number: telling the operator it "is not an IBAN" and demanding a BIC sends them
+        # after the wrong problem. Spaces are already normalised away above; hyphens and
+        # dots are the other spellings people paste from invoices.
+        stripped = re.sub(r"[-.‐-―]", "", acct_raw)
+        if stripped != acct_raw and re.fullmatch(r"[A-Z]{2}[0-9A-Z]{13,32}", stripped):
+            print(
+                f"NOTE: --iban {args.iban!r} contains separators; using {stripped}. "
+                f"An IBAN has none.",
+                file=sys.stderr,
+            )
+            args.iban = acct_raw = stripped
+            is_iban = True
     if not is_iban and not args.beneficiary_bic:
         sys.exit(
             f"ERROR: {acct_raw!r} is not an IBAN, so the beneficiary's country cannot be "
@@ -1424,7 +1486,6 @@ def main():
     # cannot pass its own check in the window between this one checking and recording.
     # Only for a run that will actually send: a dry run mutates nothing, and taking the
     # lock would make a harmless preview block a real payment.
-    guard = contextlib.ExitStack()
     if args.invoice_id and args.confirm:
         guard.enter_context(ledger_lock())
 
@@ -1439,12 +1500,9 @@ def main():
             invoice_date=args.invoice_date,
             currency=currency,
         )
-        # Show EVERY payment to any candidate IBAN in the period, for human review.
-        period = (
-            f"since {args.invoice_date}"
-            if args.invoice_date
-            else f"over the last {DEFAULT_LOOKBACK_DAYS} days (no --invoice-date given)"
-        )
+        # Show EVERY payment to any candidate IBAN in the period, for human review. The
+        # period comes from the same helper the scan used — never re-derived here.
+        _, period = scan_window(args.invoice_date)
         print(
             f"Dup-check: scanned payments from {payer} to "
             f"{len(set(_norm_iban(i) for i in candidate_ibans))} beneficiary IBAN(s) {period}."
