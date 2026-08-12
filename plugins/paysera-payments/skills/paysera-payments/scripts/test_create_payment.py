@@ -1098,7 +1098,9 @@ class TestCommandLineValidation(ScriptHarness, unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "calls.log")))
 
     def test_todays_invoice_date_is_accepted(self):
-        # The boundary: an invoice issued today is ordinary, and must not be refused.
+        # End-to-end companion to TestInvoiceDateBoundary below. On its own this cannot
+        # see the boundary — it runs a subprocess against the real clock — so the day
+        # boundary itself is pinned there, with a frozen clock.
         out = self.run_script(
             "--amount", "10.00", "--invoice-id", "INV-1",
             "--invoice-date", datetime.date.today().isoformat(),
@@ -1195,6 +1197,72 @@ class TestWriteAheadLedger(ScriptHarness, unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["state"], "created")
         self.assertEqual(rows[0]["transfer_hash"], "HASH123")
+
+
+class TestInvoiceDateBoundary(unittest.TestCase):
+    """"Is this date in the future?" is a CALENDAR question, in Vilnius.
+
+    The guard first compared UTC midnight of the given day against the current instant.
+    For the first 2-3 hours of every Vilnius day, UTC midnight of that day has not
+    arrived, so TODAY was refused as future — in a message that printed today's Vilnius
+    date as the reason it was not today. An ordinary run with a correct invoice date
+    stopped every night, and the natural workaround (dropping --invoice-date) puts the
+    scan back on the wide default window that 1.7.0 narrowed on purpose.
+
+    A frozen clock is the point: the end-to-end test used date.today() against the real
+    clock, which on a UTC runner can never fail.
+    """
+
+    def _refused(self, when, spec):
+        with frozen_clock(cp, when):
+            return cp.invoice_date_error(spec)
+
+    def test_today_is_accepted_at_every_hour_including_the_small_ones(self):
+        for month, day in [(8, 13), (1, 15)]:  # EEST (+3) and EET (+2)
+            for hour in (0, 1, 2, 3, 12, 23):
+                when = vilnius(2026, month, day, hour, 30)
+                today = when.date().isoformat()
+                with self.subTest(when=str(when)):
+                    self.assertIsNone(
+                        self._refused(when, today),
+                        f"today ({today}) was refused at {hour:02d}:30 Vilnius",
+                    )
+
+    def test_yesterday_and_older_are_accepted(self):
+        when = vilnius(2026, 8, 13, 0, 30)
+        for spec in ("2026-08-12", "2026-01-01", "2025-06-15"):
+            with self.subTest(spec=spec):
+                self.assertIsNone(self._refused(when, spec))
+
+    def test_tomorrow_is_refused_even_late_at_night(self):
+        # The other side of the boundary must not move either: at 23:30 Vilnius,
+        # tomorrow's UTC midnight has already passed, so an epoch comparison would have
+        # let it through.
+        when = vilnius(2026, 8, 13, 23, 30)
+        error = self._refused(when, "2026-08-14")
+        self.assertIsNotNone(error)
+        self.assertIn("is in the future", error)
+
+    def test_a_mistyped_year_is_refused(self):
+        error = self._refused(vilnius(2026, 8, 13, 12, 0), "2027-08-13")
+        self.assertIn("is in the future", error)
+        self.assertIn("2026-08-13", error, "the message must name today in Vilnius")
+
+    def test_the_error_message_never_contradicts_itself(self):
+        # The old message said "<date> is in the future (today is <the same date>)".
+        for hour in range(0, 24):
+            when = vilnius(2026, 8, 13, hour, 30)
+            error = self._refused(when, when.date().isoformat())
+            with self.subTest(hour=hour):
+                self.assertIsNone(error, error)
+
+    def test_a_malformed_date_is_still_reported_first(self):
+        error = self._refused(vilnius(2026, 8, 13, 0, 30), "15/06/2026")
+        self.assertIn("is not YYYY-MM-DD", error)
+
+    def test_no_date_is_not_an_error(self):
+        self.assertIsNone(self._refused(vilnius(2026, 8, 13, 0, 30), None))
+        self.assertIsNone(self._refused(vilnius(2026, 8, 13, 0, 30), ""))
 
 
 class TestAccountNormalisation(unittest.TestCase):

@@ -312,8 +312,10 @@ cross-check scans, so it must be ISO — a day-first `15/06/2026` is **refused**
 guessed at, because a date the operator typed is a date they expect to be used, and a
 scan narrower than the one reported is worse than a stop. A date in the **future** is
 refused for the same reason: the window would start after today, hold nothing, and then
-report "no prior payments" — an all-clear from a check that never ran. Without it the
-tool scans the
+report "no prior payments" — an all-clear from a check that never ran. "Future" is judged
+on the **Vilnius calendar**, like every other date decision here, so today's date is
+accepted at any hour — including the small hours, when the UTC date is still yesterday.
+Without it the tool scans the
 **last 90 days**, and in that window a
 prior transfer to the same IBAN for the **same amount** blocks even when its purpose names
 a different invoice — which is exactly what a supplier billed the same sum every month

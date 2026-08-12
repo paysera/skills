@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.7.3 (2026-08-12)
+
+Tenth review round.
+
+- **The future-date guard added in 1.7.2 refused TODAY for the first 2-3 hours of every
+  Vilnius day.** It compared UTC midnight of the given date against the current instant,
+  and for the first 2 hours (EET) or 3 hours (EEST) of a Vilnius day that midnight has not
+  arrived — so an ordinary run with a correct invoice date stopped with exit 1, in a
+  message that then printed today's Vilnius date as the reason it was not today. A
+  scheduled job running after midnight hit it every night, and the obvious workaround —
+  dropping `--invoice-date` — puts the duplicate scan back on the wide default window that
+  1.7.0 narrowed on purpose. "Is this date in the future?" is now a calendar comparison in
+  Vilnius, like every other date decision in this file.
+- The test that was supposed to cover this could not fail. It called `date.today()` and
+  ran the script against the real clock, so on a UTC runner UTC midnight of the UTC date
+  is always past. The boundary now has its own tests against a **frozen clock**, at every
+  hour of the day, in both EET and EEST, and on both sides of the boundary — reverting the
+  fix fails eight of them. The end-to-end test is kept as a companion and now says in the
+  file that it cannot see the boundary by itself.
+
 ## 1.7.2 (2026-08-12)
 
 Ninth review round.

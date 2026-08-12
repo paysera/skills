@@ -804,13 +804,63 @@ DEFAULT_LOOKBACK_DAYS = 90
 INVOICE_DATE_FORMAT = "%Y-%m-%d"
 
 
-def parse_invoice_date(spec):
-    """Epoch for the start of `spec` (YYYY-MM-DD), or None if it is not that format."""
+def parse_invoice_day(spec):
+    """The calendar date in `spec` (YYYY-MM-DD), or None if it is not that format."""
     try:
-        parsed = datetime.datetime.strptime(spec, INVOICE_DATE_FORMAT)
+        return datetime.datetime.strptime(spec, INVOICE_DATE_FORMAT).date()
     except ValueError:
         return None
-    return int(parsed.replace(tzinfo=datetime.timezone.utc).timestamp())
+
+
+def parse_invoice_date(spec):
+    """Epoch for the start of `spec` (YYYY-MM-DD) in UTC, or None if it is not that
+    format. This is a scan boundary, so UTC is fine — a day of grace is subtracted from
+    it anyway. Do NOT compare it against "now" to decide what day it is: see
+    invoice_date_error()."""
+    day = parse_invoice_day(spec)
+    if day is None:
+        return None
+    return int(
+        datetime.datetime(
+            day.year, day.month, day.day, tzinfo=datetime.timezone.utc
+        ).timestamp()
+    )
+
+
+def invoice_date_error(spec):
+    """Return the error message for --invoice-date, or None when it is usable.
+
+    A pure function of the value and the clock, so the boundary can be tested against a
+    frozen clock rather than against whatever time CI happens to run at.
+    """
+    if not spec:
+        return None
+    day = parse_invoice_day(spec)
+    if day is None:
+        return (
+            f"ERROR: --invoice-date {spec!r} is not YYYY-MM-DD.\n"
+            f"  It sets the period the duplicate check scans, so it is not guessed — "
+            f"a day-first date like 06/07/2026 is ambiguous.\n"
+            f"  Write it as 2026-07-06, or omit it to scan the last "
+            f"{DEFAULT_LOOKBACK_DAYS} days."
+        )
+    # Compare CALENDAR DAYS in Vilnius, never an epoch against "now". parse_invoice_date()
+    # returns UTC midnight, which for the first 2-3 hours of a Vilnius day is still in the
+    # future — so an epoch comparison rejected TODAY every night, in a message that then
+    # printed today's Vilnius date as the reason it was not today. Same UTC-against-Vilnius
+    # mismatch compute_schedule() documents for its own date decisions.
+    today = _vilnius_today()
+    if day > today:
+        return (
+            f"ERROR: --invoice-date {spec} is in the future (today is {today} in "
+            f"Vilnius).\n"
+            f"  It is the date the invoice was ISSUED, and it sets the start of the "
+            f"duplicate scan — a future date scans an empty period and then reports "
+            f"no prior payments, which looks like an all-clear.\n"
+            f"  Check the year, or omit it to scan the last "
+            f"{DEFAULT_LOOKBACK_DAYS} days."
+        )
+    return None
 
 
 def scan_window(invoice_date):
@@ -1460,30 +1510,13 @@ def _main(guard):
     # the default window on a parse failure made the duplicate scan narrower than the
     # printed report claimed — and for an invoice older than the default window, a real
     # duplicate could sit outside the scan while stdout said it had been covered.
-    if args.invoice_date:
-        parsed_invoice_date = parse_invoice_date(args.invoice_date)
-        if parsed_invoice_date is None:
-            sys.exit(
-                f"ERROR: --invoice-date {args.invoice_date!r} is not YYYY-MM-DD.\n"
-                f"  It sets the period the duplicate check scans, so it is not guessed — "
-                f"a day-first date like 06/07/2026 is ambiguous.\n"
-                f"  Write it as 2026-07-06, or omit it to scan the last "
-                f"{DEFAULT_LOOKBACK_DAYS} days."
-            )
-        # A window that starts in the future can hold no transfer, so the live half of
-        # the duplicate check is disabled — and it reports "no prior payments", which
-        # reads as an all-clear. A mistyped year is the usual way in. `--perform-at`
-        # already refuses a past date for the same class of reason.
-        if parsed_invoice_date > int(datetime.datetime.now(_VILNIUS).timestamp()):
-            sys.exit(
-                f"ERROR: --invoice-date {args.invoice_date} is in the future "
-                f"(today is {_vilnius_today()} in Vilnius).\n"
-                f"  It is the date the invoice was ISSUED, and it sets the start of the "
-                f"duplicate scan — a future date scans an empty period and then reports "
-                f"no prior payments, which looks like an all-clear.\n"
-                f"  Check the year, or omit it to scan the last "
-                f"{DEFAULT_LOOKBACK_DAYS} days."
-            )
+    # Format, and "not in the future" — a window starting after today holds no transfer,
+    # so the live half of the duplicate check is disabled and then reports "no prior
+    # payments", which reads as an all-clear. `--perform-at` refuses a past date for the
+    # same class of reason.
+    date_error = invoice_date_error(args.invoice_date)
+    if date_error:
+        sys.exit(date_error)
 
     # A national account number that is not an IBAN (e.g. the Armenian "2050…" format,
     # supported further down) starts with digits, so neither the IBAN prefix nor an
