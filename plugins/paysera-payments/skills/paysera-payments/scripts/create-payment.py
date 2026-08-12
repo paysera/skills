@@ -55,10 +55,12 @@ the PAYSERA_PAT env var).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -85,14 +87,66 @@ class _VilniusFallback(datetime.tzinfo):
         d = datetime.date(year, month, 31)
         return d - datetime.timedelta(days=(d.weekday() + 1) % 7)
 
+    def _wall_bounds(self, year):
+        """The transitions as LOCAL WALL clock readings.
+
+        Going in, 01:00 UTC reads 03:00 (EET) and jumps to 04:00 (EEST) — 03:00-04:00
+        never happens. Coming out, 01:00 UTC reads 04:00 (EEST) and falls back to 03:00
+        (EET) — 03:00-04:00 happens TWICE.
+        """
+        return (
+            datetime.datetime.combine(self._last_sunday(year, 3), datetime.time(3)),
+            datetime.datetime.combine(self._last_sunday(year, 10), datetime.time(4)),
+        )
+
+    def _utc_bounds(self, year):
+        """The same two transitions as UTC readings: 01:00 UTC on both dates."""
+        return (
+            datetime.datetime.combine(self._last_sunday(year, 3), datetime.time(1)),
+            datetime.datetime.combine(self._last_sunday(year, 10), datetime.time(1)),
+        )
+
     def _is_dst(self, dt):
+        """Is this LOCAL WALL time in summer? Used by utcoffset/dst/tzname.
+
+        Only ever asked about wall clock readings, because fromutc() below is explicit
+        and never round-trips through here. Relying on the default fromutc() was the old
+        defect: it adds the STANDARD offset to the UTC value and asks dst() about THAT,
+        so one boundary constant had to serve two different conventions and could not.
+        The result was an hour that converted one hour late, and non-monotonically
+        (01:30 UTC gave 04:30 while 02:00 UTC gave 04:00).
+        """
         if dt is None:
             return False
-        # Transition instants expressed in LOCAL time: 01:00 UTC is 03:00 EET going in,
-        # and 04:00 EEST coming out.
-        start = datetime.datetime.combine(self._last_sunday(dt.year, 3), datetime.time(3))
-        end = datetime.datetime.combine(self._last_sunday(dt.year, 10), datetime.time(4))
-        return start <= dt.replace(tzinfo=None) < end
+        start, end = self._wall_bounds(dt.year)
+        naive = dt.replace(tzinfo=None)
+        if not (start <= naive < end):
+            return False
+        # The last hour before `end` is the ambiguous one — it occurs once as EEST and
+        # again as EET. fold=1 names the second, standard-time pass (PEP 495).
+        if naive >= end - datetime.timedelta(hours=1) and getattr(dt, "fold", 0):
+            return False
+        return True
+
+    def fromutc(self, dt):
+        """Convert a UTC reading to local time directly, in UTC terms.
+
+        Explicit rather than inherited: the base implementation infers the offset by
+        calling dst() back on a partially-converted value, which cannot be reconciled
+        with the wall-clock convention utcoffset() needs.
+        """
+        if dt.tzinfo is not self:
+            raise ValueError("fromutc: dt.tzinfo is not self")
+        naive = dt.replace(tzinfo=None)
+        start, end = self._utc_bounds(naive.year)
+        if start <= naive < end:
+            return dt + self._DST
+        result = dt + self._STD
+        if end <= naive < end + datetime.timedelta(hours=1):
+            # This reading lands in the repeated hour; mark it as the second pass so
+            # utcoffset() reports EET rather than EEST.
+            result = result.replace(fold=1)
+        return result
 
     def utcoffset(self, dt):
         return self._DST if self._is_dst(dt) else self._STD
@@ -223,6 +277,11 @@ SEPA_COUNTRIES = {
     "VA",
     "AD",
     "GI",
+    # Joined the SEPA schemes 2023-2024 (list last checked 2026-08-12).
+    "AL",
+    "MD",
+    "MK",
+    "ME",
 }
 
 
@@ -301,10 +360,32 @@ def _clip_address(text, limit=ADDRESS_MAX):
     return kept
 
 
+def _check_token_file_mode(path):
+    """Refuse a token file that group or other can read.
+
+    The docs say this file is 0600, but nothing used to make it so: a plain
+    `curl ... > ~/.config/paysera-payments/token` under the usual umask 022 leaves it
+    0644, and then every local user can read a PAT with transfers:create and
+    transfers:cancel. Unlike the argv exposure fixed in 1.4.0 — which lasted for the
+    length of one request — a world-readable token file is permanent.
+    """
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+    except OSError:
+        return  # the open() below reports it properly
+    if mode & 0o077:
+        sys.exit(
+            f"ERROR: {path} is mode {mode:04o} — readable by other users on this host.\n"
+            f"  A PAT in a world- or group-readable file is exposed to every local user.\n"
+            f"  Fix it and re-run:  chmod 600 {path}"
+        )
+
+
 def read_token(path):
     tok = os.environ.get("PAYSERA_PAT")
     if tok:
         return _validate_token(tok.strip())
+    _check_token_file_mode(path)
     try:
         with open(path) as f:
             return _validate_token(f.read().strip())
@@ -373,6 +454,97 @@ def http_json(method, url, token, payload=None):
         return "ERR", {"error": str(e)}
 
 
+def _lock_path():
+    """Derived from LEDGER_FILE at call time, not import time: the lock has to follow the
+    ledger when LEDGER_FILE is redirected (tests, --token-file-style overrides)."""
+    return os.path.join(os.path.dirname(LEDGER_FILE), ".lock")
+
+
+try:
+    import fcntl
+
+    _HAVE_FLOCK = True
+except ImportError:  # non-POSIX host
+    _HAVE_FLOCK = False
+
+_lock_fd = None
+_lock_depth = 0
+
+
+@contextlib.contextmanager
+def ledger_lock():
+    """Serialise the whole duplicate-check-and-record section against other runs.
+
+    Without this the ledger's read-append-write is a lost-update race: two runs (a cron
+    job and a manual run, or two agent sessions) both read the same ledger, and the one
+    that writes second erases the other's row. The erased row is usually the write-ahead
+    `pending` one — and since GET /transfers cannot list unsigned drafts, that row is the
+    ONLY record of the draft. Losing it lets a later run create a second signable draft
+    for the same invoice, which is exactly the double payment 1.5.0 set out to stop.
+
+    The lock spans the check AND the write-ahead append, not just the file write, because
+    two runs that both pass the duplicate check before either records anything race the
+    same way. It is taken NON-BLOCKING and fails closed: a concurrent run is told to wait
+    rather than queueing behind a network call. flock is released by the kernel when the
+    process dies, so a killed run cannot leave a stale lock behind.
+
+    Re-entrant: nested `with` blocks in the same process share the one descriptor
+    (flock is per open-file-description, so a second open would deadlock against itself).
+    """
+    global _lock_fd, _lock_depth
+    if not _HAVE_FLOCK:
+        # Better to run unserialised than not at all, but say so — the guarantee above
+        # does not hold here.
+        print(
+            "WARNING: no fcntl on this platform — the ledger is not locked. Do not run "
+            "two payments concurrently.",
+            file=sys.stderr,
+        )
+        yield
+        return
+    if _lock_depth == 0:
+        _ensure_config_dir()
+        path = _lock_path()
+        _lock_fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(_lock_fd)
+            _lock_fd = None
+            sys.exit(
+                f"ERROR: another paysera-payments run holds {path}.\n"
+                f"  Two concurrent runs can each miss the other's transfer and pay the "
+                f"same invoice twice, so this one is stopping.\n"
+                f"  Wait for the other run to finish and re-run."
+            )
+    _lock_depth += 1
+    try:
+        yield
+    finally:
+        _lock_depth -= 1
+        if _lock_depth == 0 and _lock_fd is not None:
+            fcntl.flock(_lock_fd, fcntl.LOCK_UN)
+            os.close(_lock_fd)
+            _lock_fd = None
+
+
+def _ensure_config_dir():
+    """The ledger and the lock live beside the token, so the directory is 0700.
+
+    os.makedirs(mode=...) applies the mode only to a directory it CREATES; with
+    exist_ok=True it silently leaves an existing one alone. In the normal sequence the
+    user creates this directory first, to hold the token, so it usually already exists
+    with the umask's 0755 — hence the explicit chmod.
+    """
+    d = os.path.dirname(LEDGER_FILE)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    try:
+        if stat.S_IMODE(os.stat(d).st_mode) & 0o077:
+            os.chmod(d, 0o700)
+    except OSError:
+        pass
+
+
 def load_ledger():
     try:
         with open(LEDGER_FILE) as f:
@@ -389,22 +561,23 @@ def _new_attempt_id():
 
 def update_ledger(attempt_id, **fields):
     """Merge `fields` into the ledger row with this attempt_id, rewriting the file."""
-    data = load_ledger()
-    for e in data:
-        if e.get("attempt_id") == attempt_id:
-            e.update(fields)
-            break
-    else:
-        return False
-    _write_ledger(data)
-    return True
+    with ledger_lock():
+        data = load_ledger()
+        for e in data:
+            if e.get("attempt_id") == attempt_id:
+                e.update(fields)
+                break
+        else:
+            return False
+        _write_ledger(data)
+        return True
 
 
 def _write_ledger(data):
-    # The ledger holds IBANs, amounts and invoice numbers. Create the directory 0700 and
-    # set 0600 on the TEMP file before it is renamed into place — setting the mode after
+    # The ledger holds IBANs, amounts and invoice numbers. The directory is 0700 and the
+    # TEMP file is 0600 BEFORE it is renamed into place — setting the mode after
     # os.replace() leaves a window where the finished file is world-readable.
-    os.makedirs(os.path.dirname(LEDGER_FILE), mode=0o700, exist_ok=True)
+    _ensure_config_dir()
     tmp = LEDGER_FILE + ".tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
@@ -413,9 +586,10 @@ def _write_ledger(data):
 
 
 def append_ledger(entry):
-    data = load_ledger()
-    data.append(entry)
-    _write_ledger(data)
+    with ledger_lock():
+        data = load_ledger()
+        data.append(entry)
+        _write_ledger(data)
 
 
 def _transfer_items(doc):
@@ -561,12 +735,21 @@ def _purpose_quotes_invoice(purpose, invoice_id):
     return re.search(rf"(?<![0-9A-Za-z]){re.escape(inv)}(?![0-9A-Za-z])", purpose or "", re.I) is not None
 
 
+# How far back the live cross-check looks when --invoice-date is not given. Unbounded
+# (from_epoch=0) meant the FULL account history, where the amount rule alone blocks: a
+# supplier paid the same EUR 250.00 every month refused every month after the first, with
+# a message naming the wrong invoice. The only escape was --force, which switches the
+# whole duplicate check off — so an over-eager block trains the operator out of the guard
+# that stops a real double payment. Pass --invoice-date for an exact window.
+DEFAULT_LOOKBACK_DAYS = 90
+
+
 def find_blocking(
     invoice_id, token, payer=None, ibans=None, amount=None, invoice_date=None, currency=None
 ):
     """Return (blocking, seen_to_ibans).
 
-    `blocking` = [(hash, status, source)] that block re-creating a payment for this
+    `blocking` = [(hash, status, source, why)] that block re-creating a payment for this
     invoice. `seen_to_ibans` = [(hash, status, amount, iban, purpose)] — EVERY transfer
     to any candidate IBAN in the period, for human review (printed by the caller).
 
@@ -603,23 +786,30 @@ def find_blocking(
                     f"UNCONFIRMED create attempt at {e.get('created_at_iso')} "
                     f"(HTTP {e.get('http_code', 'no answer')}) — check the Paysera app",
                     "ledger",
+                    "this tool recorded an attempt for this invoice id",
                 )
             continue
         code, doc = http_json("GET", f"{TRANSFER_API}/{h}", token)
         if code == "200" and isinstance(doc, dict) and doc.get("id"):
             st = (doc.get("status") or "").lower()
             if st not in NONBLOCKING_STATES:
-                blocking[h] = (h, doc.get("status"), "ledger")
+                blocking[h] = (h, doc.get("status"), "ledger", "recorded for this invoice id")
         else:
             # Could not confirm it's dead -> be conservative, treat as blocking.
-            blocking[h] = (h, f"unknown (HTTP {code})", "ledger")
+            blocking[h] = (
+                h,
+                f"unknown (HTTP {code})",
+                "ledger",
+                "recorded for this invoice id; its live status could not be read",
+            )
 
     # 2. Live cross-check: same payer, any candidate beneficiary IBAN, over the whole
     #    period from (invoice issue date - 1d grace) to now — regardless of who created
     #    the transfer (app or tool).
     cand = {_norm_iban(i) for i in (ibans or []) if i}
     if payer and cand:
-        from_epoch = 0
+        # Never 0 (= the full account history): see DEFAULT_LOOKBACK_DAYS.
+        from_epoch = int(time.time()) - DEFAULT_LOOKBACK_DAYS * 86400
         if invoice_date:
             try:
                 d = datetime.datetime.strptime(invoice_date, "%Y-%m-%d").replace(
@@ -627,7 +817,11 @@ def find_blocking(
                 )
                 from_epoch = int(d.timestamp()) - 86400  # 1-day grace before issue date
             except ValueError:
-                from_epoch = 0
+                print(
+                    f"WARNING: --invoice-date {invoice_date!r} is not YYYY-MM-DD — "
+                    f"scanning the last {DEFAULT_LOOKBACK_DAYS} days instead.",
+                    file=sys.stderr,
+                )
         for t in list_transfers(token, payer, from_epoch):
             if not isinstance(t, dict):
                 continue
@@ -677,7 +871,15 @@ def find_blocking(
                 and st not in NONBLOCKING_STATES
                 and h not in blocking
             ):
-                blocking[h] = (h, t.get("status"), "live-list")
+                # Which rule fired matters to the operator: an invoice id quoted in the
+                # purpose is near-certain, while an equal amount alone is circumstantial
+                # (a recurring supplier charges the same sum every month).
+                why = (
+                    "its purpose quotes this invoice id"
+                    if id_match
+                    else "SAME AMOUNT only — the purpose does not mention this invoice"
+                )
+                blocking[h] = (h, t.get("status"), "live-list", why)
 
     return list(blocking.values()), seen_to_ibans
 
@@ -1111,6 +1313,12 @@ def main():
     # legitimate transfer is this large, and the API's rejection is late and cryptic.
     if amount_dec >= Decimal("1e12"):
         sys.exit(f"ERROR: --amount {args.amount} is implausibly large. Check the value.")
+    # Everything downstream uses the VALIDATED decimal, never the raw text. `1e2`,
+    # ` 12.34` and `+12.34` all pass the checks above, and the raw spelling used to go
+    # straight into the payload and the ledger — a format the API may reject or read
+    # differently. format(..., "f") is plain positional notation and preserves the
+    # written scale ("100.00" stays "100.00").
+    args.amount = format(amount_dec, "f")
 
     # Normalise ONCE: the routing decision below upper-cases it, so sending the raw
     # spelling would let `--currency eur` pick the instant rail while the payload and the
@@ -1150,12 +1358,41 @@ def main():
             f"  Set a real label in ALLOWED_ACCOUNTS, or pass --payer-name."
         )
 
+    # A national account number that is not an IBAN (e.g. the Armenian "2050…" format,
+    # supported further down) starts with digits, so neither the IBAN prefix nor an
+    # absent BIC yields a country. beneficiary_country() then returns None, and an
+    # unknown country used to read as "domestic and in the SEPA zone": the --beneficiary-
+    # type, --beneficiary-bic, --beneficiary-address and --beneficiary-city checks were
+    # ALL skipped, and the instant rail was selected for an account outside SEPA. The API
+    # then refuses the transfer with 'mapper_beneficiary_country_not_set' — exactly the
+    # late, cryptic failure these pre-flight checks exist to replace. An unknown country
+    # is not domestic; ask for the BIC, which carries the country in chars 5-6.
+    acct_raw = (args.iban or "").replace(" ", "").upper()
+    is_iban = bool(re.fullmatch(r"[A-Z]{2}[0-9A-Z]{13,32}", acct_raw))
+    if not is_iban and not args.beneficiary_bic:
+        sys.exit(
+            f"ERROR: {acct_raw!r} is not an IBAN, so the beneficiary's country cannot be "
+            f"determined from it.\n"
+            f"  Pass --beneficiary-bic — its characters 5-6 are the country, which the "
+            f"cross-border and SEPA checks need.\n"
+            f"  Without it this transfer would be treated as domestic and rejected by the "
+            f"API with a 'mapper_beneficiary_country_not_set' error after being sent."
+        )
+
     # Recipient country (ISO-2) from the BIC (chars 5-6, reliable for non-IBAN accounts
     # too) or the IBAN prefix. Drives the address.country field and SEPA-vs-international
     # routing further down.
     benef_country = beneficiary_country(args.iban, args.beneficiary_bic)
-    is_international = bool(benef_country) and benef_country != "LT"
-    is_sepa_zone = benef_country is None or benef_country in SEPA_COUNTRIES
+    if benef_country is None:
+        # Backstop for a malformed BIC (chars 5-6 not letters) on a non-IBAN account:
+        # an unknown country must never fall through to the domestic path.
+        sys.exit(
+            f"ERROR: cannot determine the beneficiary's country from account "
+            f"{acct_raw!r} or BIC {args.beneficiary_bic!r}.\n"
+            f"  Check --beneficiary-bic: characters 5-6 must be the ISO-2 country."
+        )
+    is_international = benef_country != "LT"
+    is_sepa_zone = benef_country in SEPA_COUNTRIES
 
     if is_international and not args.beneficiary_type:
         sys.exit(
@@ -1183,6 +1420,14 @@ def main():
             )
 
     # --- Idempotency: refuse to double-pay the same invoice ---
+    # Held from BEFORE the duplicate check until main() returns, so that a concurrent run
+    # cannot pass its own check in the window between this one checking and recording.
+    # Only for a run that will actually send: a dry run mutates nothing, and taking the
+    # lock would make a harmless preview block a real payment.
+    guard = contextlib.ExitStack()
+    if args.invoice_id and args.confirm:
+        guard.enter_context(ledger_lock())
+
     candidate_ibans = [args.iban] + list(args.also_iban or [])
     if args.invoice_id and not args.force:
         blocking, seen = find_blocking(
@@ -1195,7 +1440,11 @@ def main():
             currency=currency,
         )
         # Show EVERY payment to any candidate IBAN in the period, for human review.
-        period = f"since {args.invoice_date}" if args.invoice_date else "(full account history)"
+        period = (
+            f"since {args.invoice_date}"
+            if args.invoice_date
+            else f"over the last {DEFAULT_LOOKBACK_DAYS} days (no --invoice-date given)"
+        )
         print(
             f"Dup-check: scanned payments from {payer} to "
             f"{len(set(_norm_iban(i) for i in candidate_ibans))} beneficiary IBAN(s) {period}."
@@ -1207,10 +1456,23 @@ def main():
         else:
             print("  No prior payments to those IBAN(s) in the period.")
         if blocking:
-            print(f"SKIP — a payment for invoice '{args.invoice_id}' already exists:")
-            for h, st, src in blocking:
-                print(f"  transfer {h}  status={st}  [{src}]")
-            print("Not creating another. Use --force to override.")
+            print(f"SKIP — this invoice looks already paid ('{args.invoice_id}'):")
+            for h, st, src, why in blocking:
+                print(f"  transfer {h}  status={st}  [{src}]\n    matched because: {why}")
+            amount_only = all(src == "live-list" and "SAME AMOUNT" in why for _, _, src, why in blocking)
+            print("Not creating another.")
+            if amount_only:
+                # Do not point at --force first. --force disables the ledger source too,
+                # including the write-ahead row that catches an unanswered POST.
+                print(
+                    "  Every match above is on the amount alone, which a recurring "
+                    "supplier trips every period.\n"
+                    "  Narrow the window with --invoice-date YYYY-MM-DD (the invoice's "
+                    "issue date) before reaching for --force — --force switches the "
+                    "duplicate check off entirely, ledger included."
+                )
+            else:
+                print("  Use --force to override.")
             sys.exit(3)
     elif not args.invoice_id:
         print("NOTE: no --invoice-id given — duplicate check is OFF for this run.")
@@ -1229,7 +1491,6 @@ def main():
     # A real IBAN goes in bank_account.iban; a non-IBAN national account number (e.g.
     # Armenia "2050…") goes in bank_account_number (the API rejects it as iban).
     acct = (args.iban or "").replace(" ", "").upper()
-    is_iban = bool(re.fullmatch(r"[A-Z]{2}[0-9A-Z]{13,32}", acct))
     bank_account = {"iban": acct} if is_iban else {"bank_account_number": acct}
     if args.beneficiary_bic:
         # BIC/SWIFT for international (non-SEPA) wires, e.g. UA PrivatBank PBANUA2X.

@@ -209,8 +209,13 @@ class TestPlausibleTld(unittest.TestCase):
             self.assertFalse(validate.is_plausible_tld(label), label)
 
 
-class TestManifestValidation(unittest.TestCase):
-    """The manifest checks must report problems, never raise."""
+class ValidatorFixture:
+    """A throwaway repository for the manifest checks — a plain mixin, not a TestCase.
+
+    Subclassing a TestCase to reuse a fixture makes unittest collect and re-run all of
+    its test methods under the subclass's name too (the same defect fixed in
+    test_create_payment.py).
+    """
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="paysera-manifest-test-"))
@@ -255,6 +260,10 @@ class TestManifestValidation(unittest.TestCase):
         base.update(over)
         return base
 
+
+class TestManifestValidation(ValidatorFixture, unittest.TestCase):
+    """The manifest checks must report problems, never raise."""
+
     def test_a_consistent_pair_is_valid(self):
         self.write(self.entry(), self.manifest())
         self.assertEqual(validate.validate(), [])
@@ -294,6 +303,56 @@ class TestManifestValidation(unittest.TestCase):
             "---\nname: wrong\ndescription: x\n---\n", encoding="utf-8"
         )
         self.assertTrue(any("frontmatter name" in e for e in validate.validate()))
+
+
+class TestMalformedInputIsReported(ValidatorFixture, unittest.TestCase):
+    """A CI gate must name the file to fix.
+
+    The missing-key path already did; three others still ended in a traceback, which
+    tells a contributor nothing about which of their manifests is bad.
+    """
+
+    def test_a_syntax_error_in_the_catalogue_is_reported(self):
+        self.write(self.entry(), self.manifest())
+        (self.root / ".claude-plugin" / "marketplace.json").write_text(
+            '{"plugins": [,]}', encoding="utf-8"
+        )
+        errors = validate.validate()  # must not raise JSONDecodeError
+        self.assertTrue(any("marketplace.json" in e and "JSON" in e for e in errors), errors)
+
+    def test_a_syntax_error_in_a_plugin_manifest_is_reported(self):
+        self.write(self.entry(), self.manifest())
+        (self.plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+            '{"name": "demo",}', encoding="utf-8"
+        )
+        errors = validate.validate()
+        self.assertTrue(any("plugin.json" in e and "JSON" in e for e in errors), errors)
+
+    def test_a_skill_without_frontmatter_is_reported(self):
+        self.write(self.entry(), self.manifest())
+        (self.plugin_dir / "skills" / "demo" / "SKILL.md").write_text(
+            "# No frontmatter here\n", encoding="utf-8"
+        )
+        errors = validate.validate()  # must not raise ValueError
+        self.assertTrue(any("frontmatter" in e for e in errors), errors)
+
+    def test_crlf_frontmatter_is_accepted(self):
+        # The FRONTMATTER pattern anchors on "\n", which looks like it would reject a
+        # CRLF file — it does not: Path.read_text() opens in universal-newline mode and
+        # translates "\r\n" before the pattern ever sees it. Pinned so a later switch to
+        # newline="" (or reading bytes) does not turn every Windows-authored SKILL.md
+        # into a gate failure without anyone noticing.
+        self.write(self.entry(), self.manifest())
+        (self.plugin_dir / "skills" / "demo" / "SKILL.md").write_bytes(
+            b"---\r\nname: demo\r\ndescription: A demo skill.\r\n---\r\n\r\nBody.\r\n"
+        )
+        self.assertEqual(validate.validate(), [])
+
+    def test_the_reported_error_names_the_file(self):
+        self.write(self.entry(), self.manifest())
+        (self.plugin_dir / "skills" / "demo" / "SKILL.md").write_text("nope\n", encoding="utf-8")
+        errors = validate.validate()
+        self.assertTrue(any("SKILL.md" in e for e in errors), errors)
 
 
 if __name__ == "__main__":

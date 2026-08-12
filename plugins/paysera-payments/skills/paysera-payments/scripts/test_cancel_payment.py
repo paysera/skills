@@ -50,6 +50,25 @@ class TestTokenHandling(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 cancel.read_token("/nonexistent")
 
+    def test_a_token_file_readable_by_others_is_refused(self):
+        # This token carries transfers:cancel — a local reader can delete pending drafts.
+        # Mode 0600 was documented but nothing enforced it, and a plain `>` redirect under
+        # the usual umask 022 leaves 0644.
+        tmp = tempfile.mkdtemp(prefix="paysera-cancel-token-")
+        path = os.path.join(tmp, "token")
+        with open(path, "w") as f:
+            f.write("a-token\n")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PAYSERA_PAT", None)
+            os.chmod(path, 0o600)
+            self.assertEqual(cancel.read_token(path), "a-token")
+            for mode in (0o644, 0o640, 0o604):
+                with self.subTest(mode=oct(mode)):
+                    os.chmod(path, mode)
+                    with self.assertRaises(SystemExit) as raised:
+                        cancel.read_token(path)
+                    self.assertIn("chmod 600", str(raised.exception))
+
 
 class TestTransportFailures(unittest.TestCase):
     def test_missing_curl_raises_http_error(self):

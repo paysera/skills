@@ -11,9 +11,11 @@ import argparse
 import datetime
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -120,6 +122,122 @@ class TestVilniusFallback(unittest.TestCase):
         self.assertIsInstance(cp._VILNIUS_IS_FALLBACK, bool)
         if cp._VILNIUS_IS_FALLBACK:
             self.assertIsInstance(cp._VILNIUS, cp._VilniusFallback)
+
+    def test_utc_conversion_is_exact_across_the_october_transition(self):
+        # Inheriting tzinfo.fromutc() made the hour 01:00-02:00 UTC on the last Sunday of
+        # October convert an hour late: the base implementation adds the STANDARD offset
+        # and asks dst() about the result, so one boundary constant had to serve both
+        # that convention and the wall-clock one utcoffset() gets. Deleting the explicit
+        # fromutc() override fails this.
+        expected = {
+            (0, 59): "2026-10-25 03:59:00+03:00",
+            (1, 0): "2026-10-25 03:00:00+02:00",  # the switch
+            (1, 30): "2026-10-25 03:30:00+02:00",
+            (2, 0): "2026-10-25 04:00:00+02:00",
+        }
+        for (hh, mm), want in expected.items():
+            with self.subTest(utc=f"{hh:02d}:{mm:02d}"):
+                moment = datetime.datetime(2026, 10, 25, hh, mm, tzinfo=datetime.timezone.utc)
+                self.assertEqual(str(moment.astimezone(self.tz)), want)
+
+    def test_a_converted_time_still_names_the_instant_it_came_from(self):
+        # The invariant the old boundary broke: wall time minus the offset the zone
+        # reports for it must be the UTC reading again. 01:00 UTC used to convert to
+        # 04:00 while reporting +02:00 — i.e. it claimed to be 02:00 UTC, an hour that
+        # had not happened. (Wall time itself is NOT monotonic here: at a fall-back the
+        # clock legitimately repeats an hour, which is why this checks the round trip.)
+        for date in ((2026, 3, 29), (2026, 10, 25)):
+            for minute in range(0, 5 * 60, 5):
+                naive_utc = datetime.datetime(*date, minute // 60, minute % 60)
+                moment = naive_utc.replace(tzinfo=datetime.timezone.utc)
+                with self.subTest(utc=moment):
+                    local = moment.astimezone(self.tz)
+                    self.assertEqual(
+                        local.replace(tzinfo=None) - local.utcoffset(), naive_utc
+                    )
+
+    def test_wall_time_advances_across_the_spring_transition(self):
+        # No ambiguity in March — the clock jumps forward, never back.
+        previous = None
+        for minute in range(0, 5 * 60, 5):
+            moment = datetime.datetime(
+                2026, 3, 29, minute // 60, minute % 60, tzinfo=datetime.timezone.utc
+            )
+            local = moment.astimezone(self.tz).replace(tzinfo=None)
+            if previous is not None:
+                self.assertGreater(local, previous, f"went backwards at {moment}")
+            previous = local
+
+    def test_october_transition_agrees_with_zoneinfo_minute_by_minute(self):
+        # The existing agreement test samples days 1/15/28 at 12:00, so it cannot see a
+        # boundary defect. This walks the transition itself.
+        try:
+            from zoneinfo import ZoneInfo
+
+            real = ZoneInfo("Europe/Vilnius")
+        except Exception:  # pragma: no cover - depends on the host having tzdata
+            self.skipTest("no tzdata on this interpreter")
+        for date in ((2026, 3, 29), (2026, 10, 25)):
+            for minute in range(0, 5 * 60, 5):
+                moment = datetime.datetime(
+                    *date, minute // 60, minute % 60, tzinfo=datetime.timezone.utc
+                )
+                with self.subTest(utc=moment):
+                    self.assertEqual(
+                        moment.astimezone(self.tz).replace(tzinfo=None),
+                        moment.astimezone(real).replace(tzinfo=None),
+                    )
+
+
+class TestSepaZone(unittest.TestCase):
+    def test_recent_sepa_members_are_recognised(self):
+        # Joined the SEPA schemes 2023-2024. Missing, they were classified as
+        # international wires needing a BIC, an address and a city.
+        for country in ("AL", "MD", "MK", "ME"):
+            with self.subTest(country=country):
+                self.assertIn(country, cp.SEPA_COUNTRIES)
+
+    def test_non_sepa_countries_are_still_outside(self):
+        for country in ("UA", "AM", "GE", "US", "TR"):
+            with self.subTest(country=country):
+                self.assertNotIn(country, cp.SEPA_COUNTRIES)
+
+
+class TestTokenFilePermissions(unittest.TestCase):
+    """A PAT in a group- or world-readable file is exposed to every local user, for good.
+
+    The docs promised 0600 but nothing created or checked it: `curl ... > token` under the
+    usual umask 022 leaves 0644.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="paysera-token-test-")
+        self.path = os.path.join(self.tmp, "token")
+        with open(self.path, "w") as f:
+            f.write("a-token\n")
+        self.env = mock.patch.dict(os.environ, {}, clear=False)
+        self.env.start()
+        os.environ.pop("PAYSERA_PAT", None)
+        self.addCleanup(self.env.stop)
+
+    def test_a_private_token_file_is_accepted(self):
+        os.chmod(self.path, 0o600)
+        self.assertEqual(cp.read_token(self.path), "a-token")
+
+    def test_a_readable_token_file_is_refused(self):
+        for mode in (0o644, 0o640, 0o604, 0o666):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.path, mode)
+                with self.assertRaises(SystemExit) as raised:
+                    cp.read_token(self.path)
+                message = str(raised.exception)
+                self.assertIn("readable by other users", message)
+                self.assertIn("chmod 600", message)
+
+    def test_the_env_var_path_does_not_need_a_file(self):
+        os.environ["PAYSERA_PAT"] = "from-env"
+        os.chmod(self.path, 0o644)
+        self.assertEqual(cp.read_token(self.path), "from-env")
 
 
 class TestSameDayWindow(unittest.TestCase):
@@ -681,9 +799,15 @@ class TestMiscHelpers(unittest.TestCase):
         )
 
 
-class TestCommandLineValidation(unittest.TestCase):
-    """End-to-end argument checks: these live in main(), so they are exercised by running
-    the script with a stubbed curl on PATH."""
+class ScriptHarness:
+    """Shared fixture for the end-to-end tests, deliberately NOT a TestCase.
+
+    A subclass of a TestCase inherits its test methods too, so unittest collects and runs
+    every one of them a second time under the subclass's name. Each of these tests spawns
+    a Python subprocess, and CI runs the whole suite twice (with pytest and without), so
+    the duplicates cost real wall-clock for no extra coverage. Keeping the fixture in a
+    plain mixin lets both test classes share it without sharing tests.
+    """
 
     # A fresh HOME per test: a shared one lets an earlier test's ledger change what a
     # later one observes, and makes "assert no ledger was written" quietly meaningless.
@@ -724,6 +848,11 @@ class TestCommandLineValidation(unittest.TestCase):
             "--purpose", "test",
         ]
         return subprocess.run(base + list(extra), capture_output=True, text=True, env=env, timeout=60)
+
+
+class TestCommandLineValidation(ScriptHarness, unittest.TestCase):
+    """End-to-end argument checks: these live in main(), so they are exercised by running
+    the script with a stubbed curl on PATH."""
 
     def test_rejects_non_finite_amount(self):
         for bad in ["Infinity", "NaN"]:
@@ -811,6 +940,93 @@ class TestCommandLineValidation(unittest.TestCase):
         self.assertIn("--force", out.stderr)
         self.assertIn("SKIPPED", out.stderr)
 
+    def _payload(self, out):
+        return json.loads(out.stdout.split("Payload:", 1)[1].split("\n\n", 1)[0])
+
+    def test_the_payload_carries_the_validated_amount_not_the_raw_text(self):
+        # "1e2" passes every check (Decimal("1e2") is finite, positive, exponent 2) and
+        # used to reach the API and the ledger verbatim, in a notation it may read
+        # differently. So did " 12.34" and "+12.34".
+        for given, expected in [
+            ("1e2", "100"),
+            (" 12.34", "12.34"),
+            ("+12.34", "12.34"),
+            ("100.00", "100.00"),  # a written scale must survive untouched
+        ]:
+            with self.subTest(amount=given):
+                out = self.run_script("--amount", given)
+                self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+                self.assertEqual(self._payload(out)["amount"]["amount"], expected)
+
+    def test_the_ledger_records_the_validated_amount(self):
+        self.write_stub('printf \'{"id":"H1","status":"new"}\\nHTTP:201\'')
+        out = self.run_script("--amount", "1e2", "--invoice-id", "INV-AMT", "--confirm")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.read_ledger()[0]["amount"], "100")
+
+    def test_a_non_iban_account_without_a_bic_is_refused(self):
+        # An Armenian-style national account number yields no country, which used to read
+        # as "domestic, in SEPA": the cross-border checks were all skipped and the API
+        # refused the transfer afterwards with mapper_beneficiary_country_not_set.
+        self.write_stub('echo "$@" >> %s/calls.log; printf \'{"items":[]}\\nHTTP:200\'' % self.tmp)
+        out = self.run_script("--amount", "50.00", "--iban", "20507231000012345")
+        self.assertNotEqual(out.returncode, 0)
+        # The specific message, not the generic unknown-country backstop below it: the
+        # operator needs to be told WHICH input is missing and why the BIC supplies it.
+        self.assertIn("is not an IBAN", out.stdout + out.stderr)
+        self.assertIn("--beneficiary-bic", out.stdout + out.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "calls.log")))
+
+    def test_a_non_iban_account_with_a_bic_is_routed_by_the_bic_country(self):
+        # AM is outside SEPA, so the international requirements now apply — which is the
+        # whole point of refusing to guess the country.
+        out = self.run_script(
+            "--amount", "50.00", "--iban", "20507231000012345",
+            "--beneficiary-bic", "ARMJAM22", "--beneficiary-type", "legal",
+        )
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("outside the SEPA zone", out.stdout + out.stderr)
+
+        ok = self.run_script(
+            "--amount", "50.00", "--iban", "20507231000012345",
+            "--beneficiary-bic", "ARMJAM22", "--beneficiary-type", "legal",
+            "--beneficiary-address", "1 Main St", "--beneficiary-city", "Yerevan",
+        )
+        self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+        payload = self._payload(ok)
+        self.assertEqual(payload["beneficiary"]["bank_account"]["bank_account_number"],
+                         "20507231000012345")
+        self.assertEqual(payload["beneficiary"]["additional_information"]["country"], "AM")
+        # Not instant: the SEPA-Instant rail does not reach a non-SEPA country.
+        self.assertNotIn("urgency", payload)
+
+    def test_a_malformed_bic_on_a_non_iban_account_is_refused(self):
+        out = self.run_script(
+            "--amount", "50.00", "--iban", "20507231000012345", "--beneficiary-bic", "1234",
+        )
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("cannot determine the beneficiary's country", out.stdout + out.stderr)
+
+    def test_a_recent_sepa_member_is_not_treated_as_an_international_wire(self):
+        # An Albanian IBAN: in SEPA since 2023, so no BIC/address/city is demanded.
+        out = self.run_script(
+            "--amount", "50.00", "--iban", "AL35202111090000000001234567",
+            "--beneficiary-type", "legal",
+        )
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertNotIn("outside the SEPA zone", out.stdout)
+
+    def test_the_config_directory_is_tightened_to_0700(self):
+        # os.makedirs(mode=...) only applies the mode to a directory it CREATES, and the
+        # user normally creates this one first, for the token, under umask 022.
+        d = os.path.join(self.tmp, ".config", "paysera-payments")
+        os.makedirs(d, mode=0o755)
+        os.chmod(d, 0o755)
+        self.write_stub('printf \'{"id":"H1","status":"new"}\\nHTTP:201\'')
+        self.run_script("--amount", "10.00", "--invoice-id", "INV-MODE", "--confirm")
+        self.assertEqual(mode_of(d), 0o700)
+        self.assertEqual(mode_of(self.ledger_path), 0o600)
+
     def test_dry_run_writes_no_ledger_entry(self):
         # Unconditional: setUp gives this test its own HOME, so the ledger cannot
         # pre-exist and the assertion cannot silently turn itself off.
@@ -819,7 +1035,7 @@ class TestCommandLineValidation(unittest.TestCase):
         self.assertFalse(os.path.exists(self.ledger_path), "a dry run must not record an attempt")
 
 
-class TestWriteAheadLedger(TestCommandLineValidation):
+class TestWriteAheadLedger(ScriptHarness, unittest.TestCase):
     """The 1.5.0 fix is the ORDER of the write relative to the POST.
 
     Moving append_ledger() after http_json_post() leaves every unit test green while
@@ -872,6 +1088,136 @@ class TestWriteAheadLedger(TestCommandLineValidation):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["state"], "created")
         self.assertEqual(rows[0]["transfer_hash"], "HASH123")
+
+
+class TestDuplicateCheckWindow(ScriptHarness, unittest.TestCase):
+    """Without --invoice-date the live scan used to read the FULL account history, where
+    the amount rule alone blocks — a supplier paid the same sum monthly was refused every
+    month after the first, and the only documented escape (--force) turns the entire
+    duplicate check off, ledger included."""
+
+    def _prior_payment(self, purpose):
+        row = {
+            "items": [
+                {
+                    "id": "OLD1",
+                    "status": "done",
+                    "amount": {"amount": "250.00", "currency": "EUR"},
+                    "beneficiary": {"bank_account": {"iban": "LT121000011101001000"}},
+                    "purpose": {"details": purpose},
+                }
+            ]
+        }
+        # Only the LIST call may return a row; the create POST must answer separately.
+        self.write_stub(
+            'case "$*" in *credit_account_number*) printf \'%s\\nHTTP:200\';; '
+            '*) printf \'{"id":"NEW1","status":"new"}\\nHTTP:201\';; esac'
+            % json.dumps(row).replace("%", "%%")
+        )
+
+    def test_the_scan_is_bounded_when_no_invoice_date_is_given(self):
+        self.write_stub(
+            'echo "$@" >> %s/calls.log; printf \'{"items":[]}\\nHTTP:200\'' % self.tmp
+        )
+        out = self.run_script("--amount", "250.00", "--invoice-id", "INV-NODATE")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        with open(os.path.join(self.tmp, "calls.log")) as f:
+            calls = f.read()
+        match = re.search(r"created_date_from=(\d+)", calls)
+        self.assertIsNotNone(match, calls)
+        window_days = (time.time() - int(match.group(1))) / 86400
+        self.assertNotEqual(int(match.group(1)), 0, "the full account history is too wide")
+        self.assertAlmostEqual(window_days, cp.DEFAULT_LOOKBACK_DAYS, delta=1)
+        self.assertIn(f"last {cp.DEFAULT_LOOKBACK_DAYS} days", out.stdout)
+
+    def test_an_amount_only_match_says_so_and_does_not_push_towards_force(self):
+        self._prior_payment("Monthly retainer 2026-07")
+        out = self.run_script("--amount", "250.00", "--invoice-id", "INV-AUG")
+        self.assertEqual(out.returncode, 3)
+        self.assertIn("SAME AMOUNT only", out.stdout)
+        self.assertIn("--invoice-date", out.stdout)
+        # --force must not be the headline remedy for a circumstantial match.
+        self.assertNotIn("Use --force to override.", out.stdout)
+
+    def test_an_invoice_id_match_still_blocks_outright(self):
+        self._prior_payment("Payment for INV-AUG")
+        out = self.run_script("--amount", "999.00", "--invoice-id", "INV-AUG")
+        self.assertEqual(out.returncode, 3)
+        self.assertIn("purpose quotes this invoice id", out.stdout)
+        self.assertIn("Use --force to override.", out.stdout)
+
+
+class TestConcurrentRuns(ScriptHarness, unittest.TestCase):
+    """The ledger's read-append-write is a lost-update race between two runs, and the row
+    it loses is usually the write-ahead `pending` one — the ONLY record of an unsigned
+    draft, since GET /transfers cannot list them."""
+
+    @property
+    def lock_path(self):
+        return os.path.join(self.tmp, ".config", "paysera-payments", ".lock")
+
+    def _hold_the_lock(self):
+        import fcntl
+
+        os.makedirs(os.path.dirname(self.lock_path), mode=0o700, exist_ok=True)
+        fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.addCleanup(os.close, fd)
+
+    def test_a_second_run_refuses_rather_than_racing(self):
+        self._hold_the_lock()
+        self.write_stub('printf \'{"id":"H1","status":"new"}\\nHTTP:201\'')
+        out = self.run_script("--amount", "10.00", "--invoice-id", "INV-LOCK", "--confirm")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("another paysera-payments run", out.stdout + out.stderr)
+        self.assertFalse(
+            os.path.exists(self.ledger_path), "the blocked run must not touch the ledger"
+        )
+
+    def test_the_lock_is_taken_before_the_duplicate_check_not_after(self):
+        # The critical section is check-THEN-record: locking only the ledger write still
+        # lets two runs both pass their own duplicate check and both go on to create a
+        # draft. Taken up front, a blocked run stops before it issues a single request.
+        self._hold_the_lock()
+        self.write_stub(
+            'echo "$@" >> %s/calls.log; printf \'{"items":[]}\\nHTTP:200\'' % self.tmp
+        )
+        out = self.run_script("--amount", "10.00", "--invoice-id", "INV-LOCK", "--confirm")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertFalse(
+            os.path.exists(os.path.join(self.tmp, "calls.log")),
+            "the duplicate check ran anyway — the lock is being taken too late",
+        )
+
+    def test_a_dry_run_is_not_blocked(self):
+        # A preview mutates nothing, so it must not be stopped by a real payment in
+        # flight — nor take the lock and stop one.
+        self._hold_the_lock()
+        out = self.run_script("--amount", "10.00", "--invoice-id", "INV-LOCK")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("DRY-RUN", out.stdout)
+
+    def test_a_normal_run_releases_the_lock_for_the_next_one(self):
+        self.write_stub('printf \'{"id":"H1","status":"new"}\\nHTTP:201\'')
+        first = self.run_script("--amount", "10.00", "--invoice-id", "INV-A", "--confirm")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        second = self.run_script("--amount", "10.00", "--invoice-id", "INV-B", "--confirm")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(len(self.read_ledger()), 2, "both rows must survive")
+
+    def test_the_lock_is_reentrant_within_one_process(self):
+        # append_ledger and update_ledger both take it, and main() holds it around them.
+        # flock is per open-file-description, so a second open would deadlock on itself.
+        with temp_ledger(cp):
+            with cp.ledger_lock():
+                cp.append_ledger({"attempt_id": "x", "state": "pending", "invoice_id": "I"})
+                self.assertTrue(cp.update_ledger("x", state="created"))
+            self.assertEqual(cp.load_ledger()[0]["state"], "created")
+
+    def test_the_lock_file_is_private(self):
+        with temp_ledger(cp):
+            with cp.ledger_lock():
+                self.assertEqual(mode_of(cp._lock_path()), 0o600)
 
 
 if __name__ == "__main__":

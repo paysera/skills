@@ -36,7 +36,11 @@ Scopes on the token: `accounts:read`, `transfers:read`, `transfers:create`,
 
 ## Token
 
-- Stored at `~/.config/paysera-payments/token` (mode `0600`, local to your machine).
+- Stored at `~/.config/paysera-payments/token`, mode **`0600`**, local to your machine.
+  The scripts **refuse to run** if that file is readable by group or other and tell you to
+  `chmod 600` it — a token in a world-readable file is exposed to every local user of the
+  machine, permanently. Create it with a tight umask (see below), not with a plain `>`
+  redirect, which leaves mode `0644` under the usual `umask 022`.
 - Never passed on a command line. The scripts hand it to curl through stdin, because
   command arguments are readable by any local user (`ps auxww`, `/proc/<pid>/cmdline`).
 - `jti` for revocation is in `~/.config/paysera-payments/jti.txt`.
@@ -64,6 +68,21 @@ Scopes on the token: `accounts:read`, `transfers:read`, `transfers:create`,
   Save the returned token to `~/.config/paysera-payments/token` and the `jti` to
   `~/.config/paysera-payments/jti.txt`. **The token value is not retrievable again** —
   if lost, revoke it (see "Revoking the token") and create a new one.
+
+  Create the directory and the file with the right modes from the start — a `>` redirect
+  under the default `umask 022` produces a world-readable token, and tightening it
+  afterwards does not un-expose what was already readable:
+
+  ```bash
+  mkdir -p -m 700 ~/.config/paysera-payments
+  # (umask, not a bare `>`: the file must never exist at 0644 even momentarily)
+  ( umask 077 && cat > ~/.config/paysera-payments/token )   # paste the token, then Ctrl-D
+  chmod 700 ~/.config/paysera-payments
+  chmod 600 ~/.config/paysera-payments/token
+  ```
+
+  The scripts also keep `~/.config/paysera-payments/` itself at `0700` (it holds the
+  ledger, which lists IBANs, amounts and invoice numbers).
 - Do **not** grant `transfers:sign`. Without it the skill physically cannot move money.
 
 ## Scoped accounts (payer must be one of these)
@@ -275,9 +294,28 @@ Outside the SEPA zone entirely (UA, AM, GE, …) the API also requires
 them **before** sending, so you get a plain message instead of a `mapper_*_not_set`
 rejection after the fact.
 
+All of that turns on the beneficiary's country, which is read from the BIC (characters
+5-6) or the IBAN prefix. A **national account number that is not an IBAN** — the Armenian
+`2050…` format, for example — yields neither, so **`--beneficiary-bic` is required** for
+one. Without it the country would be unknown, and an unknown country is not treated as
+domestic: the tool refuses rather than skipping the cross-border checks and picking the
+SEPA-Instant rail for an account the instant rail cannot reach.
+
+The SEPA country list includes the members added in 2023-2024 (AL, MD, MK, ME); it is
+in `SEPA_COUNTRIES` in `create-payment.py`, with the date it was last checked.
+
 ## Idempotency — avoid double-paying an invoice
 
-Pass `--invoice-id <id>` (and optionally `--invoice-date YYYY-MM-DD`) when creating.
+Pass `--invoice-id <id>` when creating, and **pass `--invoice-date YYYY-MM-DD` too**
+whenever you have it. It is optional but not merely cosmetic: it sets the window the live
+cross-check scans. Without it the tool scans the **last 90 days**, and in that window a
+prior transfer to the same IBAN for the **same amount** blocks even when its purpose names
+a different invoice — which is exactly what a supplier billed the same sum every month
+looks like. The `SKIP` output says which rule matched, so an amount-only match is
+distinguishable from a purpose that actually quotes the invoice id. When it is amount-only,
+narrow the window with `--invoice-date` rather than reaching for `--force`; `--force`
+switches the duplicate check off completely, ledger included.
+
 Before posting, the tool reads a local ledger (`~/.config/paysera-payments/ledger.json`),
 finds prior transfers it created for that invoice, checks each one's **live** status,
 and **refuses** (`exit 3`, `SKIP`) if any is still alive or already succeeded — i.e.
@@ -301,6 +339,17 @@ When you hit `SKIP — ... UNCONFIRMED create attempt`:
    duplicate check was skipped.
 
 A definite API refusal (HTTP 4xx) is recorded as `failed` instead and never blocks a retry.
+
+### One payment run at a time
+
+A run that will actually send (`--confirm` with an `--invoice-id`) takes an exclusive lock
+on `~/.config/paysera-payments/.lock` **before** the duplicate check and holds it until the
+attempt is recorded. Two runs that overlap — a cron job firing alongside a manual run, or
+two agent sessions — would otherwise each pass their own duplicate check, and the second
+ledger write would erase the first one's row. That row is the only record of an unsigned
+draft, so losing it lets a later run create a second signable draft for the same invoice.
+A run that finds the lock held exits with an error telling you to wait; dry runs never take
+it and are never blocked by it.
 
 ```bash
 python3 ${CLAUDE_PLUGIN_ROOT}/skills/paysera-payments/scripts/create-payment.py \

@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 
@@ -46,9 +47,29 @@ class HttpError(RuntimeError):
     """A transport-level failure (curl missing, timed out, or non-zero exit)."""
 
 
+def _check_token_file_mode(path):
+    """Refuse a token file that group or other can read.
+
+    Same rule as create-payment.py, and for the same reason: the docs promised 0600 but
+    nothing enforced it, and a `curl ... > token` under the usual umask 022 leaves 0644.
+    This token carries transfers:cancel, so a local reader can delete pending drafts.
+    """
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+    except OSError:
+        return  # the open() below reports it properly
+    if mode & 0o077:
+        sys.exit(
+            f"ERROR: {path} is mode {mode:04o} — readable by other users on this host.\n"
+            f"  A PAT in a world- or group-readable file is exposed to every local user.\n"
+            f"  Fix it and re-run:  chmod 600 {path}"
+        )
+
+
 def read_token(path):
     tok = os.environ.get("PAYSERA_PAT")
     if not tok:
+        _check_token_file_mode(path)
         try:
             with open(path) as f:
                 tok = f.read()

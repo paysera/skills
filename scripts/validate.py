@@ -59,10 +59,28 @@ TRACKER_URL = re.compile(
 )
 
 
+def load_json(path: Path, errors: list):
+    """Parse a manifest, reporting a syntax error the way every other failure here is
+    reported. Returns None when it could not be parsed.
+
+    Same rule as the missing-key check below: this runs as a CI gate, and a
+    JSONDecodeError traceback tells a contributor nothing about which file to fix.
+    """
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        errors.append(f"{path.relative_to(ROOT)}: cannot be read as JSON — {e}")
+        return None
+
+
 def read_frontmatter(skill_file: Path) -> dict:
     match = FRONTMATTER.match(skill_file.read_text(encoding="utf-8"))
     if match is None:
-        raise ValueError(f"{skill_file}: missing YAML frontmatter")
+        # CRLF line ends are the usual cause: the pattern anchors on "\n".
+        raise ValueError(
+            f"{skill_file.name}: no YAML frontmatter found — the file must start with a "
+            f"'---' block (LF line ends)"
+        )
     fields = {}
     for line in match.group(1).splitlines():
         if line.startswith(" ") or ": " not in line:
@@ -74,7 +92,11 @@ def read_frontmatter(skill_file: Path) -> dict:
 
 def validate() -> list:
     errors = []
-    marketplace = json.loads((ROOT / ".claude-plugin/marketplace.json").read_text(encoding="utf-8"))
+    marketplace = load_json(ROOT / ".claude-plugin/marketplace.json", errors)
+    if marketplace is None:
+        # Nothing else can be checked against a catalogue that will not parse, but the
+        # published-content scan is independent of it and still runs.
+        return errors + scan_published_content()
 
     listed = set()
     for index, entry in enumerate(marketplace.get("plugins", [])):
@@ -97,7 +119,9 @@ def validate() -> list:
         if not manifest_path.is_file():
             errors.append(f"{name}: {manifest_path.relative_to(ROOT)} is missing")
             continue
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = load_json(manifest_path, errors)
+        if manifest is None:
+            continue
         manifest_missing = [k for k in ("name", "version", "description") if k not in manifest]
         if manifest_missing:
             errors.append(f"{name}: plugin.json missing {', '.join(manifest_missing)}")
@@ -124,7 +148,11 @@ def validate() -> list:
         if not skills:
             errors.append(f"{name}: no skills/*/SKILL.md found")
         for skill_file in skills:
-            fields = read_frontmatter(skill_file)
+            try:
+                fields = read_frontmatter(skill_file)
+            except (OSError, ValueError) as e:
+                errors.append(f"{skill_file.relative_to(ROOT)}: {e}")
+                continue
             if fields.get("name") != skill_file.parent.name:
                 errors.append(f"{skill_file}: frontmatter name does not match its directory")
             if not fields.get("description"):

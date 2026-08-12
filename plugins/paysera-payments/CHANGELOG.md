@@ -1,5 +1,71 @@
 # Changelog
 
+## 1.7.0 (2026-08-12)
+
+Seventh review round — the first since 1.6.0 to change the shipped skill rather than the
+publication checker.
+
+**Security**
+- **The `0600` token file was documented but never created or checked.** The setup steps
+  said only "save the returned token to …", so a plain `>` redirect under the usual
+  `umask 022` produced a `0644` file, and `read_token()` never looked at the mode. Every
+  local user could read a PAT carrying `transfers:create` and `transfers:cancel`. Unlike
+  the argv exposure closed in 1.4.0, which lasted for the length of one request, this was
+  permanent. Both scripts now refuse a token file readable by group or other and print the
+  `chmod` that fixes it; SKILL.md creates the file under `umask 077` instead.
+- The config directory is genuinely `0700` now. `os.makedirs(mode=0o700, exist_ok=True)`
+  applies the mode only to a directory it creates — and the user creates this one first,
+  for the token — so it silently stayed at the umask's `0755`.
+
+**Double payments**
+- **Concurrent runs could lose a ledger row.** The append was a read-modify-write with no
+  lock, so of two overlapping runs the second erased the first's row. That row is usually
+  the write-ahead `pending` one, and since `GET /transfers` cannot list unsigned drafts it
+  is the *only* record of the draft — losing it lets a later run create a second signable
+  draft for the same invoice, the exact failure 1.5.0 set out to stop. A sending run now
+  holds an exclusive lock from before the duplicate check until the attempt is recorded,
+  so two runs cannot both pass their own check. It is non-blocking and fails closed; dry
+  runs neither take it nor are blocked by it.
+- **Without `--invoice-date` the scan covered the entire account history**, where a match
+  on the amount alone blocks. A supplier billed the same sum every month was refused every
+  month after the first, under a message naming the wrong invoice — and the only remedy
+  offered was `--force`, which disables the whole duplicate check, ledger included. The
+  window is now 90 days by default, the `SKIP` output says which rule matched each hit,
+  and an amount-only match points at `--invoice-date` rather than at `--force`.
+
+**Cross-border**
+- A **non-IBAN account number with no BIC** (the Armenian `2050…` format, which the script
+  explicitly supports) yielded no country, and an unknown country read as "domestic, in
+  SEPA": `--beneficiary-type`, `--beneficiary-bic`, `--beneficiary-address` and
+  `--beneficiary-city` were all skipped and the SEPA-Instant rail was chosen for an
+  account it cannot reach. The API then refused the transfer with
+  `mapper_beneficiary_country_not_set` — precisely the late, cryptic failure these
+  pre-flight checks exist to replace. A BIC is now required for a non-IBAN account, and an
+  undeterminable country is refused rather than assumed domestic.
+- Added the SEPA members admitted in 2023-2024 (AL, MD, MK, ME), with the date the list
+  was last checked. They were being treated as international wires.
+
+**Correctness**
+- The payload and the ledger now carry the **validated** amount, not the raw `--amount`
+  text. `1e2`, `+12.34` and `" 12.34"` all passed validation and were sent verbatim.
+- The built-in Vilnius rule converted the hour 01:00-02:00 UTC on the last Sunday of
+  October one hour late, and non-monotonically. The cause was inheriting
+  `tzinfo.fromutc()`, which infers the offset by calling `dst()` back on a
+  partly-converted value — one boundary constant cannot serve both that convention and
+  the wall-clock one `utcoffset()` receives. `fromutc()` is now explicit and marks the
+  repeated hour with `fold=1`. Affected hosts without tzdata only, and printed deadlines
+  rather than dates. The transitions are now walked minute by minute against `zoneinfo`.
+
+**Checks and tests**
+- `validate.py` reports malformed JSON and missing frontmatter as errors naming the file,
+  instead of a traceback that tells a contributor nothing. (CRLF turned out **not** to be
+  a failure mode — `read_text` translates universal newlines — so that is now pinned as
+  working rather than "fixed".)
+- `TestWriteAheadLedger` subclassed a `TestCase` to reuse its fixture, so unittest ran all
+  15 inherited subprocess-spawning tests a second time, in a suite CI runs twice. The
+  fixtures in both test files are plain mixins now.
+- Every fix above is pinned by a test that fails when the fix is reverted.
+
 ## 1.6.3 (2026-08-11)
 
 Sixth review round — publication checker only; the shipped skill is unchanged.

@@ -55,7 +55,8 @@ Never grant an agent a token with `transfers:sign`.
 Skills published here call public Paysera APIs from your own machine, using credentials you
 create on your own account. They never ship credentials. The token lives only on your
 machine (`~/.config/paysera-payments/token`, mode `0600`) and is sent only to Paysera API
-hosts.
+hosts. That mode is enforced, not just documented: the scripts refuse to run if the token
+file is readable by group or other.
 
 To report a security issue with this repository, see [SECURITY.md](SECURITY.md).
 
