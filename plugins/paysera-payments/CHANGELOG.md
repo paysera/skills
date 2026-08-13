@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.8.5 (2026-08-13)
+
+Seventeenth review round.
+
+- **The published exit-code contract was missing `2`.** `resolve_payer()` exits 2 for a
+  `--payer` outside the token's scoped accounts, and argparse exits 2 for a usage error —
+  both ordinary results, neither in the list an agent reads to decide what a run meant.
+  `SKILL.md` now documents `2`, documents `cancel-payment.py`'s own codes, and states that
+  the list is exhaustive: a code outside it is a bug, not a result to interpret. A test
+  reads every `sys.exit(N)` out of the source and fails on any code the documentation does
+  not list, so the next one added cannot be forgotten.
+- **Every URL built from a transferHash is now shape-checked**, not just the two built from
+  a hash somebody typed. `find_blocking()` took one from the ledger — a plain JSON file the
+  documentation invites the operator to read — and `register_transfer()` took one from the
+  API's answer. Both now go through `_checked_hash()`, which owns the rule. A malformed
+  ledger row blocks with a message naming the row instead of fetching whatever path it
+  spells out (still fail-safe, and now no request is made at all); an id the API returns
+  that cannot go in a URL is reported as a failed registration rather than a crash.
+
 ## 1.8.4 (2026-08-13)
 
 Sixteenth review round. Both findings are about the two copies of the leak check drifting

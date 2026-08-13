@@ -36,8 +36,16 @@ That creates nothing — it registers the draft you already have. It is also how
 that creates a second draft instead of fixing the first. A later run for the same invoice
 is blocked as usual and points at this command.
 
-Exit codes: `0` fine · `1` nothing was created · `3` duplicate, nothing created ·
-`4` created but not registered (use `--register-only`).
+Exit codes: `0` fine · `1` nothing was created · `2` bad arguments, or a `--payer` outside
+the token's scoped accounts (argparse's own convention; nothing was created) · `3`
+duplicate, nothing created · `4` created but not registered (use `--register-only`).
+
+`cancel-payment.py` has its own: `0` every hash handled · `1` at least one could not be
+read or removed (the rest of the list still ran) · `2` bad arguments.
+
+Read `4` as its own outcome, not as a failure: a transfer exists. Every other non-zero code
+means nothing was created, and this list is exhaustive — a code outside it is a bug, not a
+result to interpret.
 
 Scopes on the token: `accounts:read`, `transfers:read`, `transfers:create`,
 `transfers:cancel` (each scoped to the accounts you configure below).

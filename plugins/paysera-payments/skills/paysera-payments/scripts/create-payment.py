@@ -225,6 +225,26 @@ def _norm_buyer_name(s):
 
 
 TRANSFER_API = "https://api.paysera.com/public/transfer/rest/v1/transfers"
+
+# A transferHash is an opaque alphanumeric id. The character class is the point: it keeps
+# slashes, dot-segments and query characters out of the URL path built from it.
+TRANSFER_HASH_SHAPE = re.compile(r"\A[A-Za-z0-9_-]{1,128}\Z")
+
+
+def _checked_hash(value):
+    """Return `value` as a transferHash, or raise ValueError.
+
+    EVERY URL built from a hash goes through here, whoever supplied the hash — the command
+    line, the ledger file, or the API's own answer. The rule used to be applied only at the
+    two sites that take one from a person, which left the other two trusting a file and a
+    network response to be well formed.
+    """
+    h = (value or "").strip()
+    if not TRANSFER_HASH_SHAPE.match(h):
+        raise ValueError(f"{value!r} is not a transferHash")
+    return h
+
+
 DEFAULT_TOKEN_FILE = os.path.expanduser("~/.config/paysera-payments/token")
 LEDGER_FILE = os.path.expanduser("~/.config/paysera-payments/ledger.json")
 
@@ -951,7 +971,22 @@ def find_blocking(
                     "this tool recorded an attempt for this invoice id",
                 )
             continue
-        code, doc = http_json("GET", f"{TRANSFER_API}/{h}", token)
+        try:
+            checked = _checked_hash(h)
+        except ValueError:
+            # The ledger is a plain JSON file the documentation invites the operator to
+            # read; a hand-edited or half-written row can hold anything. Block rather than
+            # request whatever path that row spells out — same fail-safe direction as an
+            # unreadable status, and the URL is never built.
+            blocking[h] = (
+                h,
+                "unreadable",
+                "ledger",
+                "recorded for this invoice id; its transfer_hash is malformed, so its "
+                "live status cannot be checked — fix or remove the row",
+            )
+            continue
+        code, doc = http_json("GET", f"{TRANSFER_API}/{checked}", token)
         if code == "200" and isinstance(doc, dict) and doc.get("id"):
             st = (doc.get("status") or "").lower()
             if st not in NONBLOCKING_STATES:
@@ -1920,8 +1955,8 @@ def _main(guard):
                 print(f" — status={reg_status}" if reg_status else "")
             else:
                 print(
-                    f"  registered       : FAILED (HTTP {rcode}) — transfer stays in 'new' "
-                    f"(invisible)."
+                    f"  registered       : FAILED ({_code_text(rcode)}) — transfer stays "
+                    f"in 'new' (invisible)."
                 )
                 print("   ", str(rj)[:400])
         else:
@@ -2005,16 +2040,27 @@ def http_json_post(url, payload, token):
 # draft is already there and needs finishing, not repeating.
 EXIT_UNREGISTERED = 4
 
-TRANSFER_HASH_SHAPE = re.compile(r"\A[A-Za-z0-9_-]{1,128}\Z")
+
+def _code_text(code):
+    """'HTTP 500' for a status, the word itself for 'unusable-id'/'ERR'."""
+    return f"HTTP {code}" if str(code).isdigit() else str(code)
 
 
 def register_transfer(transfer_hash, token):
     """PUT /transfers/{hash}/register — make an existing draft visible for signing.
 
-    Returns (ok, http_code, body). A bare POST leaves the transfer in the validation-only
+    Returns (ok, code, body). A bare POST leaves the transfer in the validation-only
     `new` state, which is not shown anywhere for signing.
+
+    `code` is the HTTP status, or `unusable-id` when the hash does not have the shape of
+    one — the id comes from the API's own answer at the create call site, and an id this
+    function cannot put in a URL is a failed registration like any other, not a crash.
     """
-    code, body = http_json("PUT", f"{TRANSFER_API}/{transfer_hash}/register", token)
+    try:
+        checked = _checked_hash(transfer_hash)
+    except ValueError as e:
+        return False, "unusable-id", {"error": str(e)}
+    code, body = http_json("PUT", f"{TRANSFER_API}/{checked}/register", token)
     return code in ("200", "201", "204"), code, body
 
 
@@ -2056,7 +2102,7 @@ def register_only(args):
     if not ok:
         mark_registered(transfer_hash, False)
         sys.exit(
-            f"ERROR: register FAILED (HTTP {code}) for {transfer_hash}.\n"
+            f"ERROR: register FAILED ({_code_text(code)}) for {transfer_hash}.\n"
             f"  {str(body)[:400]}\n"
             f"  The transfer still exists and is still NOT visible for signing. "
             f"Re-run this command when the API is healthy."

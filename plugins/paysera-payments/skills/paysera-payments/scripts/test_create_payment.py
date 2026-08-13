@@ -1619,6 +1619,109 @@ class TestAccountNormalisation(unittest.TestCase):
         self.assertIn("LT121000011101001000", note)
 
 
+class TestEveryHashInAUrlIsChecked(unittest.TestCase):
+    """The shape check guarded the two hashes that come from a person, and neither of the
+    two that come from a file or from the network.
+
+    Not a security boundary — the ledger is 0600 in a 0700 directory, and whoever can
+    write it can edit the script. It is the rule the project states about this exact URL
+    construction, applied everywhere the URL is built rather than at two of four sites.
+    """
+
+    BAD = ["../../transfers/OTHER", "H?status=done", "H/register", "a b", "", None, "x" * 200]
+
+    def test_the_checker_accepts_a_hash_and_refuses_the_rest(self):
+        self.assertEqual(cp._checked_hash("  HASH-123_x  "), "HASH-123_x")
+        for bad in self.BAD:
+            with self.subTest(value=bad):
+                with self.assertRaises(ValueError):
+                    cp._checked_hash(bad)
+
+    def test_a_malformed_ledger_hash_blocks_instead_of_being_fetched(self):
+        calls = []
+
+        def spy(method, url, token, **kw):
+            calls.append(url)
+            return "200", {"id": "x", "status": "done"}
+
+        with temp_ledger(cp):
+            cp._ensure_config_dir()
+            cp.append_ledger(
+                {"invoice_id": "INV-1", "state": "created",
+                 "transfer_hash": "../../transfers/OTHER"}
+            )
+            with mock.patch.object(cp, "http_json", spy):
+                blocking, _ = cp.find_blocking("INV-1", token="t")
+        self.assertEqual(calls, [], "a URL was built from the malformed row")
+        self.assertEqual(len(blocking), 1, "the row must still block — fail safe")
+        self.assertIn("malformed", blocking[0][3])
+
+    def test_register_refuses_an_id_it_cannot_put_in_a_url(self):
+        with mock.patch.object(cp, "http_json") as http:
+            ok, code, body = cp.register_transfer("../../other/register", "t")
+        self.assertFalse(ok)
+        self.assertEqual(code, "unusable-id")
+        http.assert_not_called()
+
+    def test_a_good_id_still_reaches_the_register_endpoint(self):
+        # Otherwise "refuse everything" would pass the test above.
+        with mock.patch.object(cp, "http_json", return_value=("200", {})) as http:
+            ok, code, _ = cp.register_transfer("HASH123", "t")
+        self.assertTrue(ok)
+        self.assertTrue(http.call_args[0][1].endswith("/HASH123/register"))
+
+    def test_the_code_text_helper_reads_correctly_either_way(self):
+        self.assertEqual(cp._code_text("500"), "HTTP 500")
+        self.assertEqual(cp._code_text("unusable-id"), "unusable-id")
+
+
+class TestExitCodeContract(ScriptHarness, unittest.TestCase):
+    """SKILL.md is what an agent reads to decide what a run meant, so every code the
+    script can produce has to be in it. Exit 2 was not — and a --payer outside the token's
+    scope is an ordinary mistake, not a rare one."""
+
+    def _paragraph(self, marker):
+        """The one paragraph that starts with `marker`, as a set of codes.
+
+        Per paragraph, not over the whole block: the two scripts are documented one after
+        the other, and pooling their digits let a code go missing from one list while the
+        other still spelled it (which is how a mutation of this test's own subject passed).
+        """
+        skill = (SCRIPTS.parent / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn(marker, skill, f"SKILL.md no longer documents {marker!r}")
+        start = skill.index(marker)
+        para = skill[start : skill.index("\n\n", start)]
+        return {int(n) for n in re.findall(r"`(\d)`", para)}, para
+
+    def test_a_payer_outside_the_scope_exits_2(self):
+        out = self.run_script("--amount", "10.00", "--payer", "EVP9999999999999")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("scoped accounts", out.stdout + out.stderr)
+
+    def test_a_missing_required_argument_exits_2(self):
+        out = self.run_script_bare("--payer", "EVP0000000000001")
+        self.assertEqual(out.returncode, 2)
+
+    def test_every_code_the_script_can_exit_with_is_documented(self):
+        documented, _ = self._paragraph("Exit codes:")
+        # Read off the source, not off a list kept by hand next to it: a new sys.exit(N)
+        # is exactly the change that would leave the documentation behind.
+        source = (SCRIPTS / "create-payment.py").read_text(encoding="utf-8")
+        used = {int(n) for n in re.findall(r"sys\.exit\((\d+)\)", source)}
+        used |= {0, 1}  # a bare sys.exit(message) is 1; falling off the end is 0
+        used.add(2)  # argparse's ap.error()
+        self.assertTrue(
+            used <= documented, f"undocumented exit code(s): {sorted(used - documented)}"
+        )
+
+    def test_the_cancel_script_codes_are_documented_too(self):
+        documented, _ = self._paragraph("`cancel-payment.py` has its own")
+        source = (SCRIPTS / "cancel-payment.py").read_text(encoding="utf-8")
+        used = {0, 1} | {int(n) for n in re.findall(r"rc = (\d)", source)}
+        used.add(2)  # argparse
+        self.assertEqual(used, documented)
+
+
 class TestRegisterStep(ScriptHarness, unittest.TestCase):
     """A transfer that is created but not registered stays in `new`, which is shown
     nowhere for signing — the original "invisible draft" problem.
