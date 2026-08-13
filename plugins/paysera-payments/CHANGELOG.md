@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.8.2 (2026-08-13)
+
+Fourteenth review round. Both findings are about the previous round's own fix.
+
+- **The rename was half done.** 1.8.1 changed the tool's output from "IBAN(s)" to
+  "beneficiary account(s)" because calling a national account number an IBAN is how the
+  missing key stayed unnoticed — and then left `SKILL.md` saying the check "scans all of
+  the beneficiary's IBANs", "prints every payment it finds to those IBANs", and "is only
+  as complete as the IBANs you give it". An operator paying an Armenian or Georgian
+  account could read that and conclude the duplicate check does not cover them. The
+  documentation, the `find_blocking` docstring and the remaining code comments now say
+  "account", and a test reads the dedup section of `SKILL.md` and fails on the old wording.
+  "IBAN" is kept where it means the flag names or the Paysera IBAN selection rule.
+- **The leak check is now behavioural.** It counted `tempfile.mkdtemp(` occurrences against
+  `shutil.rmtree` occurrences in each test module — but it read its own module, so both
+  strings counted themselves and the balance was accidental (a docstring naming either
+  function would have broken it), equal counts never proved pairing anyway, and
+  `scripts/test_validate.py` was not covered. Each test module is now run in a subprocess
+  with an empty `TMPDIR` of its own, and the directory must be empty afterwards. No
+  bookkeeping, covers every module including ones added later, and it caught a deliberately
+  reintroduced leak in all six places plus `test_validate.py`.
+
 ## 1.8.1 (2026-08-13)
 
 Thirteenth review round.

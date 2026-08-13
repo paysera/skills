@@ -335,7 +335,7 @@ on the **Vilnius calendar**, like every other date decision here, so today's dat
 accepted at any hour — including the small hours, when the UTC date is still yesterday.
 Without it the tool scans the
 **last 90 days**, and in that window a
-prior transfer to the same IBAN for the **same amount** blocks even when its purpose names
+prior transfer to the same account for the **same amount** blocks even when its purpose names
 a different invoice — which is exactly what a supplier billed the same sum every month
 looks like. The `SKIP` output says which rule matched, so an amount-only match is
 distinguishable from a purpose that actually quotes the invoice id. When it is amount-only,
@@ -387,11 +387,13 @@ python3 ${CLAUDE_PLUGIN_ROOT}/skills/paysera-payments/scripts/create-payment.py 
 
 The dedup checks **two** sources: (1) the local ledger of tool-created transfers, and
 (2) the payer account's **actual** transfers via the `GET /transfers` list filter
-(shipped 2026-06-18). For (2) it scans **all of the beneficiary's IBANs** — `--iban`
+(shipped 2026-06-18). For (2) it scans **all of the beneficiary's accounts** — `--iban`
 plus every `--also-iban` — over the whole period **from (invoice issue date − 1 day) to
 today**, because an invoice can name several accounts (e.g. Luminor *and* SEB) and a
-prior payment to **any** of them means the invoice is already paid. It **prints every
-payment it finds to those IBANs in the period** (amount + purpose) for you to eyeball,
+prior payment to **any** of them means the invoice is already paid. "Account", not
+"IBAN": a national account number that is not an IBAN is scanned exactly the same way,
+under whichever key the API returns it. It **prints every payment it finds to those
+accounts in the period** (amount + purpose) for you to eyeball,
 and **blocks** (`exit 3`, `SKIP`) on any whose **amount matches OR whose purpose quotes
 the invoice id** — so a duplicate made **manually in the Paysera app, to either bank**,
 is caught. Blocking ignores terminal transfers (`NONBLOCKING_STATES`, above — a prior
@@ -407,9 +409,11 @@ every way this check can come back incomplete says so, because a partial scan th
 as complete is worse than one that fails outright. Narrow the window with `--invoice-date`
 if you see it.
 
-> **Pass all the invoice's IBANs.** The check is only as complete as the IBANs you give
-> it. If the invoice lists two banks, `--also-iban` the second one — otherwise a prior
-> payment to that other account would be missed.
+> **Pass all the invoice's accounts.** The check is only as complete as the accounts you
+> give it. If the invoice lists two banks, `--also-iban` the second one — otherwise a
+> prior payment to that other account would be missed. (`--iban`/`--also-iban` take a
+> national account number just as readily as an IBAN; the flags are named for the common
+> case, not for what they accept.)
 >
 > Paste them however the invoice prints them. Spaces, hyphens and dots are stripped from
 > every listed IBAN before anything compares or chooses between them, and the tool says

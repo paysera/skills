@@ -31,6 +31,11 @@ from _testsupport import SCRIPTS, capture_curl, frozen_clock, load, mode_of, tem
 cp = load("create-payment.py", "create_payment")
 V = cp._VILNIUS
 
+# plugins/<plugin>/skills/<skill>/scripts -> the repository root.
+REPO_ROOT = SCRIPTS.parents[4]
+# Set in the child of the leak check below, so that child does not spawn one of its own.
+NO_RECURSE = "PAYSERA_TESTS_INNER_RUN"
+
 
 def vilnius(y, m, d, hh=0, mm=0):
     return datetime.datetime(y, m, d, hh, mm, tzinfo=V)
@@ -828,16 +833,47 @@ class TestTheSuiteCleansUpAfterItself(unittest.TestCase):
                 raise ValueError("boom")
         self.assertFalse(os.path.exists(directory))
 
-    def test_every_mkdtemp_in_the_suite_is_paired_with_a_cleanup(self):
-        # A source check, because a leak leaves nothing behind to assert on from inside
-        # the run that caused it. One rmtree per mkdtemp, in each test module.
-        for name in ("test_create_payment.py", "test_cancel_payment.py", "_testsupport.py"):
-            with self.subTest(module=name):
-                source = (SCRIPTS / name).read_text(encoding="utf-8")
+    @unittest.skipIf(
+        os.environ.get(NO_RECURSE) == "1",
+        "inner run: this test is what spawned it",
+    )
+    def test_no_test_module_leaves_a_temporary_directory_behind(self):
+        """Run each test module with its own empty TMPDIR and assert it is empty after.
+
+        This replaces a source check that counted `tempfile.mkdtemp(` against
+        `shutil.rmtree` occurrences. That check was weaker than it looked: it read its own
+        module, so both search strings counted themselves and the balance was accidental —
+        a docstring naming either function would have broken it — and equal counts never
+        proved pairing, since two mkdtemp calls in one class and two rmtree calls in
+        another passed it just as well. It also could not cover test_validate.py without
+        that file importing this one.
+
+        Asserting on the directory instead needs no bookkeeping, covers every module
+        including any added later, and fails for exactly the reason that matters.
+        """
+        modules = [
+            SCRIPTS / "test_create_payment.py",
+            SCRIPTS / "test_cancel_payment.py",
+            REPO_ROOT / "scripts" / "test_validate.py",
+        ]
+        for module in modules:
+            with self.subTest(module=module.name):
+                self.assertTrue(module.exists(), module)
+                tmpdir = tempfile.mkdtemp(prefix="paysera-leak-check-")
+                self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+                env = dict(os.environ)
+                # Every name Python consults for the temporary directory, so the child
+                # cannot fall back to the real /tmp and pass by writing outside the box.
+                env.update(TMPDIR=tmpdir, TEMP=tmpdir, TMP=tmpdir)
+                env[NO_RECURSE] = "1"  # or this test would spawn itself, forever
+                run = subprocess.run(
+                    [sys.executable, str(module)],
+                    capture_output=True, text=True, env=env, timeout=300,
+                )
+                self.assertEqual(run.returncode, 0, run.stderr[-2000:])
+                left = sorted(os.listdir(tmpdir))
                 self.assertEqual(
-                    source.count("tempfile.mkdtemp("),
-                    source.count("shutil.rmtree"),
-                    f"{name}: a mkdtemp() with no matching rmtree",
+                    left, [], f"{module.name} left {len(left)} directories behind: {left[:5]}"
                 )
 
 
@@ -891,6 +927,26 @@ class TestBeneficiaryAccountKeys(unittest.TestCase):
         blocking, seen = self._find({"bank_account": {"bank_account_number": "99999999999"}})
         self.assertEqual(blocking, [])
         self.assertEqual(seen, [])
+
+    def test_the_documentation_does_not_call_the_scanned_accounts_IBANs(self):
+        # The rename in the code was half of the fix; the documentation is where an
+        # operator paying an Armenian or Georgian account decides whether the check
+        # covers them. "Scans all of the beneficiary's IBANs" says it does not.
+        skill = (SCRIPTS.parent / "SKILL.md").read_text(encoding="utf-8")
+        section = skill[skill.index("The dedup checks") :]
+        section = section[: section.index("\n## ")]
+        # Collapsed, because the prose is hard-wrapped: "to those\nIBANs" is the same
+        # sentence as "to those IBANs" and must not escape the check by line break. The
+        # blockquote markers go too — half of this section is a "> " callout, and a "> "
+        # landing mid-sentence hides the phrase just as effectively as a newline.
+        section = " ".join(
+            word
+            for line in section.splitlines()
+            for word in re.sub(r"^\s*>\s?", "", line).split()
+        )
+        for wrong in ("beneficiary's IBANs", "those IBANs", "the IBANs you give"):
+            self.assertNotIn(wrong, section, f"documentation still says {wrong!r}")
+        self.assertIn("beneficiary's accounts", section)
 
     def test_the_key_the_tool_writes_is_the_key_the_scan_reads(self):
         # Pins the two halves together: whichever key create builds its payload with must

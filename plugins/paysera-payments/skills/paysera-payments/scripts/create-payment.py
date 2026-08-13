@@ -24,7 +24,7 @@ failed/rejected/canceled/expired; override with --force):
      shipped 2026-06-18). An invoice can name MORE THAN ONE beneficiary account (e.g. a
      Luminor AND a SEB IBAN); a prior payment to EITHER is still "this invoice paid". So
      pass every account from the invoice via --iban + --also-iban (repeatable). The check
-     pulls EVERY transfer to ANY of those IBANs over [invoice_date .. today], prints them
+     pulls EVERY transfer to ANY of those accounts over [invoice_date .. today], prints them
      for review, and BLOCKS on any whose amount matches OR whose purpose mentions the
      invoice id — catching a duplicate made manually in the app, to either bank.
 
@@ -907,16 +907,21 @@ def find_blocking(
     """Return (blocking, seen_to_ibans).
 
     `blocking` = [(hash, status, source, why)] that block re-creating a payment for this
-    invoice. `seen_to_ibans` = [(hash, status, amount, iban, purpose)] — EVERY transfer
-    to any candidate IBAN in the period, for human review (printed by the caller).
+    invoice. `seen_to_ibans` = [(hash, status, amount, account, purpose)] — EVERY transfer
+    to any candidate account in the period, for human review (printed by the caller).
+
+    "Account", not "IBAN", throughout: `ibans` may hold a national account number that is
+    not an IBAN, and the scan reads all three keys the API can return one under. Calling
+    them IBANs is how the missing key went unnoticed for twelve rounds; the parameter name
+    stays for compatibility with the caller, the prose does not.
 
     Two block sources, deduped by hash:
       1. LEDGER — prior transfers this tool recorded for `invoice_id` (live-checked).
       2. LIVE LIST — the payer account's ACTUAL transfers since the invoice date to ANY
-         of the beneficiary's accounts. An invoice can list several IBANs (Luminor AND
+         of the beneficiary's accounts. An invoice can list several accounts (Luminor AND
          SEB); a payment to EITHER means "this invoice already paid". Pass them all via
-         `ibans` (a set). A transfer to a candidate IBAN BLOCKS when its amount matches
-         OR its purpose mentions the invoice id. All transfers to those IBANs (whatever
+         `ibans` (a set). A transfer to a candidate account BLOCKS when its amount matches
+         OR its purpose mentions the invoice id. All transfers to those accounts (whatever
          the amount) are also returned in `seen_to_ibans` so a human can eyeball "what
          was it for". Uses GET /transfers (shipped 2026-06-18); best-effort.
 
@@ -969,7 +974,7 @@ def find_blocking(
                 "recorded for this invoice id; its live status could not be read",
             )
 
-    # 2. Live cross-check: same payer, any candidate beneficiary IBAN, over the whole
+    # 2. Live cross-check: same payer, any candidate beneficiary account, over the whole
     #    period from (invoice issue date - 1d grace) to now — regardless of who created
     #    the transfer (app or tool).
     cand = {_norm_iban(i) for i in (ibans or []) if i}
@@ -1666,7 +1671,7 @@ def _main(guard):
             invoice_date=args.invoice_date,
             currency=currency,
         )
-        # Show EVERY payment to any candidate IBAN in the period, for human review. The
+        # Show EVERY payment to any candidate account in the period, for human review. The
         # period comes from the same helper the scan used — never re-derived here.
         _, period = scan_window(args.invoice_date)
         print(
