@@ -42,9 +42,11 @@ def isolate_tempdir():
 
 def assert_tempdir_is_empty():
     """Use as `tearDownModule`. Fail if the module left anything in its directory."""
-    box = _TEMPBOX.pop("path", None)
-    if box is None:
-        return
+    # Raise rather than return: a silent no-op here is the exact failure this check exists
+    # to catch — a disarmed check and a clean run are the same green otherwise.
+    if "path" not in _TEMPBOX:
+        raise AssertionError("setUpModule did not run — the leak check is disarmed")
+    box = _TEMPBOX.pop("path")
     tempfile.tempdir = _TEMPBOX.pop("tempdir")
     for key, value in _TEMPBOX.pop("env").items():
         os.environ.pop(key, None) if value is None else os.environ.update({key: value})

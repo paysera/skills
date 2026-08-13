@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.8.4 (2026-08-13)
+
+Sixteenth review round. Both findings are about the two copies of the leak check drifting
+apart in the round that created the second copy.
+
+- **The repository copy redirected only `tempfile.tempdir`, not `TMPDIR`/`TEMP`/`TMP`.**
+  Harmless today — `scripts/test_validate.py` starts no subprocess — but its own probe
+  asserted only the half it had, so the first subprocess test added there would have
+  written to the real `/tmp` while the module reported clean. Confirmed by adding such a
+  test: before the fix the module passed, after it the module fails and names the leak.
+  Both copies now redirect both halves, and both probes assert both and then prove it with
+  a real `mkdtemp()`.
+- **A disarmed check no longer reads as a pass.** `assert_tempdir_is_empty()` returned
+  quietly when `setUpModule` had not run — the exact "never fired and nothing leaked look
+  identical" failure the check exists to prevent, one level up. Both copies now raise
+  `setUpModule did not run — the leak check is disarmed`, and both have a test for it.
+- Both copies restore `TMPDIR`/`TEMP`/`TMP` and `tempfile.tempdir` at teardown, with a test
+  that a full cycle leaves the process as it found it. Under pytest the three test modules
+  share one process, so a teardown that skips the restore hands the next module a path that
+  no longer exists.
+- `CONTRIBUTING.md` says the check exists twice, why, and that both halves belong in both.
+
 ## 1.8.3 (2026-08-13)
 
 Fifteenth review round. Both findings are about the previous round's leak check, which is

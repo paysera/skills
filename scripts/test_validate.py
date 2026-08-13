@@ -8,6 +8,7 @@ that either must fail CI or must not.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -30,12 +31,22 @@ _TEMPBOX = {}
 def setUpModule():
     _TEMPBOX["path"] = box = tempfile.mkdtemp(prefix="paysera-validate-tempbox-")
     _TEMPBOX["tempdir"] = tempfile.tempdir
+    _TEMPBOX["env"] = {k: os.environ.get(k) for k in ("TMPDIR", "TEMP", "TMP")}
+    # BOTH halves, exactly as the plugin copy does it: `tempfile.tempdir` for this
+    # process, the environment for any subprocess, which inherits it and reads nothing
+    # else. This module starts no subprocess today — which is why the half was missing,
+    # and why leaving it missing would make the first one added silently escape the box.
     tempfile.tempdir = box
+    os.environ.update(TMPDIR=box, TEMP=box, TMP=box)
 
 
 def tearDownModule():
+    if "path" not in _TEMPBOX:
+        raise AssertionError("setUpModule did not run — the leak check is disarmed")
     box = _TEMPBOX.pop("path")
     tempfile.tempdir = _TEMPBOX.pop("tempdir")
+    for key, value in _TEMPBOX.pop("env").items():
+        os.environ.pop(key, None) if value is None else os.environ.update({key: value})
     left = sorted(Path(box).iterdir())
     shutil.rmtree(box, ignore_errors=True)
     if left:
@@ -463,7 +474,10 @@ class TestTheLeakCheckItself(unittest.TestCase):
         # The value it had, not the box: restoring it to the box would repair a broken
         # setUpModule for the next test rather than leaving it broken to be caught.
         prior_tempdir = tempfile.tempdir
-        _TEMPBOX.update(path=box, tempdir=prior_tempdir)
+        # env={} for the same reason: the real saved environment must not be restored by
+        # a probe, or TMPDIR goes back to what it was before setUpModule and the rest of
+        # the module runs outside its own box.
+        _TEMPBOX.update(path=box, tempdir=prior_tempdir, env={})
         try:
             with self.assertRaises(AssertionError) as raised:
                 tearDownModule()
@@ -476,7 +490,47 @@ class TestTheLeakCheckItself(unittest.TestCase):
     def test_this_module_writes_inside_its_own_box(self):
         box = _TEMPBOX.get("path")
         self.assertIsNotNone(box, "setUpModule did not run")
-        self.assertEqual(tempfile.tempdir, box)
+        # Both halves. The environment one has no subprocess to protect in this module
+        # today; asserting it is what stops the first one added from escaping the box
+        # while the module still reports clean.
+        self.assertEqual(tempfile.tempdir, box, "this process writes outside the box")
+        for key in ("TMPDIR", "TEMP", "TMP"):
+            self.assertEqual(os.environ.get(key), box, key)
+        made = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, made, ignore_errors=True)
+        self.assertTrue(made.startswith(box))
+
+    def test_a_full_cycle_leaves_the_process_as_it_found_it(self):
+        # setUpModule/tearDownModule mutate process-wide state. Under pytest all three
+        # test modules share one process, so a teardown that does not put TMPDIR back
+        # hands the next module a value pointing at a directory that no longer exists.
+        keys = ("TMPDIR", "TEMP", "TMP")
+        before = {k: os.environ.get(k) for k in keys}
+        saved, prior_tempdir = dict(_TEMPBOX), tempfile.tempdir
+        try:
+            setUpModule()
+            self.assertNotEqual(os.environ["TMPDIR"], before["TMPDIR"])
+            tearDownModule()
+            self.assertEqual({k: os.environ.get(k) for k in keys}, before)
+            self.assertEqual(tempfile.tempdir, prior_tempdir)
+        finally:
+            _TEMPBOX.clear()
+            _TEMPBOX.update(saved)
+            tempfile.tempdir = prior_tempdir
+            for key, value in before.items():
+                os.environ.pop(key, None) if value is None else os.environ.update({key: value})
+
+    def test_a_disarmed_check_is_not_a_pass(self):
+        # tearDownModule with no setUpModule must say so, not return quietly: silence
+        # here is indistinguishable from a clean run.
+        saved = dict(_TEMPBOX)
+        _TEMPBOX.clear()
+        try:
+            with self.assertRaises(AssertionError) as raised:
+                tearDownModule()
+        finally:
+            _TEMPBOX.update(saved)
+        self.assertIn("disarmed", str(raised.exception))
 
 
 if __name__ == "__main__":

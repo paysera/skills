@@ -122,9 +122,16 @@ deleting them. CI runs them on Python 3.8 and 3.11 — 3.8 is the supported mini
 configuration where the built-in timezone fallback runs instead of `zoneinfo`.
 
 Run them serially. `frozen_clock` in `_testsupport.py` patches the shared `datetime` and
-`time` modules for the whole process, and each test module redirects `tempfile.tempdir`
-(and `TMPDIR`) to a private directory it must leave empty — both are process-wide, so
-parallel runners (`pytest -n`) are not supported.
+`time` modules for the whole process, and each test module redirects **both**
+`tempfile.tempdir` (this process) and `TMPDIR`/`TEMP`/`TMP` (any subprocess it spawns) to
+a private directory it must leave empty — all of that is process-wide, so parallel runners
+(`pytest -n`) are not supported.
+
+That check exists twice, in `_testsupport.py` and in `scripts/test_validate.py`, because a
+plugin file must not read a repository file and the reverse would be as wrong. Copies drift:
+if you change one, change the other, and keep both halves of the redirect in both. A module
+that redirects only `tempfile.tempdir` looks clean while its subprocesses write to the real
+`/tmp`.
 
 The tests inside a plugin never read a file outside it: `claude plugin install` copies the
 plugin directory alone, so anything a shipped test reaches for must be shipped with it.

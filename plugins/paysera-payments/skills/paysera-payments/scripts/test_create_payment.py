@@ -876,6 +876,38 @@ class TestTheSuiteCleansUpAfterItself(unittest.TestCase):
         self.addCleanup(shutil.rmtree, made, ignore_errors=True)
         self.assertTrue(made.startswith(box))
 
+    def test_a_full_cycle_leaves_the_process_as_it_found_it(self):
+        # Under pytest all three test modules share one process, so a teardown that does
+        # not put TMPDIR back hands the next module a path that no longer exists.
+        keys = ("TMPDIR", "TEMP", "TMP")
+        before = {k: os.environ.get(k) for k in keys}
+        saved, prior_tempdir = dict(_testsupport._TEMPBOX), tempfile.tempdir
+        try:
+            isolate_tempdir()
+            self.assertNotEqual(os.environ["TMPDIR"], before["TMPDIR"])
+            assert_tempdir_is_empty()
+            self.assertEqual({k: os.environ.get(k) for k in keys}, before)
+            self.assertEqual(tempfile.tempdir, prior_tempdir)
+        finally:
+            _testsupport._TEMPBOX.clear()
+            _testsupport._TEMPBOX.update(saved)
+            tempfile.tempdir = prior_tempdir
+            for key, value in before.items():
+                os.environ.pop(key, None) if value is None else os.environ.update({key: value})
+
+    def test_a_disarmed_check_is_not_a_pass(self):
+        # The teardown used to return quietly when setUpModule had not run. That is the
+        # failure mode this whole check exists to prevent, one level up: a check that
+        # never fires and a run that leaked nothing produce the same green.
+        saved = dict(_testsupport._TEMPBOX)
+        _testsupport._TEMPBOX.clear()
+        try:
+            with self.assertRaises(AssertionError) as raised:
+                _testsupport.assert_tempdir_is_empty()
+        finally:
+            _testsupport._TEMPBOX.update(saved)
+        self.assertIn("disarmed", str(raised.exception))
+
     def test_the_leak_check_fails_when_something_is_left_behind(self):
         # The check runs at module teardown, where a test cannot observe it. Call it
         # directly against a planted leak instead, so it is not merely assumed to work.
