@@ -122,7 +122,12 @@ deleting them. CI runs them on Python 3.8 and 3.11 — 3.8 is the supported mini
 configuration where the built-in timezone fallback runs instead of `zoneinfo`.
 
 Run them serially. `frozen_clock` in `_testsupport.py` patches the shared `datetime` and
-`time` modules for the whole process, so parallel runners (`pytest -n`) are not supported.
+`time` modules for the whole process, and each test module redirects `tempfile.tempdir`
+(and `TMPDIR`) to a private directory it must leave empty — both are process-wide, so
+parallel runners (`pytest -n`) are not supported.
+
+The tests inside a plugin never read a file outside it: `claude plugin install` copies the
+plugin directory alone, so anything a shipped test reaches for must be shipped with it.
 
 ## Releasing
 

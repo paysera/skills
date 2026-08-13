@@ -21,9 +21,19 @@ from unittest import mock
 # unittest from this directory, or a plain `python3 test_cancel_payment.py`).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _testsupport import SCRIPTS, capture_curl, load
+from _testsupport import (
+    SCRIPTS,
+    assert_tempdir_is_empty,
+    capture_curl,
+    isolate_tempdir,
+    load,
+)
 
 cancel = load("cancel-payment.py", "cancel_payment")
+
+# Own temporary directory, required to be empty at the end — see _testsupport.
+setUpModule = isolate_tempdir
+tearDownModule = assert_tempdir_is_empty
 
 
 class TestTokenHandling(unittest.TestCase):

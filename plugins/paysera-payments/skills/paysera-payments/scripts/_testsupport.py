@@ -19,6 +19,43 @@ from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parent
 
+# --- leak check -----------------------------------------------------------------------
+# Every fixture here makes a temporary directory holding a ledger with test IBANs and
+# amounts, and CI runs the whole suite twice. Rather than checking that each one is
+# cleaned up, give the module its OWN temporary directory and require it to be empty at
+# the end: no per-site bookkeeping, and a fixture added later is covered for free.
+#
+# `tempfile.tempdir` covers this process; the TMPDIR/TEMP/TMP variables cover the
+# subprocesses the end-to-end tests spawn, which inherit the environment.
+_TEMPBOX = {}
+
+
+def isolate_tempdir():
+    """Use as `setUpModule`. Give this module a private, empty temporary directory."""
+    box = tempfile.mkdtemp(prefix="paysera-tempbox-")
+    _TEMPBOX["path"] = box
+    _TEMPBOX["tempdir"] = tempfile.tempdir
+    _TEMPBOX["env"] = {k: os.environ.get(k) for k in ("TMPDIR", "TEMP", "TMP")}
+    tempfile.tempdir = box
+    os.environ.update(TMPDIR=box, TEMP=box, TMP=box)
+
+
+def assert_tempdir_is_empty():
+    """Use as `tearDownModule`. Fail if the module left anything in its directory."""
+    box = _TEMPBOX.pop("path", None)
+    if box is None:
+        return
+    tempfile.tempdir = _TEMPBOX.pop("tempdir")
+    for key, value in _TEMPBOX.pop("env").items():
+        os.environ.pop(key, None) if value is None else os.environ.update({key: value})
+    left = sorted(os.listdir(box))
+    shutil.rmtree(box, ignore_errors=True)
+    if left:
+        raise AssertionError(
+            f"{len(left)} temporary item(s) left behind by this module — every mkdtemp() "
+            f"needs a matching cleanup: {left[:5]}"
+        )
+
 
 def load(script_name, module_name):
     spec = importlib.util.spec_from_file_location(module_name, SCRIPTS / script_name)

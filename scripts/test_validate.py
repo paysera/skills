@@ -19,6 +19,31 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import validate  # noqa: E402
 
+# --- leak check -----------------------------------------------------------------------
+# This module gets its own temporary directory and must leave it empty. Deliberately a
+# local copy of what plugins/*/scripts/_testsupport.py does, not an import of it: a plugin
+# is installed on its own, so a plugin file must never depend on a repository file, and
+# the dependency in this direction would be just as wrong.
+_TEMPBOX = {}
+
+
+def setUpModule():
+    _TEMPBOX["path"] = box = tempfile.mkdtemp(prefix="paysera-validate-tempbox-")
+    _TEMPBOX["tempdir"] = tempfile.tempdir
+    tempfile.tempdir = box
+
+
+def tearDownModule():
+    box = _TEMPBOX.pop("path")
+    tempfile.tempdir = _TEMPBOX.pop("tempdir")
+    left = sorted(Path(box).iterdir())
+    shutil.rmtree(box, ignore_errors=True)
+    if left:
+        raise AssertionError(
+            f"{len(left)} temporary item(s) left behind by this module — every mkdtemp() "
+            f"needs a matching cleanup: {[p.name for p in left[:5]]}"
+        )
+
 # (sample line, must_be_flagged, why)
 SAMPLES = [
     # --- internal hosts that must never reach the public repository ----------------
@@ -423,6 +448,35 @@ class TestMalformedInputIsReported(ValidatorFixture, unittest.TestCase):
         (self.plugin_dir / "skills" / "demo" / "SKILL.md").write_text("nope\n", encoding="utf-8")
         errors = validate.validate()
         self.assertTrue(any("SKILL.md" in e for e in errors), errors)
+
+
+class TestTheLeakCheckItself(unittest.TestCase):
+    """tearDownModule is where the check runs, and no test can observe it from inside the
+    module. Call it directly against a planted leak, or "it never fires" and "nothing
+    leaked" look identical."""
+
+    def test_a_leftover_directory_fails_the_module(self):
+        box = tempfile.mkdtemp(prefix="paysera-leakprobe-")
+        self.addCleanup(shutil.rmtree, box, ignore_errors=True)
+        (Path(box) / "left-behind").mkdir()
+        saved = dict(_TEMPBOX)
+        # The value it had, not the box: restoring it to the box would repair a broken
+        # setUpModule for the next test rather than leaving it broken to be caught.
+        prior_tempdir = tempfile.tempdir
+        _TEMPBOX.update(path=box, tempdir=prior_tempdir)
+        try:
+            with self.assertRaises(AssertionError) as raised:
+                tearDownModule()
+        finally:
+            _TEMPBOX.clear()
+            _TEMPBOX.update(saved)
+            tempfile.tempdir = prior_tempdir
+        self.assertIn("left-behind", str(raised.exception))
+
+    def test_this_module_writes_inside_its_own_box(self):
+        box = _TEMPBOX.get("path")
+        self.assertIsNotNone(box, "setUpModule did not run")
+        self.assertEqual(tempfile.tempdir, box)
 
 
 if __name__ == "__main__":

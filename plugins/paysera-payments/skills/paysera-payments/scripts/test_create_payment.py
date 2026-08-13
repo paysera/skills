@@ -26,15 +26,26 @@ from unittest import mock
 # unittest from this directory, or a plain `python3 test_create_payment.py`).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _testsupport import SCRIPTS, capture_curl, frozen_clock, load, mode_of, temp_ledger
+import _testsupport  # noqa: E402  (for the leak check's own test, below)
+from _testsupport import (  # noqa: E402
+    SCRIPTS,
+    assert_tempdir_is_empty,
+    capture_curl,
+    frozen_clock,
+    isolate_tempdir,
+    load,
+    mode_of,
+    temp_ledger,
+)
 
 cp = load("create-payment.py", "create_payment")
 V = cp._VILNIUS
 
-# plugins/<plugin>/skills/<skill>/scripts -> the repository root.
-REPO_ROOT = SCRIPTS.parents[4]
-# Set in the child of the leak check below, so that child does not spawn one of its own.
-NO_RECURSE = "PAYSERA_TESTS_INNER_RUN"
+# This module gets its own temporary directory, and must leave it empty. Nothing here
+# reaches outside the plugin: `claude plugin install` copies the plugin directory only, so
+# a check that needs a repository file fails from an installed copy for no real defect.
+setUpModule = isolate_tempdir
+tearDownModule = assert_tempdir_is_empty
 
 
 def vilnius(y, m, d, hh=0, mm=0):
@@ -833,48 +844,58 @@ class TestTheSuiteCleansUpAfterItself(unittest.TestCase):
                 raise ValueError("boom")
         self.assertFalse(os.path.exists(directory))
 
-    @unittest.skipIf(
-        os.environ.get(NO_RECURSE) == "1",
-        "inner run: this test is what spawned it",
-    )
-    def test_no_test_module_leaves_a_temporary_directory_behind(self):
-        """Run each test module with its own empty TMPDIR and assert it is empty after.
+    def test_the_module_temporary_directory_is_isolated_and_checked(self):
+        """The leak check itself is `tearDownModule`; this pins that it is armed.
 
-        This replaces a source check that counted `tempfile.mkdtemp(` against
-        `shutil.rmtree` occurrences. That check was weaker than it looked: it read its own
-        module, so both search strings counted themselves and the balance was accidental —
-        a docstring naming either function would have broken it — and equal counts never
-        proved pairing, since two mkdtemp calls in one class and two rmtree calls in
-        another passed it just as well. It also could not cover test_validate.py without
-        that file importing this one.
+        Two earlier versions of this check were worse. The first counted
+        `tempfile.mkdtemp(` occurrences against `shutil.rmtree` occurrences per module: it
+        read its own module, so both strings counted themselves and the balance was
+        arithmetic coincidence, and equal counts never proved pairing anyway. The second
+        re-ran every test module in a subprocess with its own TMPDIR — which did test the
+        real property, but ran the whole suite a second time inside itself (four times per
+        CI job, this module carrying 63 subprocess call sites), and reached out to
+        `scripts/test_validate.py`, a repository file that `claude plugin install` does not
+        copy. From an installed plugin that path does not exist and the check failed for a
+        defect that was not there.
 
-        Asserting on the directory instead needs no bookkeeping, covers every module
-        including any added later, and fails for exactly the reason that matters.
+        Giving each module its own temporary directory and requiring it to be empty
+        afterwards tests the same property, costs nothing, needs no path outside the
+        plugin, and covers a fixture added later without anyone remembering to.
         """
-        modules = [
-            SCRIPTS / "test_create_payment.py",
-            SCRIPTS / "test_cancel_payment.py",
-            REPO_ROOT / "scripts" / "test_validate.py",
-        ]
-        for module in modules:
-            with self.subTest(module=module.name):
-                self.assertTrue(module.exists(), module)
-                tmpdir = tempfile.mkdtemp(prefix="paysera-leak-check-")
-                self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
-                env = dict(os.environ)
-                # Every name Python consults for the temporary directory, so the child
-                # cannot fall back to the real /tmp and pass by writing outside the box.
-                env.update(TMPDIR=tmpdir, TEMP=tmpdir, TMP=tmpdir)
-                env[NO_RECURSE] = "1"  # or this test would spawn itself, forever
-                run = subprocess.run(
-                    [sys.executable, str(module)],
-                    capture_output=True, text=True, env=env, timeout=300,
-                )
-                self.assertEqual(run.returncode, 0, run.stderr[-2000:])
-                left = sorted(os.listdir(tmpdir))
-                self.assertEqual(
-                    left, [], f"{module.name} left {len(left)} directories behind: {left[:5]}"
-                )
+        box = _testsupport._TEMPBOX.get("path")
+        self.assertIsNotNone(box, "setUpModule did not run")
+        self.assertIn("paysera-tempbox-", box)
+        # Asserted against tempfile.tempdir, NOT gettempdir(): gettempdir() falls back to
+        # $TMPDIR, so it reports the box either way and cannot see this half go missing.
+        self.assertEqual(tempfile.tempdir, box, "this process still writes outside the box")
+        # And the environment, because the end-to-end tests spawn subprocesses, which read
+        # that and not tempfile.tempdir. Both halves, or the check has a hole.
+        for key in ("TMPDIR", "TEMP", "TMP"):
+            self.assertEqual(os.environ.get(key), box, key)
+        made = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, made, ignore_errors=True)
+        self.assertTrue(made.startswith(box))
+
+    def test_the_leak_check_fails_when_something_is_left_behind(self):
+        # The check runs at module teardown, where a test cannot observe it. Call it
+        # directly against a planted leak instead, so it is not merely assumed to work.
+        box = tempfile.mkdtemp(prefix="paysera-leakprobe-")
+        self.addCleanup(shutil.rmtree, box, ignore_errors=True)
+        os.mkdir(os.path.join(box, "left-behind"))
+        saved = dict(_testsupport._TEMPBOX)
+        # Captured, not assumed to be the box: restoring it to the box would REPAIR a
+        # broken isolate_tempdir for whatever test runs next, and that is not this test's
+        # business. (It did, until a mutation of isolate_tempdir survived because of it.)
+        prior_tempdir = tempfile.tempdir
+        _testsupport._TEMPBOX.update(path=box, tempdir=prior_tempdir, env={})
+        try:
+            with self.assertRaises(AssertionError) as raised:
+                _testsupport.assert_tempdir_is_empty()
+        finally:
+            _testsupport._TEMPBOX.clear()
+            _testsupport._TEMPBOX.update(saved)
+            tempfile.tempdir = prior_tempdir
+        self.assertIn("left-behind", str(raised.exception))
 
 
 class TestBeneficiaryAccountKeys(unittest.TestCase):

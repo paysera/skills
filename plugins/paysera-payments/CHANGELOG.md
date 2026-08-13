@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.8.3 (2026-08-13)
+
+Fifteenth review round. Both findings are about the previous round's leak check, which is
+now built a third way — and the third way is the one that should have been obvious.
+
+- **A shipped test reached outside the plugin.** The leak check ran each test module in a
+  subprocess, including `scripts/test_validate.py`, which belongs to the repository.
+  `claude plugin install` copies the plugin directory alone, so from an installed copy that
+  path does not exist and the check failed — a hard failure naming no real defect.
+  Confirmed by running the shipped suite from a copy outside the repository.
+- **It also ran the whole suite a second time inside itself**: four executions of every
+  module per CI job, this module carrying 63 subprocess call sites.
+
+  Both are gone. Each test module now gets its own temporary directory
+  (`tempfile.tempdir` plus `TMPDIR`/`TEMP`/`TMP`, so spawned subprocesses land inside it
+  too) and must leave it empty at `tearDownModule`. Same property, no path outside the
+  plugin, no second run: the suite goes back from ~7.5s to ~3.4s. `scripts/test_validate.py`
+  carries its own six-line copy rather than importing the plugin's — a plugin file must not
+  depend on a repository file, and the dependency the other way round would be as wrong.
+- The teardown check has tests of its own in both places, because a check that runs at
+  teardown cannot be observed from inside the module: "it never fires" and "nothing leaked"
+  look identical otherwise.
+
 ## 1.8.2 (2026-08-13)
 
 Fourteenth review round. Both findings are about the previous round's own fix.
