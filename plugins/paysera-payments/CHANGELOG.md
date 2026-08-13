@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.8.1 (2026-08-13)
+
+Thirteenth review round.
+
+- **The duplicate check could not see a payment to a non-IBAN account.** The live
+  cross-check read the beneficiary account from two keys, `bank_account.iban` and
+  `beneficiary.iban`. It never read the third — `bank_account.bank_account_number` — which
+  is the key this tool itself writes for a national account number (Armenian, Georgian and
+  similar). For every such beneficiary the account was absent from the candidate set, so
+  every prior payment was dropped before the amount and invoice-id rules ran, and the run
+  printed "No prior payments … in the period". Only the local ledger stood in the way, and
+  the ledger cannot see a payment made by hand in the app. All three keys are now read.
+- The dup-check output says "beneficiary account(s)", not "IBAN(s)". A national account
+  number is not an IBAN, and calling it one is how the missing key stayed unnoticed.
+- **The publication gate now treats any scheme as a URL** — `ssh://`, `git://`,
+  `jdbc:postgresql://`, or a bare `//`, not only `http`/`https`. An internal host behind
+  another scheme fell through to the prose exemption, whose file-path rule then cleared it,
+  because the text before the host ends in `/`. A clone command for an internal repository
+  is an ordinary line to write in a contributing guide or a workflow `run:` step.
+- `--beneficiary-address` help said REQUIRED for any cross-border transfer; the pre-flight
+  check demands it only outside the SEPA zone. The help now states the rule that is
+  actually applied, and a test pins the two together.
+- Gate errors about a skill name a repository-relative path, and name the file once. Two
+  of them printed the CI runner's own absolute checkout path, and one printed the file
+  name twice.
+- The test suite removed none of its temporary directories: one per test method, 84 per
+  run, each holding a ledger with test IBANs and amounts, and CI runs the suite twice.
+  Every `mkdtemp()` is now paired with a cleanup, and a test fails if one is not.
+- `CONTRIBUTING.md` lists `.yaml`, which the gate has always scanned.
+
 ## 1.8.0 (2026-08-12)
 
 Twelfth review round.

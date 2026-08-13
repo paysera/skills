@@ -18,8 +18,12 @@ SKIP_DIRS = {".git", "__pycache__", ".pytest_cache"}
 # This is an allowlist on purpose: naming the hosts that are *not* public would
 # put them in this repository, which is exactly what the check exists to prevent.
 HOSTNAME = re.compile(r"\b(?:[a-z0-9-]+\.)+[a-z]{2,}\b", re.IGNORECASE)
-# A hostname sits in an explicit URL when the text right before it is a scheme.
-URL_PREFIX = re.compile(r"https?://\Z", re.IGNORECASE)
+# A hostname sits in an explicit URL when the text right before it is `//` — with ANY
+# scheme in front of it, or none at all. Restricting this to http/https missed the most
+# ordinary way to write an internal host in a contributing guide or a workflow `run:`
+# step: `git clone ssh://host/repo.git`. Those fell through to looks_like_prose(), whose
+# path rule then cleared them, because the text before the host ends in `/`.
+URL_PREFIX = re.compile(r"(?:[a-z][a-z0-9+.-]*:)?//\Z", re.IGNORECASE)
 PAYSERA_HOST = re.compile(r"(?:^|\.)paysera\.[a-z]{2,}$", re.IGNORECASE)
 PUBLIC_PAYSERA_HOSTS = frozenset(
     {
@@ -112,9 +116,10 @@ def read_frontmatter(skill_file: Path) -> dict:
     match = FRONTMATTER.match(skill_file.read_text(encoding="utf-8"))
     if match is None:
         # CRLF line ends are the usual cause: the pattern anchors on "\n".
+        # No file name here: every caller prefixes the path it wants to show.
         raise ValueError(
-            f"{skill_file.name}: no YAML frontmatter found — the file must start with a "
-            f"'---' block (LF line ends)"
+            "no YAML frontmatter found — the file must start with a '---' block "
+            "(LF line ends)"
         )
     fields = {}
     for line in match.group(1).splitlines():
@@ -188,10 +193,13 @@ def validate() -> list:
             except (OSError, ValueError) as e:
                 errors.append(f"{skill_file.relative_to(ROOT)}: {e}")
                 continue
+            # Relative, like every other message: an absolute path here is the CI
+            # runner's own checkout directory, which means nothing to the reader.
+            rel_skill = skill_file.relative_to(ROOT)
             if fields.get("name") != skill_file.parent.name:
-                errors.append(f"{skill_file}: frontmatter name does not match its directory")
+                errors.append(f"{rel_skill}: frontmatter name does not match its directory")
             if not fields.get("description"):
-                errors.append(f"{skill_file}: frontmatter has no description")
+                errors.append(f"{rel_skill}: frontmatter has no description")
 
     plugins_root = ROOT / "plugins"
     for plugin_dir in sorted(plugins_root.iterdir()) if plugins_root.is_dir() else []:

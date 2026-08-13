@@ -10,6 +10,7 @@ import contextlib
 import datetime
 import importlib.util
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -61,6 +62,9 @@ def temp_ledger(module):
         yield module.LEDGER_FILE
     finally:
         module.LEDGER_FILE = original
+        # The ledger holds test IBANs and amounts, and CI runs the whole suite twice.
+        # ignore_errors: a cleanup failure must not turn a passing test red.
+        shutil.rmtree(d, ignore_errors=True)
 
 
 class FakeCompletedProcess:

@@ -23,8 +23,8 @@ Only client-facing skills. A skill qualifies when all of the following hold:
 
 ### What the automated check does and does not cover
 
-`scripts/validate.py` scans **every** `.md`, `.py`, `.json` and `.yml` file in the
-repository (not just `plugins/`) and fails on:
+`scripts/validate.py` scans **every** `.md`, `.py`, `.json`, `.yml` and `.yaml` file in
+the repository (not just `plugins/`) and fails on:
 
 - a `paysera.*` hostname that is not on its allowlist of public hosts, wherever it appears;
 - a hostname containing `intranet`/`internal`, or ending in `.local`, `.lan`, `.corp`,
@@ -38,7 +38,11 @@ repository (not just `plugins/`) and fails on:
   checked. **Backticks are not an exemption** — a hostname in backticks is checked exactly
   as a bare one is, because backticks are how this repository normally writes hostnames.
   `.test` and `.invalid` are reserved TLDs but also ordinary file suffixes, so they count
-  only inside a URL;
+  only inside a URL. "Inside a URL" means **any** scheme, or none: `ssh://`, `git://`,
+  `jdbc:postgresql://` and a bare `//` all count, not only `http`/`https`. A clone command
+  for an internal repository is a usual thing to write in a contributing guide or a
+  workflow `run:` step, and it was the exemption for file paths that used to clear it —
+  the text before the host ends in `/`;
 - a URL that looks like an issue tracker or forge link (`/browse/KEY-123`, `/jira/`,
   `/confluence/`, `/-/merge_requests/`);
 - a **bare issue-tracker key** anywhere, with no URL around it — an uppercase project

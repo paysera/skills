@@ -981,9 +981,20 @@ def find_blocking(
             if not isinstance(t, dict):
                 continue
             ben = t.get("beneficiary") or {}
-            # IBAN location varies by beneficiary type: bank → beneficiary.bank_account.iban,
-            # paysera → beneficiary.iban (verified against the live list). Check both.
-            t_iban = _norm_iban((ben.get("bank_account") or {}).get("iban") or ben.get("iban"))
+            # The account sits under one of three keys, and missing any one of them makes
+            # this check silently match nothing for that beneficiary:
+            #   bank_account.iban                 — a bank beneficiary with an IBAN
+            #   bank_account.bank_account_number  — a bank beneficiary with a NATIONAL
+            #       account number, which is what this tool itself sends for a non-IBAN
+            #       account (see the create payload below)
+            #   beneficiary.iban                  — a paysera beneficiary
+            # All three are verified against the live list.
+            acct_field = ben.get("bank_account") or {}
+            t_iban = _norm_iban(
+                acct_field.get("iban")
+                or acct_field.get("bank_account_number")
+                or ben.get("iban")
+            )
             if t_iban not in cand:
                 continue
             t_amt = (
@@ -1368,9 +1379,10 @@ def _main(guard):
     ap.add_argument(
         "--beneficiary-address",
         default=None,
-        help="Beneficiary postal address (street, city, country). REQUIRED by the "
-        "Paysera API for cross-border / international transfers (non-SEPA-Instant); "
-        "the API rejects them with 'mapper_empty_beneficiary_address' otherwise.",
+        help="Beneficiary postal address (street, city, country). REQUIRED for a "
+        "beneficiary OUTSIDE the SEPA zone (UA/AM/GE/…), which is what the pre-flight "
+        "check demands and what the API rejects with 'mapper_empty_beneficiary_address'. "
+        "A cross-border transfer INSIDE SEPA does not need it.",
     )
     ap.add_argument("--iban", help="Beneficiary IBAN/account (the one to pay TO)")
     ap.add_argument(
@@ -1659,14 +1671,15 @@ def _main(guard):
         _, period = scan_window(args.invoice_date)
         print(
             f"Dup-check: scanned payments from {payer} to "
-            f"{len(set(_norm_iban(i) for i in candidate_ibans))} beneficiary IBAN(s) {period}."
+            f"{len(set(_norm_iban(i) for i in candidate_ibans))} beneficiary account(s) "
+            f"{period}."
         )
         if seen:
-            print(f"  Found {len(seen)} prior payment(s) to those IBANs — review:")
+            print(f"  Found {len(seen)} prior payment(s) to those accounts — review:")
             for h, st, amt, ib, purp in seen:
                 print(f"    {amt} -> {ib}  status={st}  {h}\n      purpose: {purp[:120]}")
         else:
-            print("  No prior payments to those IBAN(s) in the period.")
+            print("  No prior payments to those accounts in the period.")
         if blocking:
             print(f"SKIP — this invoice looks already paid ('{args.invoice_id}'):")
             for h, st, src, why in blocking:

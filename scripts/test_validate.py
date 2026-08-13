@@ -66,6 +66,15 @@ SAMPLES = [
     ("https://config.test/path", True, "reserved TLD used as a real host"),
     # Both spellings on one line: "in a URL" is decided per occurrence, not per line.
     ("`config.test` is a file; https://config.test/x is a host", True, "URL wins on its own"),
+    # --- a URL is a URL under any scheme --------------------------------------------
+    # These all used to pass: the scheme was not http/https, so the host was not "in a
+    # URL", and the file-path exemption then cleared it because the text before it ends
+    # in `/`. A clone command for an internal repository is an ordinary thing to write.
+    ("clone ssh://wiki.internal/repo.git", True, "ssh scheme"),
+    ("git clone git://wiki.internal/x.git", True, "git scheme"),
+    ("see //wiki.internal/page", True, "protocol-relative, no scheme at all"),
+    ("jdbc:postgresql://db.corp.local:5432/main", True, "compound jdbc scheme"),
+    ("ssh://config.test/x", True, "reserved TLD counts under a non-http scheme too"),
     # --- private IP addresses -------------------------------------------------------
     # The HOSTNAME pattern requires a letters-only last label, so it can never match an
     # address. Naming an internal box by IP is at least as common as naming it by host.
@@ -371,6 +380,31 @@ class TestMalformedInputIsReported(ValidatorFixture, unittest.TestCase):
         )
         errors = validate.validate()  # must not raise ValueError
         self.assertTrue(any("frontmatter" in e for e in errors), errors)
+        # Named once, not twice: the caller supplies the path, so the exception must not
+        # carry a file name of its own.
+        message = next(e for e in errors if "frontmatter" in e)
+        self.assertEqual(message.count("SKILL.md"), 1, message)
+
+    def test_every_skill_error_names_a_repository_relative_path(self):
+        # An absolute path here is the CI runner's own checkout directory, which the
+        # reader has never seen. Every other message in the gate is relative.
+        self.write(self.entry(), self.manifest())
+        skill = self.plugin_dir / "skills" / "demo" / "SKILL.md"
+        for body in (
+            "# No frontmatter here\n",              # the ValueError path
+            "---\nname: wrong\ndescription: x\n---\n",  # name does not match
+            "---\nname: demo\n---\n",               # no description
+        ):
+            with self.subTest(body=body.splitlines()[0]):
+                skill.write_text(body, encoding="utf-8")
+                errors = [e for e in validate.validate() if "SKILL.md" in e]
+                self.assertTrue(errors)
+                for e in errors:
+                    self.assertTrue(
+                        e.startswith("plugins/demo/skills/demo/SKILL.md:"),
+                        f"not a repository-relative path: {e}",
+                    )
+                    self.assertNotIn(str(self.root), e)
 
     def test_crlf_frontmatter_is_accepted(self):
         # The FRONTMATTER pattern anchors on "\n", which looks like it would reject a

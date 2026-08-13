@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -55,6 +56,7 @@ class TestTokenHandling(unittest.TestCase):
         # Mode 0600 was documented but nothing enforced it, and a plain `>` redirect under
         # the usual umask 022 leaves 0644.
         tmp = tempfile.mkdtemp(prefix="paysera-cancel-token-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         path = os.path.join(tmp, "token")
         with open(path, "w") as f:
             f.write("a-token\n")
@@ -123,6 +125,7 @@ class TestCommandLine(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="paysera-cancel-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.bin = os.path.join(self.tmp, "bin")
         os.makedirs(self.bin)
         self.log = os.path.join(self.tmp, "calls.log")

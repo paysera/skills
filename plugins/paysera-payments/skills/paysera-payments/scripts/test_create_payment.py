@@ -13,6 +13,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -213,6 +214,7 @@ class TestTokenFilePermissions(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="paysera-token-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.path = os.path.join(self.tmp, "token")
         with open(self.path, "w") as f:
             f.write("a-token\n")
@@ -807,6 +809,97 @@ class TestTransportFailures(unittest.TestCase):
         self.assertEqual(code, "ERR")
 
 
+class TestTheSuiteCleansUpAfterItself(unittest.TestCase):
+    """Every temporary directory here holds a ledger with test IBANs and amounts, and CI
+    runs the whole suite twice. One directory per test method, left behind, adds up."""
+
+    def test_temp_ledger_removes_its_directory(self):
+        with temp_ledger(cp) as path:
+            cp._ensure_config_dir()
+            cp.append_ledger({"invoice_id": "INV-1"})
+            self.assertTrue(os.path.exists(path))
+            directory = os.path.dirname(os.path.dirname(path))
+        self.assertFalse(os.path.exists(directory), "temp_ledger left its directory behind")
+
+    def test_temp_ledger_cleans_up_even_when_the_body_raises(self):
+        with self.assertRaises(ValueError):
+            with temp_ledger(cp) as path:
+                directory = os.path.dirname(os.path.dirname(path))
+                raise ValueError("boom")
+        self.assertFalse(os.path.exists(directory))
+
+    def test_every_mkdtemp_in_the_suite_is_paired_with_a_cleanup(self):
+        # A source check, because a leak leaves nothing behind to assert on from inside
+        # the run that caused it. One rmtree per mkdtemp, in each test module.
+        for name in ("test_create_payment.py", "test_cancel_payment.py", "_testsupport.py"):
+            with self.subTest(module=name):
+                source = (SCRIPTS / name).read_text(encoding="utf-8")
+                self.assertEqual(
+                    source.count("tempfile.mkdtemp("),
+                    source.count("shutil.rmtree"),
+                    f"{name}: a mkdtemp() with no matching rmtree",
+                )
+
+
+class TestBeneficiaryAccountKeys(unittest.TestCase):
+    """The account sits under one of three keys, and the scan must read all three.
+
+    The one it used to miss is the one THIS TOOL writes for a non-IBAN account:
+    beneficiary.bank_account.bank_account_number. For every Armenian/Georgian-style
+    national account number the candidate set could not match, so the scan found nothing
+    and the run printed its all-clear — a partial check reporting as complete.
+    """
+
+    ACCOUNT = "20507231000012345"
+
+    def _find(self, beneficiary):
+        row = {
+            "id": "H1",
+            "status": "done",
+            "purpose": {"details": "Invoice INV-77"},
+            "amount": {"amount": "250.00", "currency": "EUR"},
+            "beneficiary": beneficiary,
+        }
+        with temp_ledger(cp):
+            with mock.patch.object(cp, "list_transfers", return_value=[row]):
+                return cp.find_blocking(
+                    "INV-77",
+                    token="t",
+                    payer="EVP1",
+                    ibans=[self.ACCOUNT],
+                    amount="250.00",
+                    currency="EUR",
+                )
+
+    def test_a_national_account_number_blocks_a_second_payment(self):
+        blocking, seen = self._find({"bank_account": {"bank_account_number": self.ACCOUNT}})
+        self.assertEqual(len(blocking), 1, "the prior payment was invisible to the scan")
+        self.assertEqual(len(seen), 1, "and absent from the human-review list too")
+
+    def test_an_iban_under_bank_account_still_blocks(self):
+        blocking, seen = self._find({"bank_account": {"iban": self.ACCOUNT}})
+        self.assertEqual(len(blocking), 1)
+        self.assertEqual(len(seen), 1)
+
+    def test_a_paysera_beneficiary_iban_still_blocks(self):
+        blocking, seen = self._find({"iban": self.ACCOUNT})
+        self.assertEqual(len(blocking), 1)
+        self.assertEqual(len(seen), 1)
+
+    def test_a_different_account_under_the_same_key_does_not_block(self):
+        # Otherwise the fix above could be "match everything", which blocks every invoice.
+        blocking, seen = self._find({"bank_account": {"bank_account_number": "99999999999"}})
+        self.assertEqual(blocking, [])
+        self.assertEqual(seen, [])
+
+    def test_the_key_the_tool_writes_is_the_key_the_scan_reads(self):
+        # Pins the two halves together: whichever key create builds its payload with must
+        # be one the scan looks under. A rename on one side alone fails here.
+        source = (SCRIPTS / "create-payment.py").read_text(encoding="utf-8")
+        self.assertIn('{"bank_account_number": acct}', source)
+        self.assertIn('acct_field.get("bank_account_number")', source)
+
+
 class TestNullFields(unittest.TestCase):
     """The API returns keys present-but-null; a .get() default does not cover that."""
 
@@ -861,6 +954,9 @@ class ScriptHarness:
     # later one observes, and makes "assert no ledger was written" quietly meaningless.
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="paysera-cli-test-")
+        # One directory per test METHOD, so without this the suite leaves one behind for
+        # every test it runs — each holding a ledger with test IBANs and amounts.
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.bin = os.path.join(self.tmp, "bin")
         os.makedirs(self.bin)
         self.write_stub('printf \'{"items":[]}\\nHTTP:200\'')
@@ -909,6 +1005,35 @@ class ScriptHarness:
         env["PAYSERA_PAT"] = "test-token"
         cmd = [sys.executable, str(SCRIPTS / "create-payment.py")] + list(argv)
         return subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=60)
+
+
+class TestAddressRequirementIsStatedAsItIsChecked(ScriptHarness, unittest.TestCase):
+    """--help said one thing, the pre-flight check did another.
+
+    The help called --beneficiary-address REQUIRED for any cross-border transfer; the
+    check only demands it outside the SEPA zone. An operator who believes the help either
+    passes an address the API does not want, or distrusts the check that let them through.
+    """
+
+    def test_a_cross_border_sepa_transfer_needs_no_address(self):
+        # Poland, --priority normal: cross-border and not SEPA-Instant, so the old help
+        # text said an address was required. It is not.
+        out = self.run_script(
+            "--amount", "10.00", "--iban", "PL27114020040000300201355387",
+            "--beneficiary-type", "legal", "--priority", "normal",
+        )
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+
+    def test_the_help_states_the_rule_the_check_applies(self):
+        out = self.run_script_bare("--help")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        # The wrapped help is re-flowed by argparse, so match on collapsed whitespace.
+        help_text = " ".join(out.stdout.split())
+        # rindex, not index: the first occurrence is in the usage line, which carries no
+        # help text at all — matching there would make this test unable to fail.
+        start = help_text.rindex("--beneficiary-address")
+        section = help_text[start : help_text.index("--iban", start)]
+        self.assertIn("OUTSIDE the SEPA zone", section)
 
 
 class TestCommandLineValidation(ScriptHarness, unittest.TestCase):
