@@ -26,17 +26,55 @@ SCRIPTS = Path(__file__).resolve().parent
 #
 # `tempfile.tempdir` covers this process; the TMPDIR/TEMP/TMP variables cover the
 # subprocesses the end-to-end tests spawn, which inherit the environment.
+#
+# HOME is redirected too, and is a different problem from the others. The temp box catches
+# what the suite WRITES; HOME decides what the suite REACHES. Since 1.8.8 both scripts
+# chmod ~/.config/paysera-payments/ to 0700 on every run that reads the token, so a test
+# that inherited the real HOME reached outside the sandbox and changed the mode of the
+# developer's own directory — silently, and invisibly to the temp-box check, which only
+# ever looks inside the box. The redirect is here rather than in each fixture so that the
+# next helper to read HOME is covered without anyone remembering.
+#
+# The script modules resolve their HOME-derived constants at IMPORT time, which is before
+# any setUpModule runs — so redirecting the variable is not enough for in-process calls,
+# and redirect_config_paths() re-points those constants as well.
 _TEMPBOX = {}
+_HOME_DERIVED = ("DEFAULT_TOKEN_FILE", "LEDGER_FILE")
 
 
 def isolate_tempdir():
     """Use as `setUpModule`. Give this module a private, empty temporary directory."""
+    # Made BEFORE tempfile.tempdir is redirected, so it lands in the real temporary
+    # directory rather than inside the box the teardown requires to be empty.
+    home = tempfile.mkdtemp(prefix="paysera-testhome-")
     box = tempfile.mkdtemp(prefix="paysera-tempbox-")
     _TEMPBOX["path"] = box
+    _TEMPBOX["home"] = home
     _TEMPBOX["tempdir"] = tempfile.tempdir
-    _TEMPBOX["env"] = {k: os.environ.get(k) for k in ("TMPDIR", "TEMP", "TMP")}
+    _TEMPBOX["env"] = {k: os.environ.get(k) for k in ("TMPDIR", "TEMP", "TMP", "HOME")}
+    _TEMPBOX["constants"] = []
     tempfile.tempdir = box
-    os.environ.update(TMPDIR=box, TEMP=box, TMP=box)
+    os.environ.update(TMPDIR=box, TEMP=box, TMP=box, HOME=home)
+
+
+def redirect_config_paths(*modules):
+    """Point each module's HOME-derived path constants inside the sandboxed HOME.
+
+    Call from `setUpModule`, after isolate_tempdir(). Needed because the scripts run
+    os.path.expanduser() at import time, so a later HOME redirect does not move a constant
+    that was already resolved — and every in-process read_token() would still chmod the
+    real ~/.config/paysera-payments.
+    """
+    home = _TEMPBOX.get("home")
+    if home is None:
+        raise AssertionError("isolate_tempdir() must run first — there is no sandbox HOME")
+    config = os.path.join(home, ".config", "paysera-payments")
+    for module in modules:
+        for name in _HOME_DERIVED:
+            if not hasattr(module, name):
+                continue
+            _TEMPBOX["constants"].append((module, name, getattr(module, name)))
+            setattr(module, name, os.path.join(config, os.path.basename(getattr(module, name))))
 
 
 def assert_tempdir_is_empty():
@@ -47,8 +85,11 @@ def assert_tempdir_is_empty():
         raise AssertionError("setUpModule did not run — the leak check is disarmed")
     box = _TEMPBOX.pop("path")
     tempfile.tempdir = _TEMPBOX.pop("tempdir")
+    for module, name, value in _TEMPBOX.pop("constants", []):
+        setattr(module, name, value)
     for key, value in _TEMPBOX.pop("env").items():
         os.environ.pop(key, None) if value is None else os.environ.update({key: value})
+    shutil.rmtree(_TEMPBOX.pop("home"), ignore_errors=True)
     left = sorted(os.listdir(box))
     shutil.rmtree(box, ignore_errors=True)
     if left:

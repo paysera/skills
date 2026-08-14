@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.8.9 (2026-08-14)
+
+Twenty-first review round. Both findings are on 1.8.8's own changes.
+
+- **The test suite reached outside its sandbox and chmodded the contributor's own config
+  directory.** 1.8.8 gave `cancel-payment.py` the `0700` hardening on every run that reads
+  the token. The shared cancel-test fixture never set `HOME`, and neither did any of the
+  in-process `read_token()` tests in either module — so running the documented test command
+  silently changed the mode of the developer's real `~/.config/paysera-payments/`. The
+  temporary-directory leak check could not see it: that check catches what the suite
+  *writes*, inside a box it owns, and this was a change made *outside* the box entirely.
+  `isolate_tempdir()` now redirects `HOME` alongside `TMPDIR`/`TEMP`/`TMP`, and a new
+  `redirect_config_paths()` re-points the scripts' `HOME`-derived constants — which
+  `expanduser()` resolves at import time, before any `setUpModule`, so the variable
+  redirect alone would not have covered in-process calls. The repository-side copy of the
+  leak check carries the same three redirects, under the same twin-copy rule.
+- **`SKILL.md` named two of the three ways the live scan can come back incomplete, and
+  called the list exhaustive.** The shape-change cause added in 1.8.7 and refined in 1.8.8
+  appeared nowhere in the documentation, so a reader meeting that warning met a message
+  from a cause the skill did not describe. All three are now documented, including the
+  `_metadata.total` rule that separates a quiet account from an API change, and a test
+  fails if a fourth warning is added without updating the paragraph that claims the list
+  is complete.
+
 ## 1.8.8 (2026-08-14)
 
 Twentieth review round. No Critical, High or Medium defect was reported; all four findings

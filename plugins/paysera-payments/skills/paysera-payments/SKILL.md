@@ -422,10 +422,19 @@ firing twice. Take that warning seriously — with only the ledger, a duplicate 
 hand in the Paysera app is invisible.
 
 The scan also stops after 5000 transfers (50 pages of 100), which a busy payer account can
-exceed over a long window. **That, too, warns on stderr**, naming how many rows were read:
-every way this check can come back incomplete says so, because a partial scan that reports
-as complete is worse than one that fails outright. Narrow the window with `--invoice-date`
-if you see it.
+exceed over a long window. **That, too, warns on stderr**, naming how many rows were read;
+narrow the window with `--invoice-date` if you see it.
+
+The third way is an answer the tool cannot read: a page that returns `200` in a shape with
+no list of rows under `items`, `transfers` or `data`. That means the API changed, so the
+scan stops and warns rather than treating an answer it does not understand as "no
+transfers". An answer whose own `_metadata` reports `total: 0` is **not** that case — it is
+an ordinary empty result for a quiet account, and passes without a word. One that reports
+rows it does not show is the dangerous case, and warns.
+
+All three — a failed page, an unreadable shape, the page cap — say so on stderr, and this
+list is complete. A partial scan that reports as complete is worse than one that fails
+outright.
 
 Whichever way it comes back incomplete, **stdout says so as well**: a
 `LIVE SCAN INCOMPLETE` line is printed **above** the rest of the summary, every time the

@@ -29,15 +29,19 @@ _TEMPBOX = {}
 
 
 def setUpModule():
+    # Made before tempfile.tempdir moves, so it does not land inside the box.
+    _TEMPBOX["home"] = home = tempfile.mkdtemp(prefix="paysera-validate-testhome-")
     _TEMPBOX["path"] = box = tempfile.mkdtemp(prefix="paysera-validate-tempbox-")
     _TEMPBOX["tempdir"] = tempfile.tempdir
-    _TEMPBOX["env"] = {k: os.environ.get(k) for k in ("TMPDIR", "TEMP", "TMP")}
-    # BOTH halves, exactly as the plugin copy does it: `tempfile.tempdir` for this
-    # process, the environment for any subprocess, which inherits it and reads nothing
-    # else. This module starts no subprocess today — which is why the half was missing,
-    # and why leaving it missing would make the first one added silently escape the box.
+    _TEMPBOX["env"] = {k: os.environ.get(k) for k in ("TMPDIR", "TEMP", "TMP", "HOME")}
+    # ALL THREE halves, exactly as the plugin copy does it: `tempfile.tempdir` for this
+    # process, TMPDIR/TEMP/TMP for any subprocess, which inherits them, and HOME — which
+    # is a different guarantee. The box catches what a module WRITES; HOME limits what it
+    # REACHES, and the box cannot see a change made outside itself. This module starts no
+    # subprocess and reads no HOME today — which is exactly why the halves went missing
+    # before, and why leaving one out makes the first code to need it escape silently.
     tempfile.tempdir = box
-    os.environ.update(TMPDIR=box, TEMP=box, TMP=box)
+    os.environ.update(TMPDIR=box, TEMP=box, TMP=box, HOME=home)
 
 
 def tearDownModule():
@@ -47,6 +51,7 @@ def tearDownModule():
     tempfile.tempdir = _TEMPBOX.pop("tempdir")
     for key, value in _TEMPBOX.pop("env").items():
         os.environ.pop(key, None) if value is None else os.environ.update({key: value})
+    shutil.rmtree(_TEMPBOX.pop("home"), ignore_errors=True)
     left = sorted(Path(box).iterdir())
     shutil.rmtree(box, ignore_errors=True)
     if left:
@@ -477,7 +482,12 @@ class TestTheLeakCheckItself(unittest.TestCase):
         # env={} for the same reason: the real saved environment must not be restored by
         # a probe, or TMPDIR goes back to what it was before setUpModule and the rest of
         # the module runs outside its own box.
-        _TEMPBOX.update(path=box, tempdir=prior_tempdir, env={})
+        probe_home = tempfile.mkdtemp(prefix="paysera-leakprobe-home-")
+        self.addCleanup(shutil.rmtree, probe_home, ignore_errors=True)
+        # clear() then set every key, NOT update(): update would leave the real `home`
+        # entry in place and the teardown below would delete the module's own sandbox.
+        _TEMPBOX.clear()
+        _TEMPBOX.update(path=box, tempdir=prior_tempdir, env={}, home=probe_home)
         try:
             with self.assertRaises(AssertionError) as raised:
                 tearDownModule()
@@ -496,6 +506,12 @@ class TestTheLeakCheckItself(unittest.TestCase):
         self.assertEqual(tempfile.tempdir, box, "this process writes outside the box")
         for key in ("TMPDIR", "TEMP", "TMP"):
             self.assertEqual(os.environ.get(key), box, key)
+        # HOME is a sibling of the box, not the box itself: the teardown requires the box
+        # to be EMPTY, and a home directory anything writes to would fail that check for
+        # the wrong reason. What matters is that it is not the developer's real one.
+        self.assertEqual(os.environ.get("HOME"), _TEMPBOX.get("home"))
+        # And that it is genuinely not the one the process started with.
+        self.assertNotEqual(os.environ.get("HOME"), _TEMPBOX["env"].get("HOME"))
         made = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, made, ignore_errors=True)
         self.assertTrue(made.startswith(box))
@@ -504,7 +520,7 @@ class TestTheLeakCheckItself(unittest.TestCase):
         # setUpModule/tearDownModule mutate process-wide state. Under pytest all three
         # test modules share one process, so a teardown that does not put TMPDIR back
         # hands the next module a value pointing at a directory that no longer exists.
-        keys = ("TMPDIR", "TEMP", "TMP")
+        keys = ("TMPDIR", "TEMP", "TMP", "HOME")
         before = {k: os.environ.get(k) for k in keys}
         saved, prior_tempdir = dict(_TEMPBOX), tempfile.tempdir
         try:

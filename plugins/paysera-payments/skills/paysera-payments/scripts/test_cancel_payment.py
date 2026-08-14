@@ -27,12 +27,21 @@ from _testsupport import (
     capture_curl,
     isolate_tempdir,
     load,
+    redirect_config_paths,
 )
 
 cancel = load("cancel-payment.py", "cancel_payment")
 
-# Own temporary directory, required to be empty at the end — see _testsupport.
-setUpModule = isolate_tempdir
+
+# Own temporary directory, required to be empty at the end, and a sandboxed HOME — see
+# _testsupport. redirect_config_paths is what covers the IN-PROCESS read_token() calls
+# below: DEFAULT_TOKEN_FILE was resolved from the real HOME when the module was imported,
+# so without it every one of them chmods the developer's own config directory.
+def setUpModule():
+    isolate_tempdir()
+    redirect_config_paths(cancel)
+
+
 tearDownModule = assert_tempdir_is_empty
 
 
@@ -154,9 +163,14 @@ class ScriptFixture:
             )
         os.chmod(stub, 0o755)
 
-    def run_script(self, *args):
+    def run_script(self, *args, home=None):
         env = dict(os.environ)
         env["PATH"] = self.bin + os.pathsep + env["PATH"]
+        # A fresh HOME per test. Without it the script resolves ~/.config/paysera-payments
+        # against the developer's real home and, since 1.8.8, chmods it — a side effect
+        # outside the sandbox that the temp-box check cannot see.
+        env["HOME"] = home or os.path.join(self.tmp, "home")
+        os.makedirs(env["HOME"], exist_ok=True)
         env["PAYSERA_PAT"] = "test-token"
         return subprocess.run(
             [sys.executable, str(SCRIPTS / "cancel-payment.py"), *args],
@@ -236,17 +250,26 @@ class TestThisScriptKeepsTheConfigDirectoryPromiseToo(ScriptFixture, unittest.Te
     the documentation said otherwise, and 1.8.7 had just made the claim stronger.
     """
 
-    def _run_with_home(self, home, *args):
-        env = dict(os.environ)
-        env["PATH"] = self.bin + os.pathsep + env["PATH"]
-        env["HOME"] = home
-        env["PAYSERA_PAT"] = "test-token"
-        return subprocess.run(
-            [sys.executable, str(SCRIPTS / "cancel-payment.py"), *args],
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=60,
+    def test_the_shared_fixture_sandboxes_home(self):
+        # The fixture had no HOME until 1.8.9, so every test using it ran the script
+        # against the developer's real ~/.config/paysera-payments — and since 1.8.8 that
+        # means chmodding it. The new class below had to bring its own HOME, which was the
+        # sign the fixture had been left behind.
+        self.write_stub('{"id":"H1","status":"new","amount":{"amount":"5.00","currency":"EUR"}}')
+        home = os.path.join(self.tmp, "home")
+        os.makedirs(home, exist_ok=True)
+        config = os.path.join(home, ".config", "paysera-payments")
+        os.makedirs(config)
+        os.chmod(config, 0o755)
+        outside = os.path.join(self.tmp, "real-home", ".config", "paysera-payments")
+        os.makedirs(outside)
+        os.chmod(outside, 0o755)
+        with mock.patch.dict(os.environ, {"HOME": os.path.join(self.tmp, "real-home")}):
+            self.run_script("H1")
+        self.assertEqual(stat.S_IMODE(os.stat(config).st_mode), 0o700)
+        self.assertEqual(
+            stat.S_IMODE(os.stat(outside).st_mode), 0o755,
+            "the fixture used the inherited HOME instead of its own",
         )
 
     def test_a_dry_run_tightens_the_directory(self):
@@ -255,7 +278,7 @@ class TestThisScriptKeepsTheConfigDirectoryPromiseToo(ScriptFixture, unittest.Te
         os.makedirs(config)
         os.chmod(config, 0o755)
         self.write_stub('{"id":"H1","status":"new","amount":{"amount":"5.00","currency":"EUR"}}')
-        out = self._run_with_home(home, "H1")
+        out = self.run_script("H1", home=home)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(stat.S_IMODE(os.stat(config).st_mode), 0o700)
 
@@ -264,7 +287,7 @@ class TestThisScriptKeepsTheConfigDirectoryPromiseToo(ScriptFixture, unittest.Te
         home = os.path.join(self.tmp, "home2")
         os.makedirs(home)
         self.write_stub('{"id":"H1","status":"new","amount":{"amount":"5.00","currency":"EUR"}}')
-        self._run_with_home(home, "H1")
+        self.run_script("H1", home=home)
         self.assertFalse(os.path.exists(os.path.join(home, ".config", "paysera-payments")))
 
     def test_it_does_not_chmod_a_directory_the_operator_pointed_at(self):

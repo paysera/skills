@@ -36,6 +36,7 @@ from _testsupport import (  # noqa: E402
     isolate_tempdir,
     load,
     mode_of,
+    redirect_config_paths,
     temp_ledger,
 )
 
@@ -45,7 +46,14 @@ V = cp._VILNIUS
 # This module gets its own temporary directory, and must leave it empty. Nothing here
 # reaches outside the plugin: `claude plugin install` copies the plugin directory only, so
 # a check that needs a repository file fails from an installed copy for no real defect.
-setUpModule = isolate_tempdir
+# It also gets a sandboxed HOME — see _testsupport. redirect_config_paths covers the IN-PROCESS calls that resolve a path from
+# HOME: LEDGER_FILE was resolved when the module was imported, so a later HOME redirect
+# does not move it, and read_token() would chmod the developer's own config directory.
+def setUpModule():
+    isolate_tempdir()
+    redirect_config_paths(cp)
+
+
 tearDownModule = assert_tempdir_is_empty
 
 
@@ -880,6 +888,52 @@ class TestTransportFailures(unittest.TestCase):
         self.assertEqual(code, "ERR")
 
 
+class TestTheSuiteReachesNothingOutsideItsSandbox(unittest.TestCase):
+    """The temp box catches what the suite WRITES. HOME decides what it REACHES.
+
+    Since 1.8.8 both scripts chmod ~/.config/paysera-payments/ to 0700 on every run that
+    reads the token. A test that inherited the real HOME therefore changed the mode of the
+    developer's own directory, silently, just by running the documented test command — and
+    the temp-box check could not see it, because it only ever looks inside the box.
+    """
+
+    def test_home_is_redirected_for_this_module(self):
+        self.assertEqual(os.environ.get("HOME"), _testsupport._TEMPBOX.get("home"))
+        self.assertNotEqual(
+            os.environ.get("HOME"),
+            _testsupport._TEMPBOX["env"].get("HOME"),
+            "HOME is still the one the process started with",
+        )
+
+    def test_the_home_derived_constants_point_inside_the_sandbox(self):
+        # Redirecting the variable is not enough: expanduser() runs at IMPORT time, before
+        # any setUpModule, so a constant resolved then still names the real home.
+        home = _testsupport._TEMPBOX["home"]
+        self.assertTrue(
+            cp.LEDGER_FILE.startswith(home),
+            f"LEDGER_FILE={cp.LEDGER_FILE} is outside the sandbox HOME {home}",
+        )
+
+    def test_reading_the_token_hardens_only_the_sandbox_directory(self):
+        # The end-to-end proof: a config directory under the REAL home is left alone,
+        # while the sandbox one is tightened.
+        outside = tempfile.mkdtemp(prefix="paysera-outside-")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        sentinel = os.path.join(outside, ".config", "paysera-payments")
+        os.makedirs(sentinel)
+        os.chmod(sentinel, 0o755)
+
+        sandbox = os.path.dirname(cp.LEDGER_FILE)
+        os.makedirs(sandbox, exist_ok=True)
+        self.addCleanup(shutil.rmtree, os.path.dirname(sandbox), ignore_errors=True)
+        os.chmod(sandbox, 0o755)
+
+        with mock.patch.dict(os.environ, {"PAYSERA_PAT": "a-token"}):
+            cp.read_token("/nonexistent")
+        self.assertEqual(mode_of(sentinel), 0o755, "the suite reached outside its sandbox")
+        self.assertEqual(mode_of(sandbox), 0o700, "and did not do its job inside it")
+
+
 class TestTheSuiteCleansUpAfterItself(unittest.TestCase):
     """Every temporary directory here holds a ledger with test IBANs and amounts, and CI
     runs the whole suite twice. One directory per test method, left behind, adds up."""
@@ -974,7 +1028,16 @@ class TestTheSuiteCleansUpAfterItself(unittest.TestCase):
         # broken isolate_tempdir for whatever test runs next, and that is not this test's
         # business. (It did, until a mutation of isolate_tempdir survived because of it.)
         prior_tempdir = tempfile.tempdir
-        _testsupport._TEMPBOX.update(path=box, tempdir=prior_tempdir, env={})
+        probe_home = tempfile.mkdtemp(prefix="paysera-leakprobe-home-")
+        self.addCleanup(shutil.rmtree, probe_home, ignore_errors=True)
+        # clear() then set every key, NOT update(): update leaves the REAL module-level
+        # `home` and `constants` entries in place, and the teardown below would then wipe
+        # the suite's sandbox home and put the live HOME-derived constants back — which is
+        # exactly how this probe silently un-sandboxed the rest of the module.
+        _testsupport._TEMPBOX.clear()
+        _testsupport._TEMPBOX.update(
+            path=box, tempdir=prior_tempdir, env={}, home=probe_home, constants=[]
+        )
         try:
             with self.assertRaises(AssertionError) as raised:
                 _testsupport.assert_tempdir_is_empty()
@@ -1325,6 +1388,32 @@ class TestAnIncompleteLiveScanDoesNotReadAsAnAllClear(ScriptHarness, unittest.Te
         self.assertNotIn("INCOMPLETE` instead of", marker)
         self.assertIn("above", marker, "it is printed above the rest of the summary")
         self.assertIn("partial", marker.lower(), "a found-list below it is a partial view")
+
+    def test_every_cause_of_an_incomplete_scan_is_documented(self):
+        # SKILL.md named the failed page and the page cap, and then called the list
+        # exhaustive — while the shape cause added in 1.8.7 appeared nowhere. A claim of
+        # completeness is what makes an omission a defect rather than a gap.
+        skill = " ".join((SCRIPTS.parent / "SKILL.md").read_text(encoding="utf-8").split())
+        causes = {
+            "a page that failed": "list call fails",
+            "the 5000-row page cap": "5000 transfers",
+            "an unreadable response shape": "no list of rows",
+            "the total:0 exception to it": "total: 0",
+        }
+        for cause, phrase in causes.items():
+            with self.subTest(cause=cause):
+                self.assertIn(phrase, skill, f"SKILL.md does not describe {cause}")
+
+    def test_the_number_of_documented_causes_matches_the_code(self):
+        # The code warns from exactly three places. If a fourth is added, this fails until
+        # the paragraph that calls its list complete is updated too.
+        source = (SCRIPTS / "create-payment.py").read_text(encoding="utf-8")
+        warnings = source.count('"WARNING: live duplicate check INCOMPLETE')
+        self.assertEqual(
+            warnings, 3,
+            "the count of incompleteness warnings changed — SKILL.md says there are three "
+            "and calls that list complete, so update both",
+        )
 
     def test_the_marker_printed_is_the_one_the_documentation_names(self):
         # A message the operator is told to look for, spelled differently in the two
