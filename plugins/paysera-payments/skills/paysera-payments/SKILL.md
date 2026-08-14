@@ -291,6 +291,10 @@ soon you'll sign** and **where** (mobile vs web):
 - **`--perform-at +Nd` / a future `YYYY-MM-DD` (default for invoices, with `--invoice-id`)** —
   a real multi-day window, but a **future** `operation_date` renders **only in the web bank,
   not mobile**, until that day. Sign it in the web bank. Use for "I'll sign sometime this week".
+  Rejected beyond **366 days ahead**, whichever spelling you use: `perform_at` is the signing
+  deadline, so a value that far out is a mistyped timestamp rather than a plan. (`epoch
+  seconds` is accepted too, and an extra digit is the usual way to get one wrong — that is
+  what the bound is for.)
 - **`--due-date YYYY-MM-DD`** — after-fact invoice → `perform_at = due date − 1 day`. A
   today/past `due − 1` falls back to ASAP.
 - **`--advance`** — *sign-right-now* ASAP (*Išankstinis*) → **`perform_at` omitted**. ⚠️ The

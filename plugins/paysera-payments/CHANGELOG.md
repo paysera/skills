@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.8.12 (2026-08-14)
+
+Twenty-fourth review round. One finding, and the first in three rounds that is in a payment
+script rather than the test scaffolding — an old defect, not drift from a recent change.
+
+- **`--perform-at` had no upper bound.** `--amount` has been bounded since 1.7.0, for the
+  stated reason that no legitimate value is that large and the API's rejection is late and
+  cryptic; its sibling option took an arbitrary integer. `SKILL.md` and `--help` both offer
+  "epoch seconds", and an extra digit is the ordinary way to mistype a pasted timestamp.
+  Two of the four spellings then crashed the schedule printout with a `ValueError` or
+  `OverflowError` out of `datetime` — a Python traceback where every other bad argument in
+  this tool gets one plain sentence — and one digit lower the value was accepted in silence
+  as a signing deadline in the year 5138. Nothing was ever created (the crash lands before
+  the payload, the `--confirm` test and the write-ahead ledger row), so this was a usability
+  and silent-acceptance defect rather than a money one.
+  The resolved epoch is now bounded to `MAX_PERFORM_AT_DAYS` (366) beside the existing
+  past/near-instant test, in the wording `--amount` already uses. `_safe_date()` formats the
+  offending value without raising the very error the bound replaces.
+  **Behaviour change:** an explicit `YYYY-MM-DD` more than 366 days ahead is now refused
+  too. It was previously bounded only by `strptime`'s year 9999, and `perform_at` is a
+  signing deadline — a draft sits unsigned until then and auto-cancels after — so a
+  multi-year window is not a use case the tool should accept quietly.
+  `--help` said "Only a past or near-instant time is rejected", which the bound made false;
+  it and `SKILL.md` now state the rule as applied, and a test fails if the help stops
+  quoting the constant.
+
 ## 1.8.11 (2026-08-14)
 
 Twenty-third review round. No Critical, High or Medium defect. Neither payment script

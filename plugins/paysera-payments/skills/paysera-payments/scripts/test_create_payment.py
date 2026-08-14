@@ -339,6 +339,61 @@ class TestParsePerformAt(unittest.TestCase):
         with self.assertRaises(SystemExit):
             cp.parse_perform_at("next tuesday")
 
+    def test_an_implausibly_far_deadline_is_refused_in_one_sentence(self):
+        # --amount has carried this guard since 1.7.0; its sibling option did not. An
+        # extra digit on a pasted epoch is the ordinary way to mistype one, and the two
+        # unbounded spellings either crashed out of datetime with a traceback or — one
+        # digit lower — were accepted in silence as a deadline centuries away.
+        for spec in ("99999999999", "999999999999999", "+99999999999d", "+400d"):
+            with self.subTest(spec=spec):
+                with frozen_clock(cp, vilnius(2026, 8, 10, 9, 0)):
+                    with self.assertRaises(SystemExit) as ctx:
+                        cp.parse_perform_at(spec)
+                message = str(ctx.exception)
+                self.assertIn("--perform-at", message)
+                self.assertIn("days ahead", message)
+                self.assertNotIn("Traceback", message)
+
+    def test_a_deadline_just_inside_the_bound_is_accepted(self):
+        # The bound must not move the boundary it claims: one day inside passes.
+        with frozen_clock(cp, vilnius(2026, 8, 10, 9, 0)):
+            epoch = cp.parse_perform_at(f"+{cp.MAX_PERFORM_AT_DAYS - 1}d")
+        self.assertGreater(epoch, 0)
+
+    def test_the_bound_reports_an_epoch_datetime_cannot_represent(self):
+        # The value being reported is by definition one datetime may refuse, so building
+        # the message must not raise the error the bound exists to replace.
+        self.assertIn("too far ahead", cp._safe_date(10**18))
+        self.assertEqual(cp._safe_date(0), "1970-01-01")
+
+    def test_the_help_and_the_skill_state_the_bound_the_code_applies(self):
+        # The help said "Only a past or near-instant time is rejected", which the bound
+        # made false. A check the words around it disagree with is the defect this project
+        # has caught in itself more often than any other.
+        source = (SCRIPTS / "create-payment.py").read_text(encoding="utf-8")
+        start = source.rindex('"--perform-at"')
+        help_text = source[start : source.index("ap.add_argument", start + 10)]
+        self.assertNotIn("Only a past or near-instant time is rejected", help_text)
+        self.assertIn("MAX_PERFORM_AT_DAYS", help_text, "the help must quote the constant, "
+                      "not a number that can drift from it")
+
+        skill = " ".join((SCRIPTS.parent / "SKILL.md").read_text(encoding="utf-8").split())
+        self.assertIn(f"{cp.MAX_PERFORM_AT_DAYS} days ahead", skill)
+
+    def test_every_unbounded_spelling_is_covered(self):
+        # +Nh is clamped to 23:00 today, and YYYY-MM-DD is bounded by strptime and now by
+        # the same test as the rest. This pins that none of the four escapes the guard.
+        with frozen_clock(cp, vilnius(2026, 8, 10, 9, 0)):
+            # +Nh: clamped rather than refused, and lands today.
+            hours = cp.parse_perform_at("+99999999999h")
+            self.assertEqual(
+                datetime.datetime.fromtimestamp(hours, V).date(), datetime.date(2026, 8, 10)
+            )
+            # A far-future explicit date now hits the same bound as the epoch spelling.
+            with self.assertRaises(SystemExit) as ctx:
+                cp.parse_perform_at("2099-01-15")
+        self.assertIn("days ahead", str(ctx.exception))
+
 
 class TestComputeSchedule(unittest.TestCase):
     def _args(self, **over):

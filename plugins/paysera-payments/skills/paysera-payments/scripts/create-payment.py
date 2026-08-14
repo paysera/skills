@@ -260,6 +260,24 @@ LEDGER_FILE = os.path.expanduser("~/.config/paysera-payments/ledger.json")
 # this set (new, reserved, signed, processing, done, ...) blocks a duplicate.
 NONBLOCKING_STATES = {"failed", "rejected", "canceled", "cancelled", "expired", "declined"}
 
+# Upper bound for --perform-at. It is a SIGNING DEADLINE, not a reminder: a draft sits
+# unsigned until then and auto-cancels after, so a year is already generous and anything
+# beyond it is a typo. See the bound test in parse_perform_at.
+MAX_PERFORM_AT_DAYS = 366
+
+
+def _safe_date(epoch):
+    """`epoch` as a date, or a plain description when it is outside what datetime holds.
+
+    The reason this exists is the message it feeds: the value being reported is by
+    definition one datetime may refuse, so formatting it must not raise the very
+    ValueError/OverflowError the bound was added to replace.
+    """
+    try:
+        return datetime.date.fromtimestamp(epoch).isoformat()
+    except (ValueError, OverflowError, OSError):
+        return f"a date too far ahead to represent (epoch {epoch})"
+
 # SEPA purpose-of-payment field max length (the API rejects longer with
 # 'details_too_long'). Used to trim long invoice purposes on a word boundary.
 PURPOSE_MAX = 140
@@ -1280,6 +1298,19 @@ def parse_perform_at(spec):
             "deadline, so pick a comfortably-future time (e.g. +3h, +1d) — or use --advance for "
             "sign-on-the-spot ASAP."
         )
+    # Bounded for the same reason --amount is (see the 1e12 test there): the epoch and +Nd
+    # spellings take an arbitrary integer, and an extra digit is the ordinary way to mistype
+    # a pasted timestamp. Unbounded, the value either crashed the schedule printout with a
+    # ValueError/OverflowError out of datetime — a traceback where every other bad argument
+    # in this tool gets one sentence — or, one digit lower, was accepted in silence as a
+    # signing deadline centuries away. YYYY-MM-DD is already bounded by strptime, and +Nh by
+    # the midnight clamp above; this covers the other two.
+    if epoch > now + MAX_PERFORM_AT_DAYS * 86400:
+        sys.exit(
+            f"ERROR: --perform-at {spec} resolves to {_safe_date(epoch)}, which is more "
+            f"than {MAX_PERFORM_AT_DAYS} days ahead. perform_at is the signing deadline, "
+            f"not a reminder — check the value."
+        )
     return epoch
 
 
@@ -1589,8 +1620,10 @@ def _main(guard):
         help="Signing deadline: YYYY-MM-DD | +Nd | +Nh | epoch seconds. SAME-DAY is allowed "
         "and is the recommended choice when you will sign on your phone (it keeps "
         "operation_date = today, so the transfer shows in the mobile app as well as the web "
-        "bank); a FUTURE day is web-bank-only until that day. Only a past or near-instant "
-        "time is rejected — use --advance for sign-on-the-spot ASAP. Default when omitted: "
+        "bank); a FUTURE day is web-bank-only until that day. Rejected: a past or "
+        f"near-instant time (use --advance for sign-on-the-spot ASAP), and anything more "
+        f"than {MAX_PERFORM_AT_DAYS} days ahead — this is a signing deadline, not a "
+        "reminder, so a value that far out is a mistyped timestamp. Default when omitted: "
         "+30d WITH --invoice-id, today WITHOUT it.",
     )
     ap.add_argument(
