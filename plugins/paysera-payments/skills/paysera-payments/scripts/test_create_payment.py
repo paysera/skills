@@ -746,6 +746,29 @@ class TestListTransfers(unittest.TestCase):
             with self.subTest(shape=unknown):
                 self.assertEqual(cp._transfer_items(unknown), ([], False))
 
+    def test_a_metadata_only_answer_is_read_by_its_own_total(self):
+        # The API sends a _metadata block (list_transfers reads `total` from it). If it
+        # also omits the rows key when there is nothing to list, then EVERY scan of a
+        # quiet account would warn "the API may have changed" — and a warning that fires
+        # on ordinary results stops being read. `total` settles it: 0 means the API is
+        # saying there is nothing, which is an empty result, not a renamed container.
+        self.assertEqual(cp._transfer_items({"_metadata": {"total": 0}}), ([], True))
+        # But rows that exist and cannot be seen IS the dangerous case, and stays loud.
+        self.assertEqual(cp._transfer_items({"_metadata": {"total": 256}}), ([], False))
+        for junk in ({"_metadata": {}}, {"_metadata": None}, {"_metadata": {"total": "0"}}):
+            with self.subTest(shape=junk):
+                self.assertEqual(cp._transfer_items(junk), ([], False))
+
+    def test_a_quiet_account_does_not_warn_that_the_api_changed(self):
+        with mock.patch.object(
+            cp, "http_json", return_value=("200", {"_metadata": {"total": 0}})
+        ):
+            with mock.patch.object(sys, "stderr", io.StringIO()) as err:
+                items, complete = cp.list_transfers("tok", "EVP1", 0)
+        self.assertEqual(items, [])
+        self.assertTrue(complete)
+        self.assertEqual(err.getvalue(), "")
+
     def test_an_unrecognised_page_shape_makes_the_scan_incomplete(self):
         with mock.patch.object(cp, "http_json", return_value=("200", {"unexpected": 1})):
             with mock.patch.object(sys, "stderr", io.StringIO()) as err:
@@ -1292,6 +1315,16 @@ class TestAnIncompleteLiveScanDoesNotReadAsAnAllClear(ScriptHarness, unittest.Te
         self.assertIn("LIVE SCAN INCOMPLETE", out.stdout)
         self.assertIn("[ledger]", out.stdout, "the ledger match is listed below it")
         self.assertNotIn("ledger found nothing", out.stdout)
+
+    def test_the_documentation_describes_the_note_as_it_is_now_printed(self):
+        # SKILL.md described the 1.8.6 form — the marker "instead of" the all-clear line —
+        # which stopped being true when 1.8.7 made it unconditional and printed it ABOVE
+        # whatever follows. The case the fix was for was the one case left undescribed.
+        skill = " ".join((SCRIPTS.parent / "SKILL.md").read_text(encoding="utf-8").split())
+        marker = skill[skill.index("LIVE SCAN INCOMPLETE") - 200 :][:700]
+        self.assertNotIn("INCOMPLETE` instead of", marker)
+        self.assertIn("above", marker, "it is printed above the rest of the summary")
+        self.assertIn("partial", marker.lower(), "a found-list below it is a partial view")
 
     def test_the_marker_printed_is_the_one_the_documentation_names(self):
         # A message the operator is told to look for, spelled differently in the two

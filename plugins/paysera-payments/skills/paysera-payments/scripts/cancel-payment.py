@@ -66,7 +66,32 @@ def _check_token_file_mode(path):
         )
 
 
+def _harden_config_dir():
+    """Drop group/other bits from ~/.config/paysera-payments/. Never creates it.
+
+    A deliberate copy of create-payment.py's helper, not an import: `claude plugin install`
+    copies the plugin directory, and these two scripts are run independently — a shared
+    module between them is one more thing that can go missing. `_check_token_file_mode`
+    above is duplicated for the same reason. SKILL.md promises that the scripts keep this
+    directory at 0700, and until 1.8.8 only create-payment.py did, so a machine used for
+    cancellations alone kept the umask's 0755 on the directory holding the token and the
+    ledger.
+
+    Fixed to the DEFAULT location, exactly as in create-payment.py, and deliberately not
+    derived from --token-file: chmod'ing whatever directory the operator pointed at would
+    be a side effect on a path this tool was only asked to read from, and that path can be
+    shared with other things.
+    """
+    d = os.path.dirname(DEFAULT_TOKEN_FILE)
+    try:
+        if stat.S_IMODE(os.stat(d).st_mode) & 0o077:
+            os.chmod(d, 0o700)
+    except OSError:
+        pass
+
+
 def read_token(path):
+    _harden_config_dir()
     tok = os.environ.get("PAYSERA_PAT")
     if not tok:
         _check_token_file_mode(path)

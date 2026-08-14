@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.8.8 (2026-08-14)
+
+Twentieth review round. No Critical, High or Medium defect was reported; all four findings
+are drift introduced by the previous round's own changes.
+
+- **`cancel-payment.py` never tightened the configuration directory.** 1.8.7 gave
+  `create-payment.py` a `_harden_config_dir()` call on every run that reads the token, and
+  strengthened `SKILL.md` to say so — but `cancel-payment.py` has its own `read_token()`
+  and got no such call. A machine used for cancellations alone kept the umask's `0755` on
+  the directory that holds the token and the ledger. It now has the helper too, deliberately
+  copied rather than shared (a plugin file must stay self-contained, as `_check_token_file_mode`
+  already is), fixed to the default config directory so that `--token-file` cannot make it
+  chmod a path it was only asked to read from.
+- **A metadata-only empty page counted as an API change.** 1.8.7 treated any 200 body with
+  no `items`/`transfers`/`data` list as an unrecognised shape. The API does send a
+  `_metadata` block, so if it omits the rows key when there is nothing to list, every scan
+  of a quiet account would have warned that the API changed and marked the duplicate check
+  incomplete — and a warning that fires on ordinary results stops being read. The answer's
+  own `total` now settles it: `0` is an empty result, `> 0` with no rows key stays loud,
+  because that is rows existing and not being visible.
+- **`SKILL.md` still described the 1.8.6 form of the incomplete-scan note** — the marker
+  printed "instead of" the all-clear line. 1.8.7 made it unconditional and printed it
+  *above* the rest of the summary, so the case that fix was made for, a truncated scan that
+  still found rows, was the one case the documentation did not cover.
+- **`CONTRIBUTING.md` overstated the gate's coverage.** It said `validate.py` scans *every*
+  `.md`/`.py`/`.json`/`.yml`/`.yaml` file in the repository, and its pairing-rule section
+  named `SKIP_DIRS` only. That section is the blind-spot list a reviewer is told to confirm
+  by hand, so a skip it does not name cannot be checked. Both mechanisms are now described,
+  including the root-only restriction that makes the file skip safe.
+
 ## 1.8.7 (2026-08-14)
 
 Nineteenth review round. Four of the six findings are on 1.8.6's own changes.

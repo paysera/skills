@@ -585,6 +585,22 @@ class TestNothingPublishableCanHideInASkippedDirectory(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 self.test_every_skipped_file_is_git_ignored()
 
+    def test_the_contributing_guide_names_both_skip_mechanisms(self):
+        # CONTRIBUTING.md's "what the check does and does not cover" section is the list a
+        # reviewer is told to confirm by hand. A blind spot the list does not name cannot
+        # be checked, and until 1.8.8 it described SKIP_DIRS only — while also claiming
+        # the gate scanned *every* file in the repository.
+        doc = (self.REPO_ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+        collapsed = " ".join(doc.split())
+        self.assertIn("SKIP_DIRS", collapsed)
+        self.assertIn("SKIP_FILES", collapsed)
+        self.assertIn("repository root", collapsed, "the root-only restriction is the "
+                      "part that makes the file skip safe, so it has to be stated")
+        self.assertNotIn(
+            "scans **every** `.md`", collapsed,
+            "the guide is claiming coverage the gate no longer has",
+        )
+
     def test_a_skipped_file_is_skipped_at_the_root_only(self):
         # A REVIEW.md inside a plugin ships with `claude plugin install`, so it is
         # published content and must still be scanned. Only the root copy is a working

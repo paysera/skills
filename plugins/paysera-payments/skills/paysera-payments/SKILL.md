@@ -427,10 +427,13 @@ every way this check can come back incomplete says so, because a partial scan th
 as complete is worse than one that fails outright. Narrow the window with `--invoice-date`
 if you see it.
 
-Whichever way it comes back incomplete, **stdout says so as well**: the summary line
-reads `LIVE SCAN INCOMPLETE` instead of `No prior payments to those accounts in the
-period.` The two are different answers — "nothing found" and "could not look" — and the
-summary is the line a log, a pipeline or an agent reads when stderr has been dropped.
+Whichever way it comes back incomplete, **stdout says so as well**: a
+`LIVE SCAN INCOMPLETE` line is printed **above** the rest of the summary, every time the
+scan fell short — whether it found nothing or found rows. If a found-list follows it, that
+list is a **partial** view of the period, not the whole of it; `No prior payments to those
+accounts in the period.` is printed only by a scan that read the whole window. "Nothing
+found" and "could not look" are different answers, and this is the line a log, a pipeline
+or an agent reads when stderr has been dropped.
 
 > **Pass all the invoice's accounts.** The check is only as complete as the accounts you
 > give it. If the invoice lists two banks, `--also-iban` the second one — otherwise a

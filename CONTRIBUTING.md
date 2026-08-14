@@ -23,8 +23,9 @@ Only client-facing skills. A skill qualifies when all of the following hold:
 
 ### What the automated check does and does not cover
 
-`scripts/validate.py` scans **every** `.md`, `.py`, `.json`, `.yml` and `.yaml` file in
-the repository (not just `plugins/`) and fails on:
+`scripts/validate.py` scans every `.md`, `.py`, `.json`, `.yml` and `.yaml` file in the
+repository (not just `plugins/`) **except** the names in its `SKIP_DIRS` and `SKIP_FILES`
+lists — see "What is not scanned" below, and treat those as blind spots. It fails on:
 
 - a `paysera.*` hostname that is not on its allowlist of public hosts, wherever it appears;
 - a hostname containing `intranet`/`internal`, or ending in `.local`, `.lan`, `.corp`,
@@ -139,12 +140,23 @@ that redirects only `tempfile.tempdir` looks clean while its subprocesses write 
 The tests inside a plugin never read a file outside it: `claude plugin install` copies the
 plugin directory alone, so anything a shipped test reaches for must be shipped with it.
 
-`validate.py` skips a short list of local directories (`SKIP_DIRS`) so that a `.venv` or a
-`node_modules` in your checkout does not make the gate slow and red on third-party code.
-A directory the gate does not read is a blind spot in a check whose whole job is to stop
-internal content going public, so **every name in `SKIP_DIRS` is also in `.gitignore`** —
-untracked means never published. `test_validate.py` enforces the pairing; adding a name to
-one list without the other fails the suite.
+### What is not scanned
+
+`validate.py` skips two lists of names, so that a `.venv` in your checkout or a review note
+beside it does not make the gate slow and red on content nobody publishes:
+
+- **`SKIP_DIRS`** — local directories: `.venv`, `venv`, `node_modules`, `.idea`, `.vscode`,
+  `.tox`, `.mypy_cache`, `.ruff_cache`, plus `.git`, `__pycache__` and `.pytest_cache`.
+- **`SKIP_FILES`** — review working notes at the **repository root only**: `REVIEW.md` and
+  `REFUSE.md`. The root restriction is what makes this safe: a file with one of those names
+  *inside a plugin* is shipped by `claude plugin install`, so it is published content and is
+  still scanned.
+
+Anything the gate does not read is a blind spot in a check whose whole job is to stop
+internal content going public. So **every name in both lists is also in `.gitignore`** —
+untracked means never published, which is the property that makes skipping it safe.
+`test_validate.py` enforces the pairing for both lists; adding a name to one without the
+other fails the suite.
 
 ## Releasing
 

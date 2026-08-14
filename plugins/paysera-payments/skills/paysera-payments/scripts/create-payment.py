@@ -652,8 +652,12 @@ def _transfer_items(doc):
     when none of them is there — which is NOT the same as a page with no rows, though this
     returned `[]` for both until 1.8.7. list_transfers() ends its walk on an empty page and
     calls the scan complete, so an API that renamed its container key turned the live half
-    of the duplicate check into a silent all-clear. An empty dict is the answer a filter
-    with no matches gives, so it counts as recognised; anything else does not.
+    of the duplicate check into a silent all-clear.
+
+    An answer with no rows key still counts as recognised when it says, itself, that there
+    was nothing to list: an empty body, or `_metadata.total == 0`. The API's empty shape is
+    not documented, and a warning that fired on every quiet account would be worth less
+    than no warning at all. See the comment below.
     """
     if isinstance(doc, list):
         return doc, True
@@ -661,7 +665,18 @@ def _transfer_items(doc):
         for key in ("items", "transfers", "data"):
             if isinstance(doc.get(key), list):
                 return doc[key], True
+        # No rows key. That is a shape change ONLY if rows were supposed to be there, and
+        # the answer's own metadata says whether they were: `total` is the count for the
+        # whole filtered window, and list_transfers already reads it to end the walk. So
+        # `total == 0` is the API stating there is nothing to list — an ordinary empty
+        # result for a quiet account, not a renamed container. A warning that fires on
+        # those stops being read, which is the failure this whole flag exists to avoid.
+        # `total > 0` with no rows key IS the dangerous case: rows exist and cannot be
+        # seen. An empty body says nothing either way and is taken as an empty result.
         if not doc:
+            return [], True
+        meta = doc.get("_metadata")
+        if isinstance(meta, dict) and meta.get("total") == 0:
             return [], True
     return [], False
 

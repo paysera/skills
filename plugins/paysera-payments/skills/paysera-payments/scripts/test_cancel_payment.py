@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -225,6 +226,70 @@ class TestCommandLine(ScriptFixture, unittest.TestCase):
         out = self.run_script("../../admin", "--confirm")
         self.assertNotEqual(out.returncode, 0)
         self.assertEqual(self.calls(), [], "a malformed hash must not be sent anywhere")
+
+
+class TestThisScriptKeepsTheConfigDirectoryPromiseToo(ScriptFixture, unittest.TestCase):
+    """SKILL.md says "the scripts" keep ~/.config/paysera-payments/ at 0700.
+
+    Only create-payment.py did. A machine used for cancellations alone kept whatever the
+    umask gave the directory that holds the token and the ledger — usually 0755 — while
+    the documentation said otherwise, and 1.8.7 had just made the claim stronger.
+    """
+
+    def _run_with_home(self, home, *args):
+        env = dict(os.environ)
+        env["PATH"] = self.bin + os.pathsep + env["PATH"]
+        env["HOME"] = home
+        env["PAYSERA_PAT"] = "test-token"
+        return subprocess.run(
+            [sys.executable, str(SCRIPTS / "cancel-payment.py"), *args],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60,
+        )
+
+    def test_a_dry_run_tightens_the_directory(self):
+        home = os.path.join(self.tmp, "home")
+        config = os.path.join(home, ".config", "paysera-payments")
+        os.makedirs(config)
+        os.chmod(config, 0o755)
+        self.write_stub('{"id":"H1","status":"new","amount":{"amount":"5.00","currency":"EUR"}}')
+        out = self._run_with_home(home, "H1")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(stat.S_IMODE(os.stat(config).st_mode), 0o700)
+
+    def test_it_never_creates_the_directory(self):
+        # Same rule as create-payment.py: tighten what is there, create nothing.
+        home = os.path.join(self.tmp, "home2")
+        os.makedirs(home)
+        self.write_stub('{"id":"H1","status":"new","amount":{"amount":"5.00","currency":"EUR"}}')
+        self._run_with_home(home, "H1")
+        self.assertFalse(os.path.exists(os.path.join(home, ".config", "paysera-payments")))
+
+    def test_it_does_not_chmod_a_directory_the_operator_pointed_at(self):
+        # --token-file can name a shared directory. Hardening is promised for the tool's
+        # own config directory, and tightening someone else's path is a side effect on a
+        # location this script was only asked to read from.
+        home = os.path.join(self.tmp, "home3")
+        elsewhere = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(home)
+        os.makedirs(elsewhere)
+        os.chmod(elsewhere, 0o755)
+        token = os.path.join(elsewhere, "token")
+        with open(token, "w") as f:
+            f.write("a-token\n")
+        os.chmod(token, 0o600)
+        env_free = dict(os.environ)
+        env_free.pop("PAYSERA_PAT", None)
+        self.write_stub('{"id":"H1","status":"new","amount":{"amount":"5.00","currency":"EUR"}}')
+        env_free["PATH"] = self.bin + os.pathsep + env_free["PATH"]
+        env_free["HOME"] = home
+        subprocess.run(
+            [sys.executable, str(SCRIPTS / "cancel-payment.py"), "H1", "--token-file", token],
+            capture_output=True, text=True, env=env_free, timeout=60,
+        )
+        self.assertEqual(stat.S_IMODE(os.stat(elsewhere).st_mode), 0o755)
 
 
 class TestEveryFailureGoesToStderr(ScriptFixture, unittest.TestCase):
