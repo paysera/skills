@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.8.11 (2026-08-14)
+
+Twenty-third review round. No Critical, High or Medium defect. Neither payment script
+changed; all three findings are on the twin-copy agreement test added in 1.8.10.
+
+- **`CONTRIBUTING.md` forbade the direction that test relies on.** It said a plugin file
+  must not read a repository file "and the reverse would be as wrong", while the new test
+  reads two plugin files from the repository side. The asymmetry is real — `claude plugin
+  install` copies the plugin alone, so only the plugin-to-repository direction can break an
+  installed copy — but the guide never said so, and it is the document a reviewer is told
+  to follow. A contributor obeying it would have deleted the test that enforces the
+  copy-drift rule stated in the same paragraph. The guide now states the rule as applied,
+  and a test fails if it goes back to forbidding it — added after a mutation showed the
+  correction was prose nothing checked, which is how it drifted in the first place.
+- **One of the three comparisons raised `IndexError` instead of naming its cause.** Its two
+  siblings assert on the match before reading it; this one indexed a `findall` result
+  directly, so a restructured copy reported a crash rather than "the copy was
+  restructured". All three now go through one guarded helper.
+- **The comparison was anchored to fixed paths**, so it covered one plugin and one of that
+  plugin's two test modules. `test_cancel_payment.py` has no full-cycle test today, and a
+  second plugin does not exist yet — but the check said nothing about either, and this
+  repository is a marketplace that gains skills one at a time. The copies are now
+  discovered by glob, every test module beside a discovered copy is compared, and the
+  search fails if it finds nothing rather than passing on an empty set.
+
 ## 1.8.10 (2026-08-14)
 
 Twenty-second review round. No Critical, High or Medium defect. Neither payment script

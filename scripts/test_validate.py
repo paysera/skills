@@ -555,65 +555,117 @@ class TestTheTwoCopiesOfTheLeakCheckAgree(unittest.TestCase):
     in both."
 
     That rule was prose only, and the copies drifted anyway — the plugin copy went two
-    rounds checking three environment variables while this one checked four. Reading the
-    plugin file from here is allowed in this direction: a plugin must never depend on a
-    repository file, but a repository test may look at a plugin, and it is the only place
-    the two can be compared at all.
+    rounds checking three environment variables while this one checked four.
+
+    Reading a plugin file from here is the allowed direction, and CONTRIBUTING.md now says
+    so explicitly: a plugin must never read a repository file, because an installed copy
+    would not have one, while a repository test only ever runs in a checkout holding both.
+    It is the only place the copies can be compared at all.
+
+    The plugin copies are DISCOVERED, not named. A second plugin, or a third test module in
+    an existing one, would otherwise sit outside this comparison with nothing saying so —
+    and README.md describes this repository as a marketplace that gains skills one at a
+    time, so that is a matter of when.
     """
 
     REPO_ROOT = Path(__file__).resolve().parent.parent
-    PLUGIN_SUPPORT = (
-        REPO_ROOT
-        / "plugins/paysera-payments/skills/paysera-payments/scripts/_testsupport.py"
-    )
+    SUPPORT_GLOB = "plugins/*/skills/*/scripts/_testsupport.py"
 
-    def _redirected_names(self, text):
+    def plugin_supports(self):
+        found = sorted(self.REPO_ROOT.glob(self.SUPPORT_GLOB))
+        self.assertTrue(
+            found,
+            f"no plugin copy of the leak check matched {self.SUPPORT_GLOB} — either the "
+            f"layout changed or this comparison is now checking nothing",
+        )
+        return found
+
+    def _one_match(self, pattern, text, path, what):
+        """The single match for `pattern`, or a failure naming the file and what was
+        sought. Never index a findall result directly: an empty list raises IndexError,
+        which reports a missing pattern as a crash and sends the reader after the wrong
+        problem."""
+        found = re.findall(pattern, text)
+        self.assertEqual(
+            len(found), 1,
+            f"expected exactly one {what} in {path.name}, found {len(found)} — the copy "
+            f"was restructured, so this comparison no longer reads what it thinks it does",
+        )
+        return found[0]
+
+    def _names(self, group):
+        return {n.strip().strip('"') for n in group.split(",") if n.strip()}
+
+    def _redirected_names(self, path):
         # The keyword arguments of the os.environ.update(...) call that arms the sandbox.
-        match = re.search(r"os\.environ\.update\(([^)]*)\)", text)
-        self.assertIsNotNone(match, "no os.environ.update(...) found — copy restructured?")
+        # re.search takes the FIRST, which is the arming call; the teardown's
+        # os.environ.update({key: value}) comes later and is not a keyword form.
+        text = path.read_text(encoding="utf-8")
+        match = re.search(r"os\.environ\.update\(([^)]*=[^)]*)\)", text)
+        self.assertIsNotNone(
+            match, f"no arming os.environ.update(...) in {path.name} — copy restructured?"
+        )
         return set(re.findall(r"(\w+)\s*=", match.group(1)))
 
-    def test_both_copies_redirect_the_same_environment_variables(self):
-        mine = self._redirected_names(Path(__file__).read_text(encoding="utf-8"))
-        theirs = self._redirected_names(self.PLUGIN_SUPPORT.read_text(encoding="utf-8"))
-        self.assertEqual(
-            mine,
-            theirs,
-            "the two copies of the leak check redirect different variables; the one that "
-            "redirects fewer has a hole its own tests cannot see",
-        )
+    def test_every_copy_redirects_the_same_environment_variables(self):
+        mine = self._redirected_names(Path(__file__))
+        for support in self.plugin_supports():
+            with self.subTest(copy=str(support.relative_to(self.REPO_ROOT))):
+                self.assertEqual(
+                    mine,
+                    self._redirected_names(support),
+                    "the copies of the leak check redirect different variables; the one "
+                    "that redirects fewer has a hole its own tests cannot see",
+                )
         self.assertEqual(mine, {"TMPDIR", "TEMP", "TMP", "HOME"})
 
-    def test_both_copies_check_the_same_variables_in_their_full_cycle_test(self):
+    def test_every_copy_captures_what_it_restores(self):
+        # Restoring fewer variables than it redirects leaves the next module — they share
+        # one process under pytest — pointed at a directory that no longer exists.
+        for path in [Path(__file__), *self.plugin_supports()]:
+            with self.subTest(copy=path.name):
+                text = path.read_text(encoding="utf-8")
+                captured = self._one_match(
+                    r"for k in \(([^)]*)\)", text, path, "_TEMPBOX env capture"
+                )
+                self.assertEqual(self._names(captured), self._redirected_names(path))
+
+    def test_every_full_cycle_test_checks_the_same_variables(self):
         # The redirects agreeing is not enough: each copy also has a test that one
         # setup/teardown cycle leaves the process as it found it, and THAT is where the
         # drift actually was — the plugin copy asserted three variables while this one
         # asserted four, for two rounds, with both suites green.
+        #
         # The tuple must open with a quoted name: this file describes the pattern it looks
-        # for in its own failure message, and a looser regex matched that too — the same
+        # for in its own failure messages, and a looser regex matched those too — the same
         # self-reference the gate has to avoid when checking its own documentation.
+        pattern = r"keys = \((\"[^)]*)\)"
+
         def keys_of(path):
-            found = re.findall(r'keys = \((\"[^)]*)\)', path.read_text(encoding="utf-8"))
-            self.assertEqual(len(found), 1, f"expected exactly one keys tuple in {path.name}")
-            return {k.strip().strip('"') for k in found[0].split(",") if k.strip()}
+            return self._names(
+                self._one_match(pattern, path.read_text(encoding="utf-8"), path, "keys tuple")
+            )
 
-        plugin_tests = self.PLUGIN_SUPPORT.parent / "test_create_payment.py"
-        self.assertEqual(
-            keys_of(Path(__file__)),
-            keys_of(plugin_tests),
-            "the two full-cycle tests check different variables; the one checking fewer "
-            "would not notice a teardown that stops restoring the rest",
+        mine = keys_of(Path(__file__))
+        # Every test module beside a discovered copy, not one named module. A module with
+        # no full-cycle test has nothing to compare; one that grows a second must not go
+        # unnoticed, which is what _one_match enforces per file.
+        compared = 0
+        for support in self.plugin_supports():
+            for module in sorted(support.parent.glob("test_*.py")):
+                if not re.search(pattern, module.read_text(encoding="utf-8")):
+                    continue
+                compared += 1
+                with self.subTest(module=module.name):
+                    self.assertEqual(
+                        mine,
+                        keys_of(module),
+                        "the full-cycle tests check different variables; the one checking "
+                        "fewer would not notice a teardown that stops restoring the rest",
+                    )
+        self.assertGreaterEqual(
+            compared, 1, "no plugin full-cycle test was found to compare against"
         )
-
-    def test_both_copies_capture_what_they_restore(self):
-        # Restoring fewer variables than it redirects leaves the next module — they share
-        # one process under pytest — pointed at a directory that no longer exists.
-        for label, path in (("repository", Path(__file__)), ("plugin", self.PLUGIN_SUPPORT)):
-            with self.subTest(copy=label):
-                text = path.read_text(encoding="utf-8")
-                captured = set(re.findall(r'for k in \(([^)]*)\)', text)[0].split(","))
-                captured = {c.strip().strip('"') for c in captured}
-                self.assertEqual(captured, self._redirected_names(text), label)
 
 
 class TestNothingPublishableCanHideInASkippedDirectory(unittest.TestCase):
@@ -667,6 +719,20 @@ class TestNothingPublishableCanHideInASkippedDirectory(unittest.TestCase):
         with mock.patch.object(validate, "SKIP_FILES", validate.SKIP_FILES | {"notes.md"}):
             with self.assertRaises(AssertionError):
                 self.test_every_skipped_file_is_git_ignored()
+
+    def test_the_guide_does_not_forbid_reading_a_plugin_from_here(self):
+        # For one round CONTRIBUTING.md said a plugin must not read a repository file "and
+        # the reverse would be as wrong", while scripts/test_validate.py read two plugin
+        # files. A contributor following the written rule would have deleted the test that
+        # enforces the copy-drift rule stated in the same paragraph.
+        doc = " ".join(
+            (self.REPO_ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8").split()
+        )
+        self.assertNotIn(
+            "the reverse would be as wrong", doc,
+            "the guide forbids the direction TestTheTwoCopiesOfTheLeakCheckAgree relies on",
+        )
+        self.assertIn("The opposite direction is fine", doc)
 
     def test_the_contributing_guide_names_both_skip_mechanisms(self):
         # CONTRIBUTING.md's "what the check does and does not cover" section is the list a

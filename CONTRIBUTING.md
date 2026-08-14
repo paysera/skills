@@ -141,13 +141,21 @@ constants and must be called from `setUpModule` for every module that runs scrip
 in-process.
 
 That check exists twice, in `_testsupport.py` and in `scripts/test_validate.py`, because a
-plugin file must not read a repository file and the reverse would be as wrong. Copies drift:
-if you change one, change the other, and keep **all three** redirects in both. A module that
-redirects only `tempfile.tempdir` looks clean while its subprocesses write to the real
-`/tmp`; one that redirects neither `HOME` looks clean while it edits the contributor's home
-directory. Both copies carry the missing-piece argument in a comment — a module that starts
-no subprocess and reads no `HOME` today is exactly the one where an omission goes unnoticed
-until the first code that needs it escapes silently.
+plugin file must never read a repository file: `claude plugin install` copies the plugin
+directory alone, so an installed copy would not have one. **The opposite direction is fine**
+— a repository test may read a plugin file, since it only ever runs inside a checkout that
+has both. That is not a loophole, it is the only place the two copies can be compared at
+all, and `scripts/test_validate.py` does exactly that.
+
+Copies drift: if you change one, change the other, and keep **all three** redirects in both.
+A module that redirects only `tempfile.tempdir` looks clean while its subprocesses write to
+the real `/tmp`; one that does not redirect `HOME` looks clean while it edits the
+contributor's home directory. Both copies carry the missing-piece argument in a comment — a
+module that starts no subprocess and reads no `HOME` today is exactly the one where an
+omission goes unnoticed until the first code that needs it escapes silently. That rule was
+prose only for six rounds and the copies drifted anyway, so
+`TestTheTwoCopiesOfTheLeakCheckAgree` now enforces it: it compares what each copy redirects,
+what each captures for restoring, and what each full-cycle test asserts.
 
 The tests inside a plugin never read a file outside it: `claude plugin install` copies the
 plugin directory alone, so anything a shipped test reaches for must be shipped with it.
