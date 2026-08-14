@@ -12,7 +12,26 @@ FRONTMATTER = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
 # Everything published here is scanned, not just plugins/ — the marketplace catalogue
 # duplicates each skill's description verbatim, and the README is as public as the rest.
 PUBLISHED_SUFFIXES = {".md", ".py", ".json", ".yml", ".yaml"}
-SKIP_DIRS = {".git", "__pycache__", ".pytest_cache"}
+# Skipped because nothing published can live in them — a virtual environment, an editor's
+# state, a dependency tree, a tool's cache. CONTRIBUTING.md tells contributors to run this
+# gate locally, and a .venv full of third-party .py and .json files made that a slow scan
+# that failed on somebody else's code. Skipping is only safe while none of these can hold
+# published content, so every name here is also in .gitignore — an untracked directory is
+# never published. test_validate.py checks that pairing, so adding a name here without
+# adding it there fails the suite.
+SKIP_DIRS = {
+    ".git",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".venv",
+    "venv",
+    "node_modules",
+    ".idea",
+    ".vscode",
+}
 
 # Published content may only reference Paysera hosts a client can actually reach.
 # This is an allowlist on purpose: naming the hosts that are *not* public would

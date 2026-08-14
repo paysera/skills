@@ -106,8 +106,11 @@ The same commands CI runs on every pull request:
 
 ```bash
 python3 scripts/validate.py             # manifests, frontmatter, published-content scan
-python3 -m pytest plugins scripts -q    # the skill tests AND the publication gate's own
+python3 -m pytest plugins scripts -q -p no:randomly   # skill tests AND the gate's own
 ```
+
+`-p no:randomly` is not decoration: the suite is not safe to shuffle or parallelise (see
+below), so leaving it off runs the tests in a different order than CI does.
 
 The tests are plain `unittest`, so they also run without pytest installed — which is how
 CI double-checks them:
@@ -135,6 +138,13 @@ that redirects only `tempfile.tempdir` looks clean while its subprocesses write 
 
 The tests inside a plugin never read a file outside it: `claude plugin install` copies the
 plugin directory alone, so anything a shipped test reaches for must be shipped with it.
+
+`validate.py` skips a short list of local directories (`SKIP_DIRS`) so that a `.venv` or a
+`node_modules` in your checkout does not make the gate slow and red on third-party code.
+A directory the gate does not read is a blind spot in a check whose whole job is to stop
+internal content going public, so **every name in `SKIP_DIRS` is also in `.gitignore`** —
+untracked means never published. `test_validate.py` enforces the pairing; adding a name to
+one list without the other fails the suite.
 
 ## Releasing
 

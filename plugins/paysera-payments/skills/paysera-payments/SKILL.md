@@ -54,6 +54,9 @@ Scopes on the token: `accounts:read`, `transfers:read`, `transfers:create`,
 
 - **Python 3.8+** and **`curl`** on `PATH`. If curl is missing or a request times out
   (30 s), the tool says so on stderr rather than treating it as an empty API response.
+  Both scripts keep the split: stdout carries the report, and **every message that makes
+  the run exit non-zero goes to stderr**, so a caller that keeps only one stream never
+  reads a failure as a result.
 - **`tzdata`** (Python 3.9+ ships `zoneinfo`; slim containers often omit the tz database).
   Scheduling is done in Europe/Vilnius, because that day boundary decides whether a
   transfer is signable in the mobile app. Without tzdata the tool falls back to a built-in
@@ -108,7 +111,9 @@ Scopes on the token: `accounts:read`, `transfers:read`, `transfers:create`,
   ```
 
   The scripts also keep `~/.config/paysera-payments/` itself at `0700` (it holds the
-  ledger, which lists IBANs, amounts and invoice numbers).
+  ledger, which lists IBANs, amounts and invoice numbers). Every run that reads the token
+  tightens it — a dry run too — but none of them *creates* it, so the `mkdir` above is
+  still yours to do.
 - Do **not** grant `transfers:sign`. Without it the skill physically cannot move money.
 
 ## Scoped accounts (payer must be one of these)
@@ -416,6 +421,11 @@ exceed over a long window. **That, too, warns on stderr**, naming how many rows 
 every way this check can come back incomplete says so, because a partial scan that reports
 as complete is worse than one that fails outright. Narrow the window with `--invoice-date`
 if you see it.
+
+Whichever way it comes back incomplete, **stdout says so as well**: the summary line
+reads `LIVE SCAN INCOMPLETE` instead of `No prior payments to those accounts in the
+period.` The two are different answers — "nothing found" and "could not look" — and the
+summary is the line a log, a pipeline or an agent reads when stderr has been dropped.
 
 > **Pass all the invoice's accounts.** The check is only as complete as the accounts you
 > give it. If the invoice lists two banks, `--also-iban` the second one — otherwise a

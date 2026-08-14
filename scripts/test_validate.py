@@ -533,5 +533,57 @@ class TestTheLeakCheckItself(unittest.TestCase):
         self.assertIn("disarmed", str(raised.exception))
 
 
+class TestNothingPublishableCanHideInASkippedDirectory(unittest.TestCase):
+    """Every name in SKIP_DIRS must also be in .gitignore.
+
+    SKIP_DIRS exists so that a local .venv or node_modules does not make the gate slow
+    and red on somebody else's code. But a directory the gate does not read is a blind
+    spot in a check whose whole job is to stop internal content going public. Pairing it
+    with .gitignore closes that: an untracked directory is never published, so skipping
+    it can never hide anything. Adding a name to one list without the other fails here.
+    """
+
+    REPO_ROOT = Path(__file__).resolve().parent.parent
+
+    def _ignored_names(self):
+        text = (self.REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+        names = set()
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            names.add(line.rstrip("/").lstrip("/"))
+        return names
+
+    def test_every_skipped_directory_is_git_ignored(self):
+        ignored = self._ignored_names()
+        # .git is the exception, and the only one: git cannot ignore its own directory.
+        unpaired = {d for d in validate.SKIP_DIRS if d != ".git"} - ignored
+        self.assertEqual(
+            unpaired,
+            set(),
+            f"in SKIP_DIRS but not in .gitignore, so published content could hide "
+            f"there unseen: {sorted(unpaired)}",
+        )
+
+    def test_the_pairing_check_can_fail(self):
+        # Without this, a .gitignore that happened to list everything would make the test
+        # above pass for a reason unrelated to what it claims to check.
+        with mock.patch.object(validate, "SKIP_DIRS", validate.SKIP_DIRS | {"secrets"}):
+            with self.assertRaises(AssertionError):
+                self.test_every_skipped_directory_is_git_ignored()
+
+    def test_a_skipped_directory_is_actually_skipped(self):
+        # And that the skip works on a nested path, not only a top-level one.
+        root = Path(tempfile.mkdtemp(prefix="paysera-skipdir-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        (root / ".venv" / "lib").mkdir(parents=True)
+        (root / ".venv" / "lib" / "vendored.py").write_text("x = 1\n", encoding="utf-8")
+        (root / "kept.md").write_text("hello\n", encoding="utf-8")
+        with mock.patch.object(validate, "ROOT", root):
+            found = {p.name for p in validate.published_files()}
+        self.assertEqual(found, {"kept.md"})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -7,7 +7,6 @@ read.
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import subprocess
@@ -130,8 +129,12 @@ class TestTransferHashValidation(unittest.TestCase):
                 self.assertFalse(cancel.TRANSFER_HASH.match(bad))
 
 
-class TestCommandLine(unittest.TestCase):
-    """Driven end to end with a stubbed curl, so the DELETE gate is tested for real."""
+class ScriptFixture:
+    """Stubbed-curl fixture, shared by the end-to-end classes below.
+
+    Deliberately NOT a TestCase: subclassing one to reuse its fixture re-runs every test
+    it holds, once per subclass. That is a slower suite reporting the same coverage twice.
+    """
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="paysera-cancel-test-")
@@ -167,6 +170,10 @@ class TestCommandLine(unittest.TestCase):
             return []
         with open(self.log) as f:
             return f.read().splitlines()
+
+
+class TestCommandLine(ScriptFixture, unittest.TestCase):
+    """Driven end to end with a stubbed curl, so the DELETE gate is tested for real."""
 
     def test_dry_run_does_not_delete(self):
         self.write_stub('{"id":"H1","status":"new","amount":{"amount":"5.00","currency":"EUR"}}')
@@ -207,13 +214,59 @@ class TestCommandLine(unittest.TestCase):
         out = self.run_script("H1", "--confirm")
         self.assertNotEqual(out.returncode, 0)
         self.assertNotIn("Traceback", out.stderr)
-        self.assertIn("cannot read", out.stdout)
+        # stderr, as SKILL.md promises for a missing curl or a timeout — and as
+        # create-payment.py has always done. This wrote to stdout until 1.8.6, so a
+        # caller that separates the streams saw the failure in the report.
+        self.assertIn("cannot read", out.stderr)
+        self.assertNotIn("cannot read", out.stdout)
 
     def test_a_malformed_hash_reaches_no_request(self):
         self.write_stub('{"id":"H1","status":"new","amount":{"amount":"5.00","currency":"EUR"}}')
         out = self.run_script("../../admin", "--confirm")
         self.assertNotEqual(out.returncode, 0)
         self.assertEqual(self.calls(), [], "a malformed hash must not be sent anywhere")
+
+
+class TestEveryFailureGoesToStderr(ScriptFixture, unittest.TestCase):
+    """No message that makes this script exit non-zero may land on stdout.
+
+    stdout is the report — "H1: status=… amount=…", DRY-RUN, CANCELED. A pipeline that
+    keeps the report and drops stderr must not silently keep a failure line as if it were
+    a result, and one that watches stderr for trouble must actually see it there.
+    """
+
+    def assert_failure_on_stderr(self, out, marker):
+        self.assertNotEqual(out.returncode, 0, "this case must exit non-zero")
+        self.assertIn(marker, out.stderr)
+        self.assertNotIn(marker, out.stdout)
+
+    def test_an_unreadable_transfer_reports_on_stderr(self):
+        self.write_stub('{"error":"nope"}', http="404")
+        self.assert_failure_on_stderr(self.run_script("H1", "--confirm"), "cannot read")
+
+    def test_a_malformed_hash_reports_on_stderr(self):
+        self.write_stub('{"id":"H1","status":"new","amount":{"amount":"5.00","currency":"EUR"}}')
+        out = self.run_script("../../admin", "--confirm")
+        self.assert_failure_on_stderr(out, "not a valid transferHash")
+
+    def test_a_failed_delete_reports_on_stderr(self):
+        # Readable (GET 200) but the DELETE is refused: the stub answers 500 for both, so
+        # drive it through a transfer the GET can read by answering on the method.
+        stub = os.path.join(self.bin, "curl")
+        with open(stub, "w") as f:
+            f.write(
+                "#!/bin/sh\n"
+                f'echo "$@" >> {self.log}\n'
+                'case "$*" in\n'
+                '  *DELETE*) echo \'{"error":"refused"}\'; echo "HTTP:500";;\n'
+                '  *) echo \'{"id":"H1","status":"new","amount":{"amount":"5.00",'
+                '"currency":"EUR"}}\'; echo "HTTP:200";;\n'
+                "esac\n"
+            )
+        os.chmod(stub, 0o755)
+        out = self.run_script("H1", "--confirm")
+        self.assert_failure_on_stderr(out, "FAILED")
+        self.assertIn("status=new", out.stdout, "the report itself still goes to stdout")
 
     def test_multiple_hashes_are_all_processed(self):
         self.write_stub('{"id":"H1","status":"new","amount":{"amount":"5.00","currency":"EUR"}}')

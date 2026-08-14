@@ -115,6 +115,14 @@ class _VilniusFallback(datetime.tzinfo):
         so one boundary constant had to serve two different conventions and could not.
         The result was an hour that converted one hour late, and non-monotonically
         (01:30 UTC gave 04:30 while 02:00 UTC gave 04:00).
+
+        KNOWN DIVERGENCE from zoneinfo, spring gap only: on the last Sunday of March the
+        wall times 03:00–03:59 do not exist. `start <= naive < end` with start = 03:00
+        calls them EEST (+3); zoneinfo with fold=0 calls them EET (+2). Nothing in this
+        file can reach that hour — the only wall times built here are 00:00
+        (_vilnius_midnight_epoch) and 23:00 (_end_of_today_epoch), and _noon_epoch works
+        in UTC — so it is recorded rather than fixed. Anyone who adds a wall-clock hour
+        must check it first.
         """
         if dt is None:
             return False
@@ -402,6 +410,10 @@ def _check_token_file_mode(path):
 
 
 def read_token(path):
+    # Every run reads the token, so this is where the 0700 promise is kept for runs that
+    # never write the ledger. It only tightens an existing directory; see
+    # _harden_config_dir.
+    _harden_config_dir()
     tok = os.environ.get("PAYSERA_PAT")
     if tok:
         return _validate_token(tok.strip())
@@ -492,8 +504,13 @@ _lock_depth = 0
 
 
 @contextlib.contextmanager
-def ledger_lock():
+def ledger_lock(fatal=True):
     """Serialise the whole duplicate-check-and-record section against other runs.
+
+    Yields True when the lock is held and False when `fatal=False` and another run has
+    it. `fatal=False` is for the one caller whose work is ALREADY DONE by the time it
+    writes — marking a completed registration. Exiting there reported failure for an
+    operation that succeeded, which invites a retry.
 
     Without this the ledger's read-append-write is a lost-update race: two runs (a cron
     job and a manual run, or two agent sessions) both read the same ledger, and the one
@@ -520,7 +537,7 @@ def ledger_lock():
             "two payments concurrently.",
             file=sys.stderr,
         )
-        yield
+        yield True
         return
     if _lock_depth == 0:
         _ensure_config_dir()
@@ -531,6 +548,9 @@ def ledger_lock():
         except OSError:
             os.close(_lock_fd)
             _lock_fd = None
+            if not fatal:
+                yield False
+                return
             sys.exit(
                 f"ERROR: another paysera-payments run holds {path}.\n"
                 f"  Two concurrent runs can each miss the other's transfer and pay the "
@@ -539,7 +559,7 @@ def ledger_lock():
             )
     _lock_depth += 1
     try:
-        yield
+        yield True
     finally:
         _lock_depth -= 1
         if _lock_depth == 0 and _lock_fd is not None:
@@ -556,8 +576,21 @@ def _ensure_config_dir():
     user creates this directory first, to hold the token, so it usually already exists
     with the umask's 0755 — hence the explicit chmod.
     """
+    os.makedirs(os.path.dirname(LEDGER_FILE), mode=0o700, exist_ok=True)
+    _harden_config_dir()
+
+
+def _harden_config_dir():
+    """Drop group/other bits from the config directory if it is there. Never creates it.
+
+    Split out of _ensure_config_dir so that runs which never touch the ledger can still
+    keep the promise. _ensure_config_dir is reached only from ledger_lock and
+    _write_ledger, i.e. only when --invoice-id is given; a dry run, and a --confirm run
+    without an invoice id, left the directory on whatever the umask gave it (usually
+    0755) while SKILL.md said the scripts keep it at 0700. Creating the directory here
+    instead would be wrong in the other direction — a dry run must not make directories.
+    """
     d = os.path.dirname(LEDGER_FILE)
-    os.makedirs(d, mode=0o700, exist_ok=True)
     try:
         if stat.S_IMODE(os.stat(d).st_mode) & 0o077:
             os.chmod(d, 0o700)
@@ -666,10 +699,11 @@ def list_transfers(token, payer_account, created_from, max_pages=50):
         f"{TRANSFER_API}?credit_account_number={payer_account}"
         f"&created_date_from={int(created_from)}&limit={page_size}"
     )
-    items, seen_ids = [], set()
+    items, seen_ids, complete = [], set(), True
     for page in range(max_pages):
         code, doc = http_json("GET", f"{base}&offset={page * page_size}", token)
         if code != "200":
+            complete = False
             # Say so: an incomplete live list silently weakens the duplicate check, and
             # the caller falls back to the ledger (which cannot see app-made payments).
             print(
@@ -701,6 +735,7 @@ def list_transfers(token, payer_account, created_from, max_pages=50):
         # hitting the cap returned a partial list indistinguishable from a complete one —
         # the same shape as the defects fixed in 1.7.1 and 1.7.2, a partial check
         # reporting as complete. Raising the cap would not fix it; the silence is the bug.
+        complete = False
         print(
             f"WARNING: live duplicate check INCOMPLETE — stopped at the {max_pages}-page "
             f"cap after reading {len(items)} transfers, and there are more in this "
@@ -708,7 +743,11 @@ def list_transfers(token, payer_account, created_from, max_pages=50):
             f"         Narrow the window with --invoice-date, or verify manually.",
             file=sys.stderr,
         )
-    return items
+    # (items, complete). The flag is returned as well as warned about because the warning
+    # goes to stderr and the caller's summary goes to stdout: a reader of stdout alone —
+    # a log, a pipeline, an agent — used to see an unqualified "No prior payments" from a
+    # scan that never ran. Same defect class as 1.7.1/1.7.4/1.8.1.
+    return items, complete
 
 
 # An IBAN's canonical form has no separators. People paste them from invoices with
@@ -924,11 +963,14 @@ def scan_window(invoice_date):
 def find_blocking(
     invoice_id, token, payer=None, ibans=None, amount=None, invoice_date=None, currency=None
 ):
-    """Return (blocking, seen_to_ibans).
+    """Return (blocking, seen_to_ibans, live_complete).
 
     `blocking` = [(hash, status, source, why)] that block re-creating a payment for this
     invoice. `seen_to_ibans` = [(hash, status, amount, account, purpose)] — EVERY transfer
     to any candidate account in the period, for human review (printed by the caller).
+    `live_complete` = did source 2 read the whole window? False when a page failed, when
+    the page cap cut the walk short, and when the live scan did not run at all. An empty
+    `seen_to_ibans` means "nothing found" only when this is True; the caller must say so.
 
     "Account", not "IBAN", throughout: `ibans` may hold a national account number that is
     not an IBAN, and the scan reads all three keys the API can return one under. Calling
@@ -949,6 +991,10 @@ def find_blocking(
     """
     blocking = {}
     seen_to_ibans = []
+    # Nothing live has been read yet. If the live scan never runs (no payer, no candidate
+    # account) the result is not a complete "no duplicates found" either, so it starts
+    # False and only a finished scan sets it True.
+    live_complete = False
 
     # 1. Ledger-recorded transfers for this invoice.
     for e in load_ledger():
@@ -991,11 +1037,20 @@ def find_blocking(
             st = (doc.get("status") or "").lower()
             if st not in NONBLOCKING_STATES:
                 why = "recorded for this invoice id"
-                if e.get("registered") is False:
+                # Is that draft signable? The LIVE status answers it: a bare POST leaves
+                # a transfer in `new`, and registering moves it out. The ledger's
+                # `registered` flag is only a fallback — it is None after --no-register
+                # and absent entirely on rows written before 1.8.0, so testing it for
+                # `is False` (as this did until 1.8.6) recognised ONLY the failed-register
+                # case. The other two fell through to the generic "Use --force to
+                # override", and --force creates the second signable draft that this whole
+                # check exists to prevent.
+                signable = st != "new" if st else e.get("registered") is True
+                if not signable:
                     # Otherwise this invoice is simply stuck: the draft blocks a re-run,
                     # and it is invisible in the app, so the operator sees no way forward.
                     why += (
-                        f"; that draft was never REGISTERED, so it is not visible for "
+                        f"; that draft is NOT REGISTERED, so it is not visible for "
                         f"signing — finish it with --register-only {h} --confirm "
                         f"(do not --force, which would create a second draft)"
                     )
@@ -1017,7 +1072,8 @@ def find_blocking(
         # Never 0 (= the full account history): see DEFAULT_LOOKBACK_DAYS. Computed by
         # the same helper main() reports from, so the two cannot disagree.
         from_epoch, _ = scan_window(invoice_date)
-        for t in list_transfers(token, payer, from_epoch):
+        live, live_complete = list_transfers(token, payer, from_epoch)
+        for t in live:
             if not isinstance(t, dict):
                 continue
             ben = t.get("beneficiary") or {}
@@ -1087,7 +1143,7 @@ def find_blocking(
                 )
                 blocking[h] = (h, t.get("status"), "live-list", why)
 
-    return list(blocking.values()), seen_to_ibans
+    return list(blocking.values()), seen_to_ibans, live_complete
 
 
 def _vilnius_today():
@@ -1697,7 +1753,7 @@ def _main(guard):
 
     candidate_ibans = [args.iban] + list(args.also_iban or [])
     if args.invoice_id and not args.force:
-        blocking, seen = find_blocking(
+        blocking, seen, live_complete = find_blocking(
             args.invoice_id,
             token,
             payer=payer,
@@ -1718,6 +1774,15 @@ def _main(guard):
             print(f"  Found {len(seen)} prior payment(s) to those accounts — review:")
             for h, st, amt, ib, purp in seen:
                 print(f"    {amt} -> {ib}  status={st}  {h}\n      purpose: {purp[:120]}")
+        elif not live_complete:
+            # "Nothing found" and "could not look" are different answers, and this line is
+            # the one a log or an agent reads. The reason is on stderr, next to the
+            # WARNING that explains which page failed.
+            print(
+                "  LIVE SCAN INCOMPLETE — the ledger found nothing, but the live list "
+                "could not be read in full (see the WARNING on stderr). A payment made "
+                "in the Paysera app may exist and be invisible here."
+            )
         else:
             print("  No prior payments to those accounts in the period.")
         if blocking:
@@ -1965,14 +2030,28 @@ def _main(guard):
         if args.invoice_id:
             # `registered` is recorded so a later run can tell a signable draft from an
             # invisible one. Both used to be written as state="created", indistinguishable.
-            update_ledger(
+            recorded = update_ledger(
                 attempt_id,
                 state="created",
                 transfer_hash=transfer_hash,
                 status_at_create=j.get("status"),
                 registered=registered,
             )
-            print("  ledger           : recorded for invoice", args.invoice_id)
+            if recorded:
+                print("  ledger           : recorded for invoice", args.invoice_id)
+            else:
+                # The write-ahead row is gone — edited or deleted mid-run. Saying
+                # "recorded" here would be the worst kind of wrong: the ledger is the
+                # only thing that stops a later run creating a second draft, and GET
+                # /transfers cannot list unsigned drafts to make up for it.
+                print(
+                    f"WARNING: the ledger row for this run is GONE, so transfer "
+                    f"{transfer_hash} is NOT recorded for invoice {args.invoice_id}. A "
+                    f"later run for this invoice will NOT be blocked by it — check the "
+                    f"Paysera app before re-running.",
+                    file=sys.stderr,
+                )
+                print("  ledger           : NOT recorded (see the warning on stderr)")
 
         if registered is False:
             # Do NOT end on "open the app and sign it": there is nothing there to sign.
@@ -2064,9 +2143,15 @@ def register_transfer(transfer_hash, token):
     return code in ("200", "201", "204"), code, body
 
 
-def mark_registered(transfer_hash, registered):
-    """Record on every ledger row for this hash whether the draft is signable."""
-    with ledger_lock():
+def mark_registered(transfer_hash, registered, fatal=True):
+    """Record on every ledger row for this hash whether the draft is signable.
+
+    Returns "updated", "missing" (no ledger row carries this hash) or "locked" (another
+    run holds the ledger lock and `fatal=False`, so nothing was written).
+    """
+    with ledger_lock(fatal=fatal) as locked:
+        if not locked:
+            return "locked"
         data = load_ledger()
         changed = False
         for entry in data:
@@ -2075,7 +2160,7 @@ def mark_registered(transfer_hash, registered):
                 changed = True
         if changed:
             _write_ledger(data)
-        return changed
+        return "updated" if changed else "missing"
 
 
 def register_only(args):
@@ -2100,7 +2185,9 @@ def register_only(args):
         return
     ok, code, body = register_transfer(transfer_hash, token)
     if not ok:
-        mark_registered(transfer_hash, False)
+        # fatal=False here too: a lock held by another run must not replace the message
+        # below, which is the one that tells the operator what to do next.
+        mark_registered(transfer_hash, False, fatal=False)
         sys.exit(
             f"ERROR: register FAILED ({_code_text(code)}) for {transfer_hash}.\n"
             f"  {str(body)[:400]}\n"
@@ -2109,8 +2196,26 @@ def register_only(args):
         )
     status = body.get("status") if isinstance(body, dict) else None
     print(f"OK registered {transfer_hash}" + (f" — status={status}" if status else ""))
-    if mark_registered(transfer_hash, True):
+    # The registration is done on the server. Whatever happens to the ledger from here,
+    # this run must not exit non-zero: SKILL.md promises that a non-zero code means
+    # nothing was created, and a wrapper that retries on non-zero would register again.
+    outcome = mark_registered(transfer_hash, True, fatal=False)
+    if outcome == "updated":
         print("  ledger           : marked as registered")
+    elif outcome == "locked":
+        print(
+            "WARNING: the transfer IS registered, but another run holds the ledger lock, "
+            "so the ledger still shows it as unregistered. Re-run this same command once "
+            "the other run finishes to correct it (registering twice is harmless).",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"WARNING: the transfer IS registered, but no ledger row carries "
+            f"{transfer_hash} — it was created without --invoice-id, or the row was "
+            f"removed. The duplicate check cannot see this transfer.",
+            file=sys.stderr,
+        )
     print("\nIt is now visible for MANUAL SIGNING in the Paysera app / web bank (2FA).")
 
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import fcntl
 import io
 import json
 import os
@@ -506,7 +507,7 @@ class TestLedgerStateMachine(unittest.TestCase):
             for row in rows:
                 cp.append_ledger(row)
             with mock.patch.object(cp, "http_json", return_value=("200", {})):
-                blocking, _ = cp.find_blocking(invoice_id, token="t")
+                blocking, _, _ = cp.find_blocking(invoice_id, token="t")
         return blocking
 
     def test_unanswered_attempt_blocks_a_retry(self):
@@ -541,21 +542,21 @@ class TestLedgerStateMachine(unittest.TestCase):
         with temp_ledger(cp):
             cp.append_ledger({"invoice_id": "INV-1", "transfer_hash": "H1", "state": "created"})
             with mock.patch.object(cp, "http_json", return_value=("200", {"id": "H1", "status": "signed"})):
-                blocking, _ = cp.find_blocking("INV-1", token="t")
+                blocking, _, _ = cp.find_blocking("INV-1", token="t")
         self.assertEqual(len(blocking), 1)
 
     def test_terminal_transfer_does_not_block(self):
         with temp_ledger(cp):
             cp.append_ledger({"invoice_id": "INV-1", "transfer_hash": "H1", "state": "created"})
             with mock.patch.object(cp, "http_json", return_value=("200", {"id": "H1", "status": "canceled"})):
-                blocking, _ = cp.find_blocking("INV-1", token="t")
+                blocking, _, _ = cp.find_blocking("INV-1", token="t")
         self.assertEqual(blocking, [])
 
     def test_unreadable_transfer_is_treated_as_blocking(self):
         with temp_ledger(cp):
             cp.append_ledger({"invoice_id": "INV-1", "transfer_hash": "H1", "state": "created"})
             with mock.patch.object(cp, "http_json", return_value=("ERR", {})):
-                blocking, _ = cp.find_blocking("INV-1", token="t")
+                blocking, _, _ = cp.find_blocking("INV-1", token="t")
         self.assertEqual(len(blocking), 1)
 
     def test_attempt_ids_are_unique(self):
@@ -650,8 +651,9 @@ class TestListTransfers(unittest.TestCase):
         # "scanned payments … since <date>" line over a truncated result.
         with mock.patch.object(cp, "http_json", self._paged_api(12000)):
             with mock.patch.object(sys, "stderr", io.StringIO()) as err:
-                got = cp.list_transfers("t", "EVP1", 0)
+                got, complete = cp.list_transfers("t", "EVP1", 0)
         self.assertEqual(len(got), 5000, "the cap itself is unchanged")
+        self.assertFalse(complete, "a truncated walk must report itself incomplete")
         message = err.getvalue()
         self.assertIn("INCOMPLETE", message)
         self.assertIn("5000", message, "the operator needs to know how much was read")
@@ -668,16 +670,18 @@ class TestListTransfers(unittest.TestCase):
             with self.subTest(ending=label):
                 with mock.patch.object(cp, "http_json", self._paged_api(total, meta)):
                     with mock.patch.object(sys, "stderr", io.StringIO()) as err:
-                        got = cp.list_transfers("t", "EVP1", 0)
+                        got, complete = cp.list_transfers("t", "EVP1", 0)
                 self.assertEqual(len(got), total)
+                self.assertTrue(complete, f"{label} reported itself incomplete")
                 self.assertEqual(err.getvalue(), "", f"{label} warned when complete")
 
     def test_a_scan_that_exactly_fills_the_cap_is_not_a_false_alarm(self):
         # 5000 rows in 50 full pages: page 51 comes back empty, which is an honest end.
         with mock.patch.object(cp, "http_json", self._paged_api(5000)):
             with mock.patch.object(sys, "stderr", io.StringIO()) as err:
-                got = cp.list_transfers("t", "EVP1", 0, max_pages=51)
+                got, complete = cp.list_transfers("t", "EVP1", 0, max_pages=51)
         self.assertEqual(len(got), 5000)
+        self.assertTrue(complete)
         self.assertEqual(err.getvalue(), "")
 
     def test_queries_the_payer_side_not_the_beneficiary_side(self):
@@ -702,8 +706,9 @@ class TestListTransfers(unittest.TestCase):
             return "200", {"items": pages.get(offset, [])}
 
         with mock.patch.object(cp, "http_json", fake):
-            items = cp.list_transfers("tok", "EVP1", 0)
+            items, complete = cp.list_transfers("tok", "EVP1", 0)
         self.assertEqual(len(items), 101)
+        self.assertTrue(complete)
 
     def test_duplicate_ids_across_pages_are_collapsed(self):
         page = [{"id": f"a{i}"} for i in range(100)]
@@ -714,14 +719,15 @@ class TestListTransfers(unittest.TestCase):
             return "200", {"items": page if offset < 200 else []}
 
         with mock.patch.object(cp, "http_json", fake):
-            items = cp.list_transfers("tok", "EVP1", 0)
+            items, _ = cp.list_transfers("tok", "EVP1", 0)
         self.assertEqual(len({i["id"] for i in items}), 100)
 
     def test_a_failed_page_warns_rather_than_looking_empty(self):
         with mock.patch.object(cp, "http_json", return_value=("ERR", {})):
             with mock.patch("sys.stderr") as err:
-                items = cp.list_transfers("tok", "EVP1", 0)
+                items, complete = cp.list_transfers("tok", "EVP1", 0)
         self.assertEqual(items, [])
+        self.assertFalse(complete, "a failed page must report itself incomplete")
         self.assertTrue(err.write.called, "an incomplete dup-check must announce itself")
 
     def test_transfer_items_accepts_the_shapes_the_api_returns(self):
@@ -742,8 +748,8 @@ class TestCurrencyAwareDuplicateMatch(unittest.TestCase):
             "beneficiary": {"iban": "LT121000011101001000"},
         }
         with temp_ledger(cp):
-            with mock.patch.object(cp, "list_transfers", return_value=[row]):
-                blocking, _ = cp.find_blocking(
+            with mock.patch.object(cp, "list_transfers", return_value=([row], True)):
+                blocking, _, _ = cp.find_blocking(
                     "INV-1",
                     token="t",
                     payer="EVP1",
@@ -950,7 +956,7 @@ class TestBeneficiaryAccountKeys(unittest.TestCase):
             "beneficiary": beneficiary,
         }
         with temp_ledger(cp):
-            with mock.patch.object(cp, "list_transfers", return_value=[row]):
+            with mock.patch.object(cp, "list_transfers", return_value=([row], True)):
                 return cp.find_blocking(
                     "INV-77",
                     token="t",
@@ -961,23 +967,23 @@ class TestBeneficiaryAccountKeys(unittest.TestCase):
                 )
 
     def test_a_national_account_number_blocks_a_second_payment(self):
-        blocking, seen = self._find({"bank_account": {"bank_account_number": self.ACCOUNT}})
+        blocking, seen, _ = self._find({"bank_account": {"bank_account_number": self.ACCOUNT}})
         self.assertEqual(len(blocking), 1, "the prior payment was invisible to the scan")
         self.assertEqual(len(seen), 1, "and absent from the human-review list too")
 
     def test_an_iban_under_bank_account_still_blocks(self):
-        blocking, seen = self._find({"bank_account": {"iban": self.ACCOUNT}})
+        blocking, seen, _ = self._find({"bank_account": {"iban": self.ACCOUNT}})
         self.assertEqual(len(blocking), 1)
         self.assertEqual(len(seen), 1)
 
     def test_a_paysera_beneficiary_iban_still_blocks(self):
-        blocking, seen = self._find({"iban": self.ACCOUNT})
+        blocking, seen, _ = self._find({"iban": self.ACCOUNT})
         self.assertEqual(len(blocking), 1)
         self.assertEqual(len(seen), 1)
 
     def test_a_different_account_under_the_same_key_does_not_block(self):
         # Otherwise the fix above could be "match everything", which blocks every invoice.
-        blocking, seen = self._find({"bank_account": {"bank_account_number": "99999999999"}})
+        blocking, seen, _ = self._find({"bank_account": {"bank_account_number": "99999999999"}})
         self.assertEqual(blocking, [])
         self.assertEqual(seen, [])
 
@@ -1021,8 +1027,8 @@ class TestNullFields(unittest.TestCase):
             "beneficiary": {"iban": "LT121000011101001000"},
         }
         with temp_ledger(cp):
-            with mock.patch.object(cp, "list_transfers", return_value=[row]):
-                _, seen = cp.find_blocking(
+            with mock.patch.object(cp, "list_transfers", return_value=([row], True)):
+                _, seen, _ = cp.find_blocking(
                     "INV-1", token="t", payer="EVP1", ibans=["LT121000011101001000"], amount="5.00"
                 )
         self.assertEqual(seen[0][4], "")
@@ -1114,6 +1120,222 @@ class ScriptHarness:
         env["PAYSERA_PAT"] = "test-token"
         cmd = [sys.executable, str(SCRIPTS / "create-payment.py")] + list(argv)
         return subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=60)
+
+
+class TestEveryUnregisteredDraftPointsAtTheRemedy(unittest.TestCase):
+    """`registered is False` recognised ONE of the three ways a draft can be unsignable.
+
+    The other two — `None` after --no-register, and the key missing entirely on a row
+    written before 1.8.0 — fell through to the generic "Use --force to override", and
+    --force creates the second signable draft the whole check exists to prevent. The live
+    status answers the question for all three, so that is what decides it now.
+    """
+
+    def _why(self, row_extra, live_status="new"):
+        row = {
+            "invoice_id": "INV-1",
+            "transfer_hash": "HASH123",
+            "state": "created",
+            "created_at_iso": "2026-08-01T10:00:00Z",
+        }
+        row.update(row_extra)
+        with temp_ledger(cp):
+            os.makedirs(os.path.dirname(cp.LEDGER_FILE), exist_ok=True)
+            with open(cp.LEDGER_FILE, "w") as f:
+                json.dump([row], f)
+            live = ("200", {"id": "HASH123", "status": live_status})
+            with mock.patch.object(cp, "http_json", lambda *a, **k: live), mock.patch.object(
+                cp, "list_transfers", lambda *a, **k: ([], True)
+            ):
+                blocking, _, _ = cp.find_blocking("INV-1", token="t")
+        self.assertEqual(len(blocking), 1, "the draft must still block a second run")
+        return blocking[0][3]
+
+    def test_a_no_register_draft_points_at_register_only(self):
+        why = self._why({"registered": None})
+        self.assertIn("--register-only HASH123 --confirm", why)
+
+    def test_a_row_written_before_the_flag_existed_points_at_register_only(self):
+        why = self._why({})  # no `registered` key at all
+        self.assertIn("--register-only HASH123 --confirm", why)
+
+    def test_a_failed_register_still_points_at_register_only(self):
+        why = self._why({"registered": False})
+        self.assertIn("--register-only HASH123 --confirm", why)
+
+    def test_a_registered_draft_is_not_told_to_register_again(self):
+        # It is blocking because it is live, not because it is invisible. Sending the
+        # operator to --register-only here would be noise that trains them to ignore it.
+        why = self._why({"registered": True}, live_status="registered")
+        self.assertNotIn("--register-only", why)
+
+    def test_the_live_status_overrules_a_stale_ledger_flag(self):
+        # The ledger says registered; the server says the draft is still `new`. The
+        # server is the one that decides whether it can be signed.
+        why = self._why({"registered": True}, live_status="new")
+        self.assertIn("--register-only HASH123 --confirm", why)
+
+
+class TestAnIncompleteLiveScanDoesNotReadAsAnAllClear(ScriptHarness, unittest.TestCase):
+    """The WARNING goes to stderr; the summary a log or an agent reads goes to stdout.
+
+    Until 1.8.6 stdout said "No prior payments to those accounts in the period." after a
+    live scan that returned HTTP 500 on its first page. Same defect class as 1.7.1,
+    1.7.4 and 1.8.1: a partial check reporting as complete.
+    """
+
+    def _run(self, list_http):
+        self.write_stub(
+            'case "$*" in\n'
+            '  *credit_account_number*) printf \'{"items":[]}\\nHTTP:%s\';;\n'
+            '  *) printf \'{"id":"HASH123","status":"new"}\\nHTTP:201\';;\n'
+            "esac" % list_http
+        )
+        return self.run_script("--amount", "10.00", "--invoice-id", "INV-SCAN", "--confirm")
+
+    def test_a_failed_live_page_is_said_on_stdout_not_only_stderr(self):
+        out = self._run("500")
+        self.assertIn("LIVE SCAN INCOMPLETE", out.stdout)
+        self.assertNotIn("No prior payments", out.stdout)
+        self.assertIn("INCOMPLETE", out.stderr, "the reason still belongs on stderr")
+
+    def test_a_complete_scan_still_says_so_plainly(self):
+        out = self._run("200")
+        self.assertIn("No prior payments", out.stdout)
+        self.assertNotIn("LIVE SCAN INCOMPLETE", out.stdout)
+
+    def test_a_live_scan_that_never_ran_is_not_reported_as_complete(self):
+        # No payer and no candidate account: source 2 is skipped entirely. "Complete" has
+        # to mean "the window was read", not "nothing went wrong on the way past it".
+        with temp_ledger(cp):
+            _, _, complete = cp.find_blocking("INV-NONE", token="t")
+        self.assertFalse(complete)
+
+    def test_the_marker_printed_is_the_one_the_documentation_names(self):
+        # A message the operator is told to look for, spelled differently in the two
+        # places, is the same failure as not printing it at all.
+        source = (SCRIPTS / "create-payment.py").read_text(encoding="utf-8")
+        skill = (SCRIPTS.parent / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("LIVE SCAN INCOMPLETE", source)
+        self.assertIn("LIVE SCAN INCOMPLETE", skill)
+
+
+class TestThePromisesAboutTheConfigDirectory(ScriptHarness, unittest.TestCase):
+    """SKILL.md says the scripts keep ~/.config/paysera-payments/ at 0700.
+
+    Only ledger_lock and _write_ledger hardened it, and both run only with --invoice-id.
+    A dry run left the directory holding the token and the ledger at the umask's 0755
+    while the documentation said otherwise.
+    """
+
+    @property
+    def config_dir(self):
+        return os.path.join(self.tmp, ".config", "paysera-payments")
+
+    def _loose_dir(self):
+        os.makedirs(self.config_dir, exist_ok=True)
+        os.chmod(self.config_dir, 0o755)
+
+    def test_a_dry_run_tightens_it(self):
+        self._loose_dir()
+        out = self.run_script("--amount", "10.00")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(mode_of(self.config_dir), 0o700)
+
+    def test_a_confirmed_run_without_an_invoice_id_tightens_it(self):
+        self._loose_dir()
+        self.write_stub('printf \'{"id":"HASH123","status":"new"}\\nHTTP:201\'')
+        self.run_script("--amount", "10.00", "--confirm")
+        self.assertEqual(mode_of(self.config_dir), 0o700)
+
+    def test_a_run_that_writes_the_ledger_still_tightens_it(self):
+        self._loose_dir()
+        self.write_stub('printf \'{"id":"HASH123","status":"new"}\\nHTTP:201\'')
+        self.run_script("--amount", "10.00", "--invoice-id", "INV-MODE", "--confirm")
+        self.assertEqual(mode_of(self.config_dir), 0o700)
+
+    def test_a_run_never_creates_the_directory_just_to_harden_it(self):
+        # A dry run must leave no trace. _harden_config_dir only tightens what is there.
+        self.run_script("--amount", "10.00")
+        self.assertFalse(os.path.exists(self.config_dir))
+
+
+class TestTheLedgerIsOnlyReportedWhenItWasWritten(ScriptHarness, unittest.TestCase):
+    """update_ledger returns False when the write-ahead row is gone. _main ignored it.
+
+    The ledger is the only guard against a second draft for an invoice, and GET
+    /transfers cannot list unsigned drafts to make up for a missing row — so "recorded"
+    printed over a ledger that holds nothing is the most expensive line in the output.
+    """
+
+    def test_a_vanished_row_is_reported_as_not_recorded(self):
+        # The stub empties the ledger while the POST is in flight, which is what a hand
+        # edit or a `rm` mid-run looks like from here.
+        ledger = self.ledger_path
+        self.write_stub(
+            'case "$*" in\n'
+            '  *credit_account_number*) printf \'{"items":[]}\\nHTTP:200\';;\n'
+            '  *POST*|*transfers*) echo "[]" > %s; printf \'{"id":"HASH123","status":"new"}\\nHTTP:201\';;\n'
+            "esac" % ledger
+        )
+        out = self.run_script("--amount", "10.00", "--invoice-id", "INV-GONE", "--confirm")
+        self.assertIn("NOT recorded", out.stdout)
+        self.assertNotIn("ledger           : recorded", out.stdout)
+        self.assertIn("will NOT be blocked", out.stderr)
+
+    def test_an_ordinary_run_still_says_recorded(self):
+        self.write_stub(
+            'case "$*" in\n'
+            '  *credit_account_number*) printf \'{"items":[]}\\nHTTP:200\';;\n'
+            '  *) printf \'{"id":"HASH123","status":"new"}\\nHTTP:201\';;\n'
+            "esac"
+        )
+        out = self.run_script("--amount", "10.00", "--invoice-id", "INV-OK", "--confirm")
+        self.assertIn("ledger           : recorded", out.stdout)
+        self.assertNotIn("NOT recorded", out.stdout)
+
+
+class TestRegisterOnlySucceedsEvenIfTheLedgerCannotBeWritten(
+    ScriptHarness, unittest.TestCase
+):
+    """The PUT is already done by the time the ledger is touched.
+
+    mark_registered took the ledger lock, and the lock exits the process when another run
+    holds it — so a concurrent run turned a completed registration into exit 1. SKILL.md
+    promises that every non-zero code except 4 means nothing happened, and a wrapper that
+    retries on non-zero would register a second time.
+    """
+
+    def test_a_held_lock_does_not_turn_success_into_failure(self):
+        self.write_stub('printf \'{"id":"HASH123","status":"registered"}\\nHTTP:200\'')
+        lock = os.path.join(self.tmp, ".config", "paysera-payments", ".lock")
+        os.makedirs(os.path.dirname(lock), exist_ok=True)
+        holder = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, holder)
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        out = self.run_script_bare("--register-only", "HASH123", "--confirm")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("OK registered HASH123", out.stdout)
+        self.assertIn("another run holds the ledger lock", out.stderr)
+
+    def test_a_hash_with_no_ledger_row_does_not_turn_success_into_failure(self):
+        self.write_stub('printf \'{"id":"HASH123","status":"registered"}\\nHTTP:200\'')
+        out = self.run_script_bare("--register-only", "HASH123", "--confirm")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("no ledger row carries HASH123", out.stderr)
+
+    def test_the_creating_run_is_still_stopped_by_a_held_lock(self):
+        # fatal=False is for the one caller whose work is already done. A run that is
+        # about to CREATE must still refuse rather than race another run's ledger.
+        self.write_stub('printf \'{"id":"HASH123","status":"new"}\\nHTTP:201\'')
+        lock = os.path.join(self.tmp, ".config", "paysera-payments", ".lock")
+        os.makedirs(os.path.dirname(lock), exist_ok=True)
+        holder = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, holder)
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        out = self.run_script("--amount", "10.00", "--invoice-id", "INV-LOCK", "--confirm")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("another paysera-payments run holds", out.stderr)
 
 
 class TestAddressRequirementIsStatedAsItIsChecked(ScriptHarness, unittest.TestCase):
@@ -1596,9 +1818,9 @@ class TestAccountNormalisation(unittest.TestCase):
         ]
         for spelling in ["LT60-3500-0100-0123-4567", "LT603500010001234567"]:
             with self.subTest(spelling=spelling):
-                with mock.patch.object(cp, "list_transfers", lambda *a, **k: rows), \
+                with mock.patch.object(cp, "list_transfers", lambda *a, **k: (rows, True)), \
                         mock.patch.object(cp, "load_ledger", lambda: []):
-                    blocking, seen = cp.find_blocking(
+                    blocking, seen, _ = cp.find_blocking(
                         "INV-1", "t", payer="EVP1",
                         ibans=["LT121000011101001000", spelling],
                         amount="250.00", currency="EUR",
@@ -1651,7 +1873,7 @@ class TestEveryHashInAUrlIsChecked(unittest.TestCase):
                  "transfer_hash": "../../transfers/OTHER"}
             )
             with mock.patch.object(cp, "http_json", spy):
-                blocking, _ = cp.find_blocking("INV-1", token="t")
+                blocking, _, _ = cp.find_blocking("INV-1", token="t")
         self.assertEqual(calls, [], "a URL was built from the malformed row")
         self.assertEqual(len(blocking), 1, "the row must still block — fail safe")
         self.assertIn("malformed", blocking[0][3])
@@ -1784,7 +2006,7 @@ class TestRegisterStep(ScriptHarness, unittest.TestCase):
         self._create()
         second = self._create()
         self.assertEqual(second.returncode, 3)
-        self.assertIn("never REGISTERED", second.stdout)
+        self.assertIn("NOT REGISTERED", second.stdout)
         self.assertIn("--register-only HASH123", second.stdout)
         self.assertNotIn(
             "Use --force to override.", second.stdout,
@@ -2008,7 +2230,7 @@ class TestConcurrentRuns(ScriptHarness, unittest.TestCase):
             held = None
             with mock.patch.object(sys, "argv", argv), mock.patch.dict(
                 os.environ, {"PAYSERA_PAT": "t"}
-            ), mock.patch.object(cp, "list_transfers", lambda *a, **k: []):
+            ), mock.patch.object(cp, "list_transfers", lambda *a, **k: ([], True)):
                 try:
                     cp.main()
                 except SystemExit as exit_:

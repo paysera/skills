@@ -1,5 +1,52 @@
 # Changelog
 
+## 1.8.6 (2026-08-14)
+
+Eighteenth review round.
+
+- **A `--no-register` draft made the next run recommend `--force`, which creates a second
+  signable draft.** `find_blocking()` recognised an unregistered draft by testing the
+  ledger's `registered` flag for `is False`. That is only one of the three ways a draft can
+  be unsignable: `--no-register` writes `None`, and rows written before 1.8.0 have no such
+  key. Both fell through to the generic "Use --force to override" — the exact opposite of
+  the remedy, and the double-payment condition 1.5.0/1.7.0/1.8.0 exist to remove. The live
+  status now decides it (`new` means not signable), with the ledger flag only as a
+  fallback, so all three cases point at `--register-only`.
+- **An incomplete live duplicate scan still printed an all-clear on stdout.** A failed page
+  and the 50-page cap both warn on **stderr** and then return a partial list; the caller
+  could not tell, and printed `No prior payments to those accounts in the period.` on
+  stdout. `list_transfers()` and `find_blocking()` now return a completeness flag, and the
+  summary reads `LIVE SCAN INCOMPLETE` instead. Same defect class as 1.7.1, 1.7.4 and
+  1.8.1: a partial check reporting as complete.
+- **The `0700` promise for `~/.config/paysera-payments/` was not kept on every run.** Only
+  `ledger_lock()` and `_write_ledger()` hardened the directory, and both run only with
+  `--invoice-id`; a dry run left it at the umask's `0755` while `SKILL.md` said otherwise.
+  `read_token()` now tightens it on every run — and, unlike the old path, never creates it,
+  so a dry run still leaves no trace.
+- **`--register-only` could exit 1 after the registration had succeeded.** `mark_registered()`
+  took the ledger lock, and the lock exits the process when another run holds it. Exit 1
+  contradicts the documented "every other non-zero code means nothing was created", and
+  invites a wrapper to retry. The ledger write is now non-fatal there and warns instead;
+  a run that is about to *create* is still stopped by a held lock.
+- **`_main()` reported a ledger record it had not made.** `update_ledger()` returns `False`
+  when the write-ahead row is gone (a hand edit, a `rm` mid-run); the return value was
+  discarded and `ledger : recorded for invoice …` printed regardless. The ledger is the
+  only guard against a second draft, so it now prints `NOT recorded` and warns on stderr.
+- **`cancel-payment.py` sent its failures to stdout** while `SKILL.md` promised stderr and
+  `create-payment.py` did that. Every message that makes the script exit non-zero now goes
+  to stderr; the per-transfer report stays on stdout.
+- **The publication gate scanned local directories nobody publishes.** A `.venv` or
+  `node_modules` in a contributor's checkout was scanned as published content, making the
+  documented local run slow and red on third-party code. `SKIP_DIRS` now covers the usual
+  ones — and because a skipped directory is a blind spot in a check that exists to stop
+  internal content going public, every name in it must also be in `.gitignore`, which a
+  test enforces.
+- `CONTRIBUTING.md` now documents `-p no:randomly`, which CI passes and the documented
+  command omitted, on a suite the same document says must not be shuffled.
+- Recorded the built-in timezone fallback's one known divergence from `zoneinfo` (the
+  non-existent 03:00–03:59 wall hour on the spring transition; nothing in this file can
+  reach it), and removed two unused imports.
+
 ## 1.8.5 (2026-08-13)
 
 Seventeenth review round.

@@ -12,7 +12,6 @@ import importlib.util
 import os
 import shutil
 import stat
-import sys
 import tempfile
 from pathlib import Path
 from unittest import mock

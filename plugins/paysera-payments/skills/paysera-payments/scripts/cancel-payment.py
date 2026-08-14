@@ -134,17 +134,24 @@ def main():
     rc = 0
     for h in args.hashes:
         if not TRANSFER_HASH.match(h):
-            print(f"{h!r}: not a valid transferHash (expected only A-Z a-z 0-9 _ -). Skipping.")
+            print(
+                f"{h!r}: not a valid transferHash (expected only A-Z a-z 0-9 _ -). "
+                f"Skipping.",
+                file=sys.stderr,
+            )
             rc = 1
             continue
         try:
             http, doc = curl_json("GET", f"{TRANSFER_API}/{h}", token)
         except HttpError as e:
-            print(f"{h}: cannot read — {e}. Skipping (nothing was cancelled).")
+            print(
+                f"{h}: cannot read — {e}. Skipping (nothing was cancelled).",
+                file=sys.stderr,
+            )
             rc = 1
             continue
         if http != "200" or not isinstance(doc, dict) or not doc.get("id"):
-            print(f"{h}: cannot read (HTTP {http}) — {str(doc)[:160]}")
+            print(f"{h}: cannot read (HTTP {http}) — {str(doc)[:160]}", file=sys.stderr)
             rc = 1
             continue
         st = doc.get("status")
@@ -163,14 +170,17 @@ def main():
         try:
             dhttp, dres = curl_json("DELETE", f"{TRANSFER_API}/{h}", token)
         except HttpError as e:
-            print(f"  -> FAILED — {e}. State unknown; re-check before retrying.")
+            print(
+                f"  -> FAILED — {e}. State unknown; re-check before retrying.",
+                file=sys.stderr,
+            )
             rc = 1
             continue
         if dhttp in ("200", "204"):
             new_st = dres.get("status") if isinstance(dres, dict) else None
             print(f"  -> CANCELED (HTTP {dhttp}){f', status={new_st}' if new_st else ''}")
         else:
-            print(f"  -> FAILED (HTTP {dhttp}) — {str(dres)[:200]}")
+            print(f"  -> FAILED (HTTP {dhttp}) — {str(dres)[:200]}", file=sys.stderr)
             rc = 1
     sys.exit(rc)
 
