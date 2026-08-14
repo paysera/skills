@@ -54,9 +54,14 @@ Scopes on the token: `accounts:read`, `transfers:read`, `transfers:create`,
 
 - **Python 3.8+** and **`curl`** on `PATH`. If curl is missing or a request times out
   (30 s), the tool says so on stderr rather than treating it as an empty API response.
-  Both scripts keep the split: stdout carries the report, and **every message that makes
-  the run exit non-zero goes to stderr**, so a caller that keeps only one stream never
-  reads a failure as a result.
+  The two scripts split their streams differently, on purpose. In `cancel-payment.py`
+  **every message that makes it exit non-zero is on stderr**, and stdout is only the
+  per-transfer report. `create-payment.py` puts its *decisions* on **stdout** — the
+  duplicate `SKIP` block behind `exit 3`, including the `--register-only` remedy, and the
+  `FAILED (HTTP …)` body behind `exit 1` — because those are results to read, not
+  transport trouble; stderr carries the warnings and the not-signable notice.
+  **So: read create's stdout.** Discarding it and keeping stderr alone loses the reason
+  the run stopped.
 - **`tzdata`** (Python 3.9+ ships `zoneinfo`; slim containers often omit the tz database).
   Scheduling is done in Europe/Vilnius, because that day boundary decides whether a
   transfer is signable in the mobile app. Without tzdata the tool falls back to a built-in

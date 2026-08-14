@@ -731,11 +731,37 @@ class TestListTransfers(unittest.TestCase):
         self.assertTrue(err.write.called, "an incomplete dup-check must announce itself")
 
     def test_transfer_items_accepts_the_shapes_the_api_returns(self):
-        self.assertEqual(cp._transfer_items([{"id": "a"}]), [{"id": "a"}])
-        self.assertEqual(cp._transfer_items({"items": [{"id": "a"}]}), [{"id": "a"}])
-        self.assertEqual(cp._transfer_items({"transfers": [{"id": "a"}]}), [{"id": "a"}])
-        self.assertEqual(cp._transfer_items({"unexpected": 1}), [])
-        self.assertEqual(cp._transfer_items(None), [])
+        self.assertEqual(cp._transfer_items([{"id": "a"}]), ([{"id": "a"}], True))
+        self.assertEqual(cp._transfer_items({"items": [{"id": "a"}]}), ([{"id": "a"}], True))
+        self.assertEqual(cp._transfer_items({"transfers": [{"id": "a"}]}), ([{"id": "a"}], True))
+        self.assertEqual(cp._transfer_items({"data": [{"id": "a"}]}), ([{"id": "a"}], True))
+
+    def test_an_empty_page_is_recognised_but_an_unknown_shape_is_not(self):
+        # Both used to be `[]`, and list_transfers ends its walk on an empty page and
+        # calls the scan complete — so a renamed container key became a silent all-clear.
+        for empty in ([], {}, {"items": []}):
+            with self.subTest(shape=empty):
+                self.assertEqual(cp._transfer_items(empty), ([], True))
+        for unknown in ({"unexpected": 1}, None, "surprise", 7):
+            with self.subTest(shape=unknown):
+                self.assertEqual(cp._transfer_items(unknown), ([], False))
+
+    def test_an_unrecognised_page_shape_makes_the_scan_incomplete(self):
+        with mock.patch.object(cp, "http_json", return_value=("200", {"unexpected": 1})):
+            with mock.patch.object(sys, "stderr", io.StringIO()) as err:
+                items, complete = cp.list_transfers("tok", "EVP1", 0)
+        self.assertEqual(items, [])
+        self.assertFalse(complete, "an all-clear this scan did not earn")
+        self.assertIn("INCOMPLETE", err.getvalue())
+        self.assertIn("does not recognise", err.getvalue())
+
+    def test_a_genuinely_empty_page_is_still_a_complete_scan(self):
+        with mock.patch.object(cp, "http_json", return_value=("200", {"items": []})):
+            with mock.patch.object(sys, "stderr", io.StringIO()) as err:
+                items, complete = cp.list_transfers("tok", "EVP1", 0)
+        self.assertEqual(items, [])
+        self.assertTrue(complete)
+        self.assertEqual(err.getvalue(), "", "an ordinary empty result must not warn")
 
 
 class TestCurrencyAwareDuplicateMatch(unittest.TestCase):
@@ -1211,6 +1237,62 @@ class TestAnIncompleteLiveScanDoesNotReadAsAnAllClear(ScriptHarness, unittest.Te
             _, _, complete = cp.find_blocking("INV-NONE", token="t")
         self.assertFalse(complete)
 
+    def test_a_truncated_scan_that_found_rows_still_says_it_is_incomplete(self):
+        # 1.8.6 put the note in an `elif`, so only the EMPTY case could reach it. A scan
+        # that lost a page and still returned rows printed the found-list with nothing
+        # said about the truncation, and the operator reviewed a partial list believing
+        # it covered the period.
+        # A FULL first page, so the walk asks for a second one — a short page is an honest
+        # end and would leave the scan complete. The second page then fails. None of the
+        # rows blocks (wrong amount, purpose does not quote the invoice), so the run
+        # reaches the summary instead of stopping at SKIP.
+        rows = ",".join(
+            '{"id":"T%d","status":"done","amount":{"amount":"5.00","currency":"EUR"},'
+            '"beneficiary":{"bank_account":{"iban":"LT121000011101001000"}},'
+            '"purpose":{"details":"something else"}}' % i
+            for i in range(100)
+        )
+        self.write_stub(
+            'case "$*" in\n'
+            '  *offset=0*) printf \'{"items":[%s]}\\nHTTP:200\';;\n'
+            '  *credit_account_number*) printf \'{}\\nHTTP:500\';;\n'
+            '  *) printf \'{"id":"HASH123","status":"new"}\\nHTTP:201\';;\n'
+            "esac" % rows
+        )
+        out = self.run_script(
+            "--amount", "10.00", "--invoice-id", "INV-PARTIAL", "--confirm"
+        )
+        self.assertIn("Found 100 prior payment(s)", out.stdout, "the rows are still shown")
+        self.assertIn("LIVE SCAN INCOMPLETE", out.stdout)
+
+    def test_the_incomplete_note_does_not_contradict_the_skip_below_it(self):
+        # It is printed directly above the SKIP block, which is where LEDGER matches are
+        # listed. A line claiming the ledger found nothing, immediately above a SKIP whose
+        # source is the ledger, undercuts the one thing standing between the operator and
+        # a second payment.
+        self.write_stub(
+            'case "$*" in\n'
+            '  *credit_account_number*) printf \'{}\\nHTTP:500\';;\n'
+            '  *) printf \'{"id":"HASH123","status":"registered"}\\nHTTP:200\';;\n'
+            "esac"
+        )
+        os.makedirs(os.path.dirname(self.ledger_path), exist_ok=True)
+        with open(self.ledger_path, "w") as f:
+            json.dump(
+                [{
+                    "invoice_id": "INV-BOTH",
+                    "transfer_hash": "HASH123",
+                    "state": "created",
+                    "registered": True,
+                }],
+                f,
+            )
+        out = self.run_script("--amount", "10.00", "--invoice-id", "INV-BOTH", "--confirm")
+        self.assertEqual(out.returncode, 3)
+        self.assertIn("LIVE SCAN INCOMPLETE", out.stdout)
+        self.assertIn("[ledger]", out.stdout, "the ledger match is listed below it")
+        self.assertNotIn("ledger found nothing", out.stdout)
+
     def test_the_marker_printed_is_the_one_the_documentation_names(self):
         # A message the operator is told to look for, spelled differently in the two
         # places, is the same failure as not printing it at all.
@@ -1218,6 +1300,51 @@ class TestAnIncompleteLiveScanDoesNotReadAsAnAllClear(ScriptHarness, unittest.Te
         skill = (SCRIPTS.parent / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn("LIVE SCAN INCOMPLETE", source)
         self.assertIn("LIVE SCAN INCOMPLETE", skill)
+
+
+class TestTheStreamContractIsTheOneTheScriptKeeps(ScriptHarness, unittest.TestCase):
+    """1.8.6 wrote a stderr contract into SKILL.md that only cancel-payment.py keeps.
+
+    "every message that makes the run exit non-zero goes to stderr" is false for
+    create-payment.py, and deliberately so: exit 3 and exit 1 are decisions to read, not
+    transport trouble, and their reasons — including the --register-only remedy that has
+    to win against --force — are on stdout. A caller that believed the sentence and kept
+    stderr alone would lose exactly that. The contract is pinned here in both directions.
+    """
+
+    def test_the_duplicate_reason_is_on_stdout(self):
+        self.write_stub(
+            'case "$*" in\n'
+            '  *credit_account_number*) printf \'{"items":[]}\\nHTTP:200\';;\n'
+            '  *) printf \'{"id":"HASH123","status":"new"}\\nHTTP:201\';;\n'
+            "esac"
+        )
+        self.run_script("--amount", "10.00", "--invoice-id", "INV-DUP", "--confirm")
+        out = self.run_script("--amount", "10.00", "--invoice-id", "INV-DUP", "--confirm")
+        self.assertEqual(out.returncode, 3)
+        self.assertIn("SKIP — this invoice looks already paid", out.stdout)
+        self.assertIn("matched because", out.stdout)
+
+    def test_the_failure_body_is_on_stdout(self):
+        self.write_stub(
+            'case "$*" in\n'
+            '  *credit_account_number*) printf \'{"items":[]}\\nHTTP:200\';;\n'
+            '  *) printf \'{"error":"refused"}\\nHTTP:400\';;\n'
+            "esac"
+        )
+        out = self.run_script("--amount", "10.00", "--invoice-id", "INV-FAIL", "--confirm")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("FAILED (HTTP 400)", out.stdout)
+
+    def test_the_documentation_does_not_promise_otherwise(self):
+        # The sentence this replaced claimed the stderr rule for BOTH scripts.
+        skill = (SCRIPTS.parent / "SKILL.md").read_text(encoding="utf-8")
+        collapsed = " ".join(skill.split())
+        self.assertNotIn(
+            "Both scripts keep the split", collapsed,
+            "SKILL.md is claiming a contract create-payment.py does not keep",
+        )
+        self.assertIn("read create's stdout", collapsed.lower())
 
 
 class TestThePromisesAboutTheConfigDirectory(ScriptHarness, unittest.TestCase):
@@ -1282,6 +1409,34 @@ class TestTheLedgerIsOnlyReportedWhenItWasWritten(ScriptHarness, unittest.TestCa
         self.assertIn("NOT recorded", out.stdout)
         self.assertNotIn("ledger           : recorded", out.stdout)
         self.assertIn("will NOT be blocked", out.stderr)
+
+    def test_a_vanished_row_after_an_unanswered_post_does_not_promise_a_block(self):
+        # The `unknown` row is the only record that a draft MAY exist on the server, and
+        # the message promises later runs will refuse because of it. With the row gone
+        # that is false — and this branch discarded update_ledger's answer until 1.8.7.
+        self.write_stub(
+            'case "$*" in\n'
+            '  *credit_account_number*) printf \'{"items":[]}\\nHTTP:200\';;\n'
+            '  *) echo "[]" > %s; printf \'{"error":"gateway"}\\nHTTP:502\';;\n'
+            "esac" % self.ledger_path
+        )
+        out = self.run_script("--amount", "10.00", "--invoice-id", "INV-LOST", "--confirm")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("CHECK THE PAYSERA APP", out.stderr)
+        self.assertIn("will NOT be blocked", out.stderr)
+        self.assertNotIn("further runs will refuse", out.stderr)
+
+    def test_an_unanswered_post_that_did_record_still_promises_the_block(self):
+        self.write_stub(
+            'case "$*" in\n'
+            '  *credit_account_number*) printf \'{"items":[]}\\nHTTP:200\';;\n'
+            '  *) printf \'{"error":"gateway"}\\nHTTP:502\';;\n'
+            "esac"
+        )
+        out = self.run_script("--amount", "10.00", "--invoice-id", "INV-KEPT", "--confirm")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("further runs will refuse", out.stderr)
+        self.assertEqual(self.read_ledger()[0]["state"], "unknown")
 
     def test_an_ordinary_run_still_says_recorded(self):
         self.write_stub(

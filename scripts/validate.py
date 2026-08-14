@@ -33,6 +33,14 @@ SKIP_DIRS = {
     ".vscode",
 }
 
+# The same rule for individual files. Review working notes sit at the repository root
+# while a change is in flight, and they are exactly the kind of writing this gate is built
+# to reject — round numbers that read as ticket keys, internal process, host names under
+# discussion. They are never published, so scanning them only makes the local run that
+# CONTRIBUTING.md documents red for a file that cannot reach anybody. Same condition as
+# SKIP_DIRS: each name is in .gitignore, and test_validate.py enforces the pairing.
+SKIP_FILES = {"REVIEW.md", "REFUSE.md"}
+
 # Published content may only reference Paysera hosts a client can actually reach.
 # This is an allowlist on purpose: naming the hosts that are *not* public would
 # put them in this repository, which is exactly what the check exists to prevent.
@@ -234,7 +242,12 @@ def published_files():
     for path in sorted(ROOT.rglob("*")):
         if not path.is_file() or path.suffix.lower() not in PUBLISHED_SUFFIXES:
             continue
-        if any(part in SKIP_DIRS for part in path.relative_to(ROOT).parts):
+        rel = path.relative_to(ROOT)
+        if any(part in SKIP_DIRS for part in rel.parts):
+            continue
+        # Only at the repository root: a file named REVIEW.md *inside* a plugin would be
+        # shipped by `claude plugin install` and must still be scanned.
+        if len(rel.parts) == 1 and rel.name in SKIP_FILES:
             continue
         yield path
 

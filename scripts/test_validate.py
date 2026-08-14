@@ -566,12 +566,37 @@ class TestNothingPublishableCanHideInASkippedDirectory(unittest.TestCase):
             f"there unseen: {sorted(unpaired)}",
         )
 
+    def test_every_skipped_file_is_git_ignored(self):
+        unpaired = set(validate.SKIP_FILES) - self._ignored_names()
+        self.assertEqual(
+            unpaired,
+            set(),
+            f"in SKIP_FILES but not in .gitignore, so it could be committed and then "
+            f"published without ever being scanned: {sorted(unpaired)}",
+        )
+
     def test_the_pairing_check_can_fail(self):
-        # Without this, a .gitignore that happened to list everything would make the test
-        # above pass for a reason unrelated to what it claims to check.
+        # Without this, a .gitignore that happened to list everything would make the two
+        # tests above pass for a reason unrelated to what they claim to check.
         with mock.patch.object(validate, "SKIP_DIRS", validate.SKIP_DIRS | {"secrets"}):
             with self.assertRaises(AssertionError):
                 self.test_every_skipped_directory_is_git_ignored()
+        with mock.patch.object(validate, "SKIP_FILES", validate.SKIP_FILES | {"notes.md"}):
+            with self.assertRaises(AssertionError):
+                self.test_every_skipped_file_is_git_ignored()
+
+    def test_a_skipped_file_is_skipped_at_the_root_only(self):
+        # A REVIEW.md inside a plugin ships with `claude plugin install`, so it is
+        # published content and must still be scanned. Only the root copy is a working
+        # note. Skipping by bare name everywhere would be a hole with a plausible name.
+        root = Path(tempfile.mkdtemp(prefix="paysera-skipfile-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        (root / "REVIEW.md").write_text("scratch\n", encoding="utf-8")
+        (root / "plugins" / "p").mkdir(parents=True)
+        (root / "plugins" / "p" / "REVIEW.md").write_text("shipped\n", encoding="utf-8")
+        with mock.patch.object(validate, "ROOT", root):
+            found = {str(p.relative_to(root)) for p in validate.published_files()}
+        self.assertEqual(found, {os.path.join("plugins", "p", "REVIEW.md")})
 
     def test_a_skipped_directory_is_actually_skipped(self):
         # And that the skip works on a nested path, not only a top-level one.

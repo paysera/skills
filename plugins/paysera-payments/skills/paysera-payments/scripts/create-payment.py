@@ -646,23 +646,33 @@ def append_ledger(entry):
 
 
 def _transfer_items(doc):
-    """Extract the list of transfer rows from a GET /transfers response, robust to the
-    container key (items / transfers / a bare list)."""
+    """Return (rows, recognised) for a GET /transfers response.
+
+    Robust to the container key (items / transfers / a bare list). `recognised` is False
+    when none of them is there — which is NOT the same as a page with no rows, though this
+    returned `[]` for both until 1.8.7. list_transfers() ends its walk on an empty page and
+    calls the scan complete, so an API that renamed its container key turned the live half
+    of the duplicate check into a silent all-clear. An empty dict is the answer a filter
+    with no matches gives, so it counts as recognised; anything else does not.
+    """
     if isinstance(doc, list):
-        return doc
+        return doc, True
     if isinstance(doc, dict):
         for key in ("items", "transfers", "data"):
             if isinstance(doc.get(key), list):
-                return doc[key]
-    return []
+                return doc[key], True
+        if not doc:
+            return [], True
+    return [], False
 
 
 def list_transfers(token, payer_account, created_from, max_pages=50):
     """List the payer account's OUTGOING transfers since `created_from` (epoch) via
     the `GET /transfers` filter (added 2026-06-18), with OFFSET pagination so a
-    busy account is NOT capped at the default page size. Returns [] on any
-    error/unknown shape so the caller falls back to the ledger check rather than
-    crashing.
+    busy account is NOT capped at the default page size. Returns (rows, complete):
+    on any error or unrecognised shape the rows are whatever was read so far and
+    `complete` is False, so the caller falls back to the ledger check and SAYS SO,
+    rather than crashing or reporting an all-clear it did not earn.
 
     DIRECTION PARAM (fixed 2026-07-08): the API uses ACCOUNTING semantics —
     `credit_account_number=X` returns transfers where X is the PAYER (outgoing;
@@ -713,7 +723,17 @@ def list_transfers(token, payer_account, created_from, max_pages=50):
                 file=sys.stderr,
             )
             break
-        page_items = _transfer_items(doc)
+        page_items, recognised = _transfer_items(doc)
+        if not recognised:
+            complete = False
+            print(
+                f"WARNING: live duplicate check INCOMPLETE — page {page + 1} came back "
+                f"200 in a shape this tool does not recognise (no items/transfers/data "
+                f"list). The API may have changed. Falling back to the ledger only; a "
+                f"duplicate made in the Paysera app may not be detected.",
+                file=sys.stderr,
+            )
+            break
         if not page_items:
             break
         for t in page_items:
@@ -1770,20 +1790,24 @@ def _main(guard):
             f"{len(set(_norm_iban(i) for i in candidate_ibans))} beneficiary account(s) "
             f"{period}."
         )
+        # Unconditional, and BEFORE the list: a truncated scan that still returned rows is
+        # exactly as incomplete as one that returned none, and 1.8.6 put this in an `elif`
+        # where only the empty case could reach it. It also says nothing about the ledger —
+        # ledger matches are printed below, in the SKIP block, and a line claiming "the
+        # ledger found nothing" directly above one would undercut the only thing standing
+        # between the operator and a second payment.
+        if not live_complete:
+            print(
+                "  LIVE SCAN INCOMPLETE — the live transfer list could not be read in "
+                "full (see the WARNING on stderr). Anything below is a PARTIAL view of "
+                "the period: a payment made in the Paysera app may exist and not appear."
+            )
         if seen:
             print(f"  Found {len(seen)} prior payment(s) to those accounts — review:")
             for h, st, amt, ib, purp in seen:
                 print(f"    {amt} -> {ib}  status={st}  {h}\n      purpose: {purp[:120]}")
-        elif not live_complete:
-            # "Nothing found" and "could not look" are different answers, and this line is
-            # the one a log or an agent reads. The reason is on stderr, next to the
-            # WARNING that explains which page failed.
-            print(
-                "  LIVE SCAN INCOMPLETE — the ledger found nothing, but the live list "
-                "could not be read in full (see the WARNING on stderr). A payment made "
-                "in the Paysera app may exist and be invisible here."
-            )
-        else:
+        elif live_complete:
+            # Only a scan that actually read the whole window may say this.
             print("  No prior payments to those accounts in the period.")
         if blocking:
             print(f"SKIP — this invoice looks already paid ('{args.invoice_id}'):")
@@ -2092,9 +2116,27 @@ def _main(guard):
         definitely_not_created = code.isdigit() and 400 <= int(code) < 500
         if args.invoice_id:
             if definitely_not_created:
+                # Return value deliberately unused: this row exists to say "safe to
+                # retry", so a run that cannot find it is in the state the row would
+                # have described anyway. Nothing blocks, and nothing should.
                 update_ledger(attempt_id, state="failed", http_code=code)
+            elif not update_ledger(attempt_id, state="unknown", http_code=code):
+                # The `unknown` row is the ONLY record that a draft may exist on the
+                # server, and the message below promises that later runs will refuse
+                # because of it. With the row gone that promise is false, and the
+                # operator has no reason to go and look in the app.
+                print(
+                    f"\nWARNING: it is NOT known whether the transfer was created — the "
+                    f"request failed with '{code}' after being sent — AND the ledger row "
+                    f"for this run is gone, so nothing recorded it.\n"
+                    f"  A draft may exist on the server. GET /transfers does NOT list "
+                    f"unsigned drafts, so this tool cannot check for you.\n"
+                    f"  CHECK THE PAYSERA APP for a draft to '{args.beneficiary_name}' "
+                    f"for {args.amount} {currency} before retrying. Later runs for this "
+                    f"invoice will NOT be blocked — there is nothing left to block them.",
+                    file=sys.stderr,
+                )
             else:
-                update_ledger(attempt_id, state="unknown", http_code=code)
                 print(
                     f"\nWARNING: it is NOT known whether the transfer was created — the "
                     f"request failed with '{code}' after being sent.\n"

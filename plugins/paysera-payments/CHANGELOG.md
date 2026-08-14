@@ -1,5 +1,42 @@
 # Changelog
 
+## 1.8.7 (2026-08-14)
+
+Nineteenth review round. Four of the six findings are on 1.8.6's own changes.
+
+- **A truncated live scan that still returned rows reported as complete.** 1.8.6 put the
+  `LIVE SCAN INCOMPLETE` note in an `elif`, so only the empty case could reach it; a scan
+  that lost a page or hit the 50-page cap and still found rows printed the found-list with
+  nothing said about the truncation. The note is now unconditional and printed *before*
+  the list, so a partial view is labelled as one.
+- **That note claimed the ledger had found nothing** — but it is printed directly above the
+  `SKIP` block, which is where ledger matches are listed. Two stdout lines could disagree
+  about the ledger, and the `SKIP` is the line that stops a second payment. The note now
+  says only what it knows: the live list could not be read in full.
+- **A 200 response in an unrecognised shape read as a complete, empty scan.**
+  `_transfer_items()` returned `[]` both for a page with no rows and for a body with no
+  `items`/`transfers`/`data` list, and `list_transfers()` ends its walk on an empty page.
+  An API that renamed its container key would have turned the live half of the duplicate
+  check into a silent all-clear. It now returns `(rows, recognised)`, and an unrecognised
+  shape warns on stderr and marks the scan incomplete. An empty object still counts as an
+  honest empty result.
+- **`SKILL.md`'s new stderr contract was not true for `create-payment.py`.** 1.8.6 wrote
+  "both scripts … every message that makes the run exit non-zero goes to stderr". That
+  holds for `cancel-payment.py`; `create-payment.py` puts its *decisions* on stdout — the
+  duplicate `SKIP` block behind `exit 3`, including the `--register-only` remedy, and the
+  `FAILED (HTTP …)` body behind `exit 1`. A caller that believed the sentence and kept
+  stderr alone would lose exactly those. The documentation now describes each script's
+  split as it is, and tests pin it in both directions.
+- **`update_ledger()`'s result was still discarded after an unanswered POST.** The
+  `unknown` row is the only record that a draft may exist on the server, and the message
+  promises later runs will refuse because of it. With the row gone that promise was false.
+  The failure path now tests the write like the success path does and says so instead.
+- **The publication gate failed on untracked working files at the repository root.** The
+  1.8.6 argument — untracked means never published, so it need not be scanned — was applied
+  to directories only. `SKIP_FILES` extends it to review notes (`REVIEW.md`, `REFUSE.md`),
+  paired with `.gitignore` under the same enforced rule, and only at the root: a `REVIEW.md`
+  inside a plugin ships with `claude plugin install` and is still scanned.
+
 ## 1.8.6 (2026-08-14)
 
 Eighteenth review round.

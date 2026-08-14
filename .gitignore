@@ -1,6 +1,11 @@
-# Every directory name in validate.py's SKIP_DIRS must be listed here. The gate does not
-# scan those directories, so anything inside one is invisible to the publication check —
-# keeping them untracked is what makes that safe. test_validate.py enforces the pairing.
+# Every name in validate.py's SKIP_DIRS and SKIP_FILES must be listed here. The gate does
+# not scan them, so anything there is invisible to the publication check — keeping them
+# untracked is what makes that safe. test_validate.py enforces the pairing.
+#
+# Review working notes, kept beside the checkout while a change is in flight:
+/REVIEW.md
+/REFUSE.md
+
 __pycache__/
 *.pyc
 .pytest_cache/
