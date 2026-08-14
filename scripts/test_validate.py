@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -547,6 +548,72 @@ class TestTheLeakCheckItself(unittest.TestCase):
         finally:
             _TEMPBOX.update(saved)
         self.assertIn("disarmed", str(raised.exception))
+
+
+class TestTheTwoCopiesOfTheLeakCheckAgree(unittest.TestCase):
+    """CONTRIBUTING.md: "if you change one, change the other, and keep all three redirects
+    in both."
+
+    That rule was prose only, and the copies drifted anyway — the plugin copy went two
+    rounds checking three environment variables while this one checked four. Reading the
+    plugin file from here is allowed in this direction: a plugin must never depend on a
+    repository file, but a repository test may look at a plugin, and it is the only place
+    the two can be compared at all.
+    """
+
+    REPO_ROOT = Path(__file__).resolve().parent.parent
+    PLUGIN_SUPPORT = (
+        REPO_ROOT
+        / "plugins/paysera-payments/skills/paysera-payments/scripts/_testsupport.py"
+    )
+
+    def _redirected_names(self, text):
+        # The keyword arguments of the os.environ.update(...) call that arms the sandbox.
+        match = re.search(r"os\.environ\.update\(([^)]*)\)", text)
+        self.assertIsNotNone(match, "no os.environ.update(...) found — copy restructured?")
+        return set(re.findall(r"(\w+)\s*=", match.group(1)))
+
+    def test_both_copies_redirect_the_same_environment_variables(self):
+        mine = self._redirected_names(Path(__file__).read_text(encoding="utf-8"))
+        theirs = self._redirected_names(self.PLUGIN_SUPPORT.read_text(encoding="utf-8"))
+        self.assertEqual(
+            mine,
+            theirs,
+            "the two copies of the leak check redirect different variables; the one that "
+            "redirects fewer has a hole its own tests cannot see",
+        )
+        self.assertEqual(mine, {"TMPDIR", "TEMP", "TMP", "HOME"})
+
+    def test_both_copies_check_the_same_variables_in_their_full_cycle_test(self):
+        # The redirects agreeing is not enough: each copy also has a test that one
+        # setup/teardown cycle leaves the process as it found it, and THAT is where the
+        # drift actually was — the plugin copy asserted three variables while this one
+        # asserted four, for two rounds, with both suites green.
+        # The tuple must open with a quoted name: this file describes the pattern it looks
+        # for in its own failure message, and a looser regex matched that too — the same
+        # self-reference the gate has to avoid when checking its own documentation.
+        def keys_of(path):
+            found = re.findall(r'keys = \((\"[^)]*)\)', path.read_text(encoding="utf-8"))
+            self.assertEqual(len(found), 1, f"expected exactly one keys tuple in {path.name}")
+            return {k.strip().strip('"') for k in found[0].split(",") if k.strip()}
+
+        plugin_tests = self.PLUGIN_SUPPORT.parent / "test_create_payment.py"
+        self.assertEqual(
+            keys_of(Path(__file__)),
+            keys_of(plugin_tests),
+            "the two full-cycle tests check different variables; the one checking fewer "
+            "would not notice a teardown that stops restoring the rest",
+        )
+
+    def test_both_copies_capture_what_they_restore(self):
+        # Restoring fewer variables than it redirects leaves the next module — they share
+        # one process under pytest — pointed at a directory that no longer exists.
+        for label, path in (("repository", Path(__file__)), ("plugin", self.PLUGIN_SUPPORT)):
+            with self.subTest(copy=label):
+                text = path.read_text(encoding="utf-8")
+                captured = set(re.findall(r'for k in \(([^)]*)\)', text)[0].split(","))
+                captured = {c.strip().strip('"') for c in captured}
+                self.assertEqual(captured, self._redirected_names(text), label)
 
 
 class TestNothingPublishableCanHideInASkippedDirectory(unittest.TestCase):

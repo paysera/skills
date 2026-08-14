@@ -21,6 +21,7 @@ from unittest import mock
 # unittest from this directory, or a plain `python3 test_cancel_payment.py`).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import _testsupport  # noqa: E402  (for the sandbox's own tests)
 from _testsupport import (
     SCRIPTS,
     assert_tempdir_is_empty,
@@ -43,6 +44,67 @@ def setUpModule():
 
 
 tearDownModule = assert_tempdir_is_empty
+
+
+class TestThisModuleIsSandboxed(unittest.TestCase):
+    """The sandbox that stops this module chmodding the contributor's own directory.
+
+    This module has four in-process `read_token()` calls, and since 1.8.8 every one of them
+    hardens the directory named by DEFAULT_TOKEN_FILE. That constant is resolved by
+    expanduser() at IMPORT time, before any setUpModule runs, so redirecting HOME does not
+    move it — `redirect_config_paths(cancel)` does. Nothing here failed when that call was
+    removed, which made the 1.8.9 fix a line anyone could delete and still see green.
+    """
+
+    def test_home_is_redirected_for_this_module(self):
+        self.assertEqual(os.environ.get("HOME"), _testsupport._TEMPBOX.get("home"))
+        self.assertNotEqual(
+            os.environ.get("HOME"),
+            _testsupport._TEMPBOX["env"].get("HOME"),
+            "HOME is still the one the process started with",
+        )
+
+    def test_the_home_derived_constants_point_inside_the_sandbox(self):
+        # Driven off _HOME_DERIVED, not the name alone, so a name dropped from that tuple
+        # fails here. `checked` stops the loop passing vacuously.
+        home = _testsupport._TEMPBOX["home"]
+        checked = 0
+        for name in _testsupport._HOME_DERIVED:
+            if not hasattr(cancel, name):
+                continue
+            checked += 1
+            value = getattr(cancel, name)
+            self.assertTrue(
+                value.startswith(home),
+                f"{name}={value} is outside the sandbox HOME {home}",
+            )
+        self.assertEqual(
+            checked, 1,
+            "cancel-payment.py's only HOME-derived path is DEFAULT_TOKEN_FILE; if that "
+            "changed, or the name left _HOME_DERIVED, the sandbox no longer covers it",
+        )
+
+    def test_reading_the_token_hardens_only_the_sandbox_directory(self):
+        # The end-to-end proof: a config directory under a REAL-looking home is left
+        # alone, while the sandbox one is tightened.
+        outside = tempfile.mkdtemp(prefix="paysera-cancel-outside-")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        sentinel = os.path.join(outside, ".config", "paysera-payments")
+        os.makedirs(sentinel)
+        os.chmod(sentinel, 0o755)
+
+        sandbox = os.path.dirname(cancel.DEFAULT_TOKEN_FILE)
+        os.makedirs(sandbox, exist_ok=True)
+        self.addCleanup(shutil.rmtree, os.path.dirname(sandbox), ignore_errors=True)
+        os.chmod(sandbox, 0o755)
+
+        with mock.patch.dict(os.environ, {"PAYSERA_PAT": "a-token"}):
+            cancel.read_token("/nonexistent")
+        self.assertEqual(
+            stat.S_IMODE(os.stat(sentinel).st_mode), 0o755,
+            "this module reached outside its sandbox",
+        )
+        self.assertEqual(stat.S_IMODE(os.stat(sandbox).st_mode), 0o700)
 
 
 class TestTokenHandling(unittest.TestCase):

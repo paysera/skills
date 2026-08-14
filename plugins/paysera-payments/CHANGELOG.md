@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.8.10 (2026-08-14)
+
+Twenty-second review round. No Critical, High or Medium defect. Neither payment script
+changed; both findings are gaps in what protects the previous round's fix.
+
+- **Nothing failed if `test_cancel_payment.py` stopped sandboxing its config paths.**
+  1.8.9's fix has two parts — `HOME` redirected, and the import-time constants re-pointed
+  by `redirect_config_paths()`. Deleting the second call from that module's `setUpModule`
+  left the suite green while restoring the defect 1.8.9 closed: four in-process
+  `read_token()` calls chmodding the contributor's own directory again. This repository
+  treats a check that cannot fail as a defect in itself, and the new sandbox had no such
+  guard on the cancel side. Both modules now assert their constants point inside the
+  sandbox, driven off `_HOME_DERIVED` rather than a hard-coded name — so a name dropped
+  from that tuple fails too — with a count assertion so the loop cannot pass vacuously.
+  The cancel module also gains the end-to-end proof the create module already had: a
+  config directory outside the sandbox stays at `0755` while the one inside is tightened.
+- **The two copies of the leak check disagreed about `HOME`.** Both have a test that one
+  setup/teardown cycle leaves the process as it found it; the repository copy checked all
+  four variables, the plugin copy three. The behaviour was right — `assert_tempdir_is_empty()`
+  does restore `HOME` — but only one copy confirmed it, which is the copy-drift
+  `CONTRIBUTING.md` forbids. The plugin copy now checks all four, and asserts the `HOME`
+  redirect in its isolation test as the repository copy does.
+  The prose rule that the copies must agree is now also a test:
+  `TestTheTwoCopiesOfTheLeakCheckAgree` compares what each copy redirects, what each
+  captures for restoring, and what each full-cycle test asserts, and fails on any
+  divergence. The last of those was added after a mutation survived: comparing only the
+  redirects still let the plugin copy's `keys` tuple drift, which is where the drift
+  actually was.
+
 ## 1.8.9 (2026-08-14)
 
 Twenty-first review round. Both findings are on 1.8.8's own changes.

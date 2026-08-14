@@ -908,10 +908,26 @@ class TestTheSuiteReachesNothingOutsideItsSandbox(unittest.TestCase):
     def test_the_home_derived_constants_point_inside_the_sandbox(self):
         # Redirecting the variable is not enough: expanduser() runs at IMPORT time, before
         # any setUpModule, so a constant resolved then still names the real home.
+        #
+        # Driven off _HOME_DERIVED rather than naming LEDGER_FILE, so that dropping a name
+        # from that tuple fails here instead of silently un-sandboxing whatever used it.
+        # The `checked` count is what stops the loop passing vacuously — an empty tuple
+        # would otherwise be indistinguishable from a fully sandboxed module.
         home = _testsupport._TEMPBOX["home"]
-        self.assertTrue(
-            cp.LEDGER_FILE.startswith(home),
-            f"LEDGER_FILE={cp.LEDGER_FILE} is outside the sandbox HOME {home}",
+        checked = 0
+        for name in _testsupport._HOME_DERIVED:
+            if not hasattr(cp, name):
+                continue
+            checked += 1
+            value = getattr(cp, name)
+            self.assertTrue(
+                value.startswith(home),
+                f"{name}={value} is outside the sandbox HOME {home}",
+            )
+        self.assertEqual(
+            checked, 2,
+            "create-payment.py has DEFAULT_TOKEN_FILE and LEDGER_FILE; if that changed, "
+            "or a name left _HOME_DERIVED, the sandbox no longer covers what it did",
         )
 
     def test_reading_the_token_hardens_only_the_sandbox_directory(self):
@@ -978,9 +994,16 @@ class TestTheSuiteCleansUpAfterItself(unittest.TestCase):
         # $TMPDIR, so it reports the box either way and cannot see this half go missing.
         self.assertEqual(tempfile.tempdir, box, "this process still writes outside the box")
         # And the environment, because the end-to-end tests spawn subprocesses, which read
-        # that and not tempfile.tempdir. Both halves, or the check has a hole.
+        # that and not tempfile.tempdir. All three redirects, or the check has a hole.
         for key in ("TMPDIR", "TEMP", "TMP"):
             self.assertEqual(os.environ.get(key), box, key)
+        # HOME is a sibling of the box, not the box itself: the teardown requires the box
+        # to be EMPTY, and a home directory anything writes to would fail that check for
+        # the wrong reason. What matters is that it is not the contributor's real one.
+        self.assertEqual(os.environ.get("HOME"), _testsupport._TEMPBOX.get("home"))
+        self.assertNotEqual(
+            os.environ.get("HOME"), _testsupport._TEMPBOX["env"].get("HOME")
+        )
         made = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, made, ignore_errors=True)
         self.assertTrue(made.startswith(box))
@@ -988,7 +1011,11 @@ class TestTheSuiteCleansUpAfterItself(unittest.TestCase):
     def test_a_full_cycle_leaves_the_process_as_it_found_it(self):
         # Under pytest all three test modules share one process, so a teardown that does
         # not put TMPDIR back hands the next module a path that no longer exists.
-        keys = ("TMPDIR", "TEMP", "TMP")
+        # HOME included: the teardown restores it, and under pytest the three modules share
+        # one process, so a teardown that did not put it back would hand the next module a
+        # home directory that no longer exists. The repository copy has always checked all
+        # four; this one checked three, which is the copy-drift CONTRIBUTING.md forbids.
+        keys = ("TMPDIR", "TEMP", "TMP", "HOME")
         before = {k: os.environ.get(k) for k in keys}
         saved, prior_tempdir = dict(_testsupport._TEMPBOX), tempfile.tempdir
         try:
