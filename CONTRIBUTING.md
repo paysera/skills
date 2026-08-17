@@ -117,8 +117,14 @@ The tests are plain `unittest`, so they also run without pytest installed — wh
 CI double-checks them:
 
 ```bash
-for t in $(find plugins scripts -name 'test_*.py'); do python3 "$t"; done
+( for t in $(find plugins scripts -name 'test_*.py' | sort); do python3 "$t" || exit 1; done )
 ```
+
+`|| exit 1` is the part that makes it a check: a bare loop exits with the status of its
+LAST command, so a module that fails reports success whenever another module runs after
+it. `| sort` fixes the order, which `find` alone leaves to the filesystem. The outer
+`( … )` keeps the `exit` inside a subshell, so a failure ends the loop and not your
+shell. CI runs the same form, plus a count that fails if no test module was found at all.
 
 Tests are **required** for anything that moves money or decides whether a payment is a
 duplicate. CI fails if no tests are collected, so a green pipeline cannot be reached by

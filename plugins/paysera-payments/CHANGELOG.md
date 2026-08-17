@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.8.13 (2026-08-17)
+
+Twenty-fifth review round. Three findings, one of them the other half of the defect 1.8.12
+set out to close.
+
+- **`--due-date` resolved a `perform_at` the 366-day bound never saw.** 1.8.12 put the
+  bound inside `parse_perform_at()`, but `--due-date` computes a `perform_at` of its own
+  (the day before the due date) in `compute_schedule()` and went around it. The same
+  resolved date was refused through `--perform-at` and accepted in silence through
+  `--due-date`: a mistyped invoice year (`2926` for `2026`, one key away) became a signing
+  deadline nine hundred years out, and `perform_at` is what makes an unsigned draft
+  auto-cancel — so that draft would never expire by itself.
+  The bound now lives in `reject_too_far()` and is applied where every schedule option
+  meets, on the value `compute_schedule()` is about to return. Each branch names the option
+  that produced its epoch, so the message says which argument to look at. A test walks all
+  six spellings and fails if any one of them reaches a caller without passing the gate — the
+  point being that a sixth option added later cannot go around it the way the fourth did.
+  `--due-date`'s `--help` and `SKILL.md` now state the bound as well.
+- **Two `NOTE:` lines were on stdout while the branch beside them was on stderr.** "No
+  `--invoice-id` — duplicate check is OFF" sat on stdout while `--force`, which switches the
+  same guard off, announced itself on stderr; `--due-date`'s today/past fallback to ASAP sat
+  on stdout while `--today`'s identical fallback was on stderr. Both moved to stderr, where
+  this script's half of the stream contract puts a warning. Decisions — the exit-3 `SKIP`
+  block and the exit-1 `FAILED` body — are unchanged on stdout.
+- **The no-pytest command in `CONTRIBUTING.md` could not report a failure that was not
+  last.** A `for` loop exits with the status of its last command, and `find` left the order
+  to the filesystem, so a failing module reported success whenever another ran after it. The
+  guide now carries CI's form (`| sort`, `|| exit 1`, inside a subshell so a failure ends the
+  loop and not the contributor's shell). CI itself was already correct; nothing could reach
+  `main` on this.
+
 ## 1.8.12 (2026-08-14)
 
 Twenty-fourth review round. One finding, and the first in three rounds that is in a payment

@@ -59,7 +59,9 @@ Scopes on the token: `accounts:read`, `transfers:read`, `transfers:create`,
   per-transfer report. `create-payment.py` puts its *decisions* on **stdout** — the
   duplicate `SKIP` block behind `exit 3`, including the `--register-only` remedy, and the
   `FAILED (HTTP …)` body behind `exit 1` — because those are results to read, not
-  transport trouble; stderr carries the warnings and the not-signable notice.
+  transport trouble; stderr carries the warnings and the not-signable notice, and every
+  `NOTE:` — including the two that say a guard did not run (`--force`, and no
+  `--invoice-id`) and the ones that say the schedule was overridden to ASAP.
   **So: read create's stdout.** Discarding it and keeping stderr alone loses the reason
   the run stopped.
 - **`tzdata`** (Python 3.9+ ships `zoneinfo`; slim containers often omit the tz database).
@@ -296,7 +298,9 @@ soon you'll sign** and **where** (mobile vs web):
   seconds` is accepted too, and an extra digit is the usual way to get one wrong — that is
   what the bound is for.)
 - **`--due-date YYYY-MM-DD`** — after-fact invoice → `perform_at = due date − 1 day`. A
-  today/past `due − 1` falls back to ASAP.
+  today/past `due − 1` falls back to ASAP (announced on stderr). The 366-day bound applies
+  here too — it is checked on the resolved `perform_at`, so a mistyped invoice year
+  (`2926` for `2026`) is refused rather than booked as a signing deadline centuries out.
 - **`--advance`** — *sign-right-now* ASAP (*Išankstinis*) → **`perform_at` omitted**. ⚠️ The
   deadline is **immediate**: with `urgent` (EUR SEPA-Instant default) `max_execution_time ≈
   creation instant` (~0 s); with `normal` it's ~30 min. Mobile-visible, but you must sign on

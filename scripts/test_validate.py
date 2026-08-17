@@ -734,6 +734,30 @@ class TestNothingPublishableCanHideInASkippedDirectory(unittest.TestCase):
         )
         self.assertIn("The opposite direction is fine", doc)
 
+    def test_the_documented_no_pytest_command_can_actually_fail(self):
+        # The guide offers this as a pre-push check and says it is what CI runs. It was
+        # written as a bare `for` loop, which exits with the status of its LAST command:
+        # a failing module reported success whenever another one ran after it, and `find`
+        # left "after it" to the filesystem. A check that cannot fail is the failure mode
+        # this repository guards against everywhere else.
+        doc = " ".join(
+            (self.REPO_ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8").split()
+        )
+        loop = re.search(r"for t in \$\(find plugins scripts[^)]*\)[^`]*", doc)
+        self.assertIsNotNone(loop, "the no-pytest loop is no longer in the guide")
+        self.assertIn("|| exit 1", loop.group(0), "a bare loop cannot report a failure "
+                      "that is not last")
+        self.assertIn("| sort", loop.group(0), "unsorted, which module runs last is "
+                      "filesystem order")
+
+        # And that it is still the same command CI runs, not a form that drifted from it.
+        ci = " ".join(
+            (self.REPO_ROOT / ".github" / "workflows" / "validate.yml")
+            .read_text(encoding="utf-8").split()
+        )
+        for fragment in ("| sort", "|| exit 1"):
+            self.assertIn(fragment, ci)
+
     def test_the_contributing_guide_names_both_skip_mechanisms(self):
         # CONTRIBUTING.md's "what the check does and does not cover" section is the list a
         # reviewer is told to confirm by hand. A blind spot the list does not name cannot

@@ -278,6 +278,25 @@ def _safe_date(epoch):
     except (ValueError, OverflowError, OSError):
         return f"a date too far ahead to represent (epoch {epoch})"
 
+
+def reject_too_far(option, spec, epoch):
+    """The 366-day bound, applied to a RESOLVED epoch whatever option produced it.
+
+    It lives here, and not inside one option's parser, because perform_at has five
+    spellings and they must not drift apart: --perform-at was bounded first and
+    --due-date — which resolves a perform_at of its own, one day before the invoice
+    date — went around it. Every schedule path now passes its resolved value through
+    this one function (see compute_schedule).
+    """
+    if epoch is None or epoch <= int(time.time()) + MAX_PERFORM_AT_DAYS * 86400:
+        return
+    tail = f" {spec}" if spec else ""
+    sys.exit(
+        f"ERROR: {option}{tail} resolves to {_safe_date(epoch)}, which is more "
+        f"than {MAX_PERFORM_AT_DAYS} days ahead. perform_at is the signing deadline, "
+        f"not a reminder — check the value."
+    )
+
 # SEPA purpose-of-payment field max length (the API rejects longer with
 # 'details_too_long'). Used to trim long invoice purposes on a word boundary.
 PURPOSE_MAX = 140
@@ -1305,12 +1324,7 @@ def parse_perform_at(spec):
     # in this tool gets one sentence — or, one digit lower, was accepted in silence as a
     # signing deadline centuries away. YYYY-MM-DD is already bounded by strptime, and +Nh by
     # the midnight clamp above; this covers the other two.
-    if epoch > now + MAX_PERFORM_AT_DAYS * 86400:
-        sys.exit(
-            f"ERROR: --perform-at {spec} resolves to {_safe_date(epoch)}, which is more "
-            f"than {MAX_PERFORM_AT_DAYS} days ahead. perform_at is the signing deadline, "
-            f"not a reminder — check the value."
-        )
+    reject_too_far("--perform-at", spec, epoch)
     return epoch
 
 
@@ -1415,6 +1429,18 @@ _NO_WINDOW_LEFT = (
 
 
 def compute_schedule(args):
+    """Resolve perform_at + a display `mode`, bounding whatever option produced it.
+
+    The bound is applied HERE, where every schedule option meets, rather than in each
+    option's own parser: --perform-at was bounded in 1.8.12 and --due-date resolved a
+    perform_at that went around it. See reject_too_far.
+    """
+    epoch, mode, option, spec = _resolve_schedule(args)
+    reject_too_far(option, spec, epoch)
+    return epoch, mode
+
+
+def _resolve_schedule(args):
     """Resolve perform_at + a display `mode` from the chosen options.
 
     Regimes (re-measured live 2026-06-30):
@@ -1431,21 +1457,23 @@ def compute_schedule(args):
         it is mobile-signable. Both overridable via --today / --advance / --perform-at.
 
     Priority: --perform-at > --advance > --today > --due-date > context-aware default.
-    Returns (perform_at_epoch_or_None, mode). None => omit perform_at (ASAP).
+    Returns (perform_at_epoch_or_None, mode, option, spec). None => omit perform_at
+    (ASAP). `option`/`spec` name the schedule spelling that produced the epoch, so
+    compute_schedule can bound it and say which argument to look at.
     """
     # Vilnius, not UTC: parse_perform_at judges "is this date past?" the same way, and
     # between 21:00 and 24:00 UTC the two calendars disagree.
     today = _vilnius_today()
     if args.perform_at:
-        return parse_perform_at(args.perform_at), "scheduled"
+        return parse_perform_at(args.perform_at), "scheduled", "--perform-at", args.perform_at
     if args.advance:
-        return None, "asap"
+        return None, "asap", "--advance", ""
     if args.today:
         epoch = _end_of_today_epoch()
         if epoch is None:
             print(_NO_WINDOW_LEFT, file=sys.stderr)
-            return None, "asap"
-        return epoch, "today"
+            return None, "asap", "--today", ""
+        return epoch, "today", "--today", ""
     if args.due_date:
         try:
             due = datetime.datetime.strptime(args.due_date, "%Y-%m-%d").date()
@@ -1453,17 +1481,20 @@ def compute_schedule(args):
             sys.exit("ERROR: --due-date must be YYYY-MM-DD")
         pay_day = due - datetime.timedelta(days=1)
         if pay_day <= today:
-            print(f"NOTE: due-date {due} minus 1 day is today/past — paying ASAP instead.")
-            return None, "asap"
-        return _noon_epoch(pay_day), "scheduled"
+            print(
+                f"NOTE: due-date {due} minus 1 day is today/past — paying ASAP instead.",
+                file=sys.stderr,
+            )
+            return None, "asap", "--due-date", args.due_date
+        return _noon_epoch(pay_day), "scheduled", "--due-date", args.due_date
     # Context-aware default: invoice/bulk -> +30d web-bank window; ad-hoc/personal -> today.
     if args.invoice_id:
-        return parse_perform_at(None), "scheduled"  # +30d
+        return parse_perform_at(None), "scheduled", "the default schedule", ""  # +30d
     epoch = _end_of_today_epoch()
     if epoch is None:
         print(_NO_WINDOW_LEFT, file=sys.stderr)
-        return None, "asap"
-    return epoch, "today"
+        return None, "asap", "the default schedule", ""
+    return epoch, "today", "the default schedule", ""
 
 
 def main():
@@ -1519,7 +1550,9 @@ def _main(guard):
         "--due-date",
         default=None,
         help="Invoice due date YYYY-MM-DD (after-fact invoices). Money leaves (instantly, "
-        "on signing) at the latest one day before the due date.",
+        "on signing) at the latest one day before the due date. Bounded like "
+        f"--perform-at: a due date more than {MAX_PERFORM_AT_DAYS} days ahead is refused "
+        "(the day before it is the signing deadline, not a reminder).",
     )
     ap.add_argument(
         "--priority",
@@ -1882,7 +1915,12 @@ def _main(guard):
                 print("  Use --force to override.")
             sys.exit(3)
     elif not args.invoice_id:
-        print("NOTE: no --invoice-id given — duplicate check is OFF for this run.")
+        # Same class as the --force line below — a guard that did not run — so the same
+        # stream. A caller watching stderr for "a guard was skipped" must see both.
+        print(
+            "NOTE: no --invoice-id given — duplicate check is OFF for this run.",
+            file=sys.stderr,
+        )
     else:
         # --force with an invoice id. Every other bypass in this script announces itself;
         # disabling the primary double-payment guard must not be the quiet one.

@@ -452,6 +452,73 @@ class TestComputeSchedule(unittest.TestCase):
         with frozen_clock(cp, vilnius(2026, 8, 10, 9, 0)):
             self.assertEqual(cp.compute_schedule(self._args(due_date="2026-08-10"))[1], "asap")
 
+    def test_a_due_date_beyond_the_bound_is_refused_like_perform_at(self):
+        # 1.8.12 bounded --perform-at and left --due-date resolving a perform_at of its
+        # own around it: the same date was refused through one option and accepted in
+        # silence through the other. A mistyped invoice year (2926 for 2026, one key
+        # away) became a signing deadline nine hundred years out, and perform_at is what
+        # makes an unsigned draft auto-cancel — so that draft never expires by itself.
+        for due in ("2926-08-20", "9999-12-31", "2027-09-30"):
+            with self.subTest(due=due):
+                with frozen_clock(cp, vilnius(2026, 8, 10, 9, 0)):
+                    with self.assertRaises(SystemExit) as ctx:
+                        cp.compute_schedule(self._args(due_date=due))
+                message = str(ctx.exception)
+                self.assertIn("--due-date", message)
+                self.assertIn(due, message, "the message must name the value to look at")
+                self.assertIn("days ahead", message)
+
+    def test_a_due_date_just_inside_the_bound_is_accepted(self):
+        # The bound is on the resolved perform_at (due − 1 day), so the last accepted due
+        # date is one day past the boundary. Pinned so the guard cannot quietly tighten.
+        with frozen_clock(cp, vilnius(2026, 8, 10, 9, 0)):
+            due = datetime.date(2026, 8, 10) + datetime.timedelta(days=cp.MAX_PERFORM_AT_DAYS)
+            epoch, mode = cp.compute_schedule(self._args(due_date=due.isoformat()))
+        self.assertEqual(mode, "scheduled")
+        self.assertGreater(epoch, 0)
+
+    def test_every_schedule_spelling_goes_through_the_one_bound(self):
+        # The finding was not "--due-date is unbounded", it was "the bound sits inside one
+        # option's parser while five options resolve a perform_at". This pins the shape of
+        # the fix: every branch returns through compute_schedule's single gate, so a sixth
+        # spelling added later cannot go around it the way the fourth did.
+        seen = []
+        spellings = [
+            self._args(perform_at="+2d"),
+            self._args(advance=True),
+            self._args(today=True),
+            self._args(due_date="2026-08-20"),
+            self._args(invoice_id="INV-1"),
+            self._args(),
+        ]
+        for args in spellings:
+            with self.subTest(args=args):
+                del seen[:]
+                with mock.patch.object(cp, "reject_too_far", lambda *a: seen.append(a)):
+                    with frozen_clock(cp, vilnius(2026, 8, 10, 9, 0)):
+                        returned, _mode = cp.compute_schedule(args)
+                self.assertTrue(seen, "this branch skipped the bound")
+                # parse_perform_at bounds its own result as well, so --perform-at is seen
+                # twice; the LAST call is always compute_schedule's gate.
+                option, _spec, epoch = seen[-1]
+                self.assertEqual(
+                    epoch, returned, "the bound saw a value other than the one returned"
+                )
+                self.assertTrue(option, "the bound was given no option name to report")
+
+    def test_the_due_date_help_states_the_bound_too(self):
+        # The half of the 1.8.12 fix that was missed here as well: --due-date's help named
+        # no bound at all. A check the words around it do not mention is the defect this
+        # project has caught in itself more often than any other.
+        source = (SCRIPTS / "create-payment.py").read_text(encoding="utf-8")
+        start = source.rindex('"--due-date"')
+        help_text = source[start : source.index("ap.add_argument", start + 10)]
+        self.assertIn("MAX_PERFORM_AT_DAYS", help_text, "the help must quote the constant, "
+                      "not a number that can drift from it")
+
+        skill = " ".join((SCRIPTS.parent / "SKILL.md").read_text(encoding="utf-8").split())
+        self.assertIn(f"The {cp.MAX_PERFORM_AT_DAYS}-day bound applies here too", skill)
+
 
 class TestBeneficiarySelection(unittest.TestCase):
     PAYSERA = "LT603500010001234567"
@@ -1539,6 +1606,28 @@ class TestTheStreamContractIsTheOneTheScriptKeeps(ScriptHarness, unittest.TestCa
         out = self.run_script("--amount", "10.00", "--invoice-id", "INV-FAIL", "--confirm")
         self.assertEqual(out.returncode, 1)
         self.assertIn("FAILED (HTTP 400)", out.stdout)
+
+    def test_a_guard_that_did_not_run_says_so_on_stderr(self):
+        # The other half of the contract: decisions are on stdout, warnings on stderr, and
+        # "a guard was skipped" is a warning. --force announced itself on stderr while the
+        # branch beside it — no --invoice-id, which switches the same duplicate check off —
+        # announced itself on stdout, so a caller watching stderr for a disabled guard saw
+        # one bypass and not the other.
+        out = self.run_script("--amount", "10.00")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("duplicate check is OFF", out.stderr)
+        self.assertNotIn("duplicate check is OFF", out.stdout)
+
+    def test_a_schedule_overridden_to_asap_says_so_on_stderr(self):
+        # Same class, same asymmetry: --today's no-window fallback was on stderr and
+        # --due-date's today/past fallback on stdout. Both say the run did something other
+        # than what was asked for.
+        # The subprocess runs on the real clock, so the date has to come from the same one.
+        today = cp._vilnius_today().isoformat()
+        out = self.run_script("--amount", "10.00", "--due-date", today)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("paying ASAP instead", out.stderr)
+        self.assertNotIn("paying ASAP instead", out.stdout)
 
     def test_the_documentation_does_not_promise_otherwise(self):
         # The sentence this replaced claimed the stderr rule for BOTH scripts.
