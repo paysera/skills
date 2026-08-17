@@ -6,18 +6,65 @@ on:
   pull_request:
 
 jobs:
-  validate:
+  manifests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Validate marketplace and plugin manifests
+      - name: Validate manifests and scan published content
         run: python3 scripts/validate.py
+
+  tests:
+    # 3.8 is the minimum the skill claims to support, and the one configuration where
+    # the built-in timezone fallback actually runs (no zoneinfo). 3.11 is the modern
+    # path, where zoneinfo is used instead. Both must pass.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            python-version: '3.8'
+          - os: ubuntu-latest
+            python-version: '3.11'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Report which timezone implementation is in use
+        run: |
+          python3 - <<'PY'
+          import importlib.util, pathlib
+          p = pathlib.Path("plugins/paysera-payments/skills/paysera-payments/scripts/create-payment.py")
+          spec = importlib.util.spec_from_file_location("cp", p)
+          m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+          print("built-in Vilnius fallback in use:", m._VILNIUS_IS_FALLBACK)
+          PY
+
       - name: Run skill script tests
+        # No exit-5 tolerance: tests exist, so "nothing collected" is a failure, not a
+        # pass. A green pipeline must not be reachable by losing the tests.
         run: |
           pip install pytest
-          if [ -d plugins ]; then
-            pytest plugins -q || [ $? -eq 5 ]   # 5 = no tests collected yet
+          pytest plugins scripts -q -p no:randomly
+
+      - name: Run the same tests without pytest
+        # Not a duplicate of the step above: this proves the suite needs no third-party
+        # runner, so a contributor without pytest gets the same result. It also fails if
+        # the test files disappear entirely.
+        run: |
+          found=0
+          for t in $(find plugins scripts -name 'test_*.py' | sort); do
+            echo "--- $t"
+            python3 "$t" || exit 1
+            found=$((found + 1))
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "No test files found — refusing to report success." >&2
+            exit 1
           fi
+          echo "Ran $found test module(s)."

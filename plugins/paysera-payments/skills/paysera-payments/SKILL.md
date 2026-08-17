@@ -1,0 +1,546 @@
+---
+name: paysera-payments
+description: Create (draft) or cancel/delete a Paysera payment/transfer via the public Transfer API using a scoped Personal Access Token — the "do a payment / pay this invoice" action. Use when asked to create, cancel, or delete a payment, transfer, pavedimas, or mokėjimas on a configured Paysera account. Create is drafts-only — it does NOT sign/execute; signing happens in the Paysera app (2FA). Cancel/delete removes a live (unsigned) draft. Keywords — payment, transfer, pavedimas, mokėjimas, SEPA, invoice. Do NOT use for — diagnosing why an existing payment failed or is stuck, or handling a support ticket about one; contact Paysera support instead.
+---
+
+# Paysera Payments (create draft transfers)
+
+Register transfers on Paysera accounts via the public Transfer API, authenticated
+with the account-scoped `paysera-payments` Personal Access Token.
+
+**Important — drafts only.** The token has `transfers:create` and
+`transfers:cancel` but **not** `transfers:sign`. Every transfer this skill creates
+is a DRAFT and is **not executed**. The money moves only after the transfer is signed
+in the Paysera app (2FA), where your account's own per-company daily limits apply. This
+skill cannot send money on its own — by design. It can, however, cancel/delete its own
+unsigned drafts.
+
+**Create then register (visible for signing).** After creating a transfer (which lands
+in the validation-only `new` state, invisible everywhere), the tool calls
+`PUT /transfers/{hash}/register` so it shows up for **manual signing** in the Paysera
+app/UI. Without that register step (scope `transfers:create`) the draft stays invisible.
+Skip it with `--no-register`.
+
+If the register call **fails**, the transfer exists but cannot be seen or signed. The tool
+says so and exits **4** — distinct from `1` (nothing was created) because the remedies are
+opposite: `1` invites a retry, `4` must not, since the draft is already there. Finish it
+with the hash the run printed:
+
+```bash
+python3 ${CLAUDE_PLUGIN_ROOT}/skills/paysera-payments/scripts/create-payment.py \
+  --register-only <transferHash> --confirm
+```
+
+That creates nothing — it registers the draft you already have. It is also how to make a
+`--no-register` transfer signable later. **Do not** re-run the payment with `--force`:
+that creates a second draft instead of fixing the first. A later run for the same invoice
+is blocked as usual and points at this command.
+
+Exit codes: `0` fine · `1` nothing was created · `2` bad arguments, or a `--payer` outside
+the token's scoped accounts (argparse's own convention; nothing was created) · `3`
+duplicate, nothing created · `4` created but not registered (use `--register-only`).
+
+`cancel-payment.py` has its own: `0` every hash handled · `1` at least one could not be
+read or removed (the rest of the list still ran) · `2` bad arguments.
+
+Read `4` as its own outcome, not as a failure: a transfer exists. Every other non-zero code
+means nothing was created, and this list is exhaustive — a code outside it is a bug, not a
+result to interpret.
+
+Scopes on the token: `accounts:read`, `transfers:read`, `transfers:create`,
+`transfers:cancel` (each scoped to the accounts you configure below).
+
+## Requirements
+
+- **Python 3.8+** and **`curl`** on `PATH`. If curl is missing or a request times out
+  (30 s), the tool says so on stderr rather than treating it as an empty API response.
+  The two scripts split their streams differently, on purpose. In `cancel-payment.py`
+  **every message that makes it exit non-zero is on stderr**, and stdout is only the
+  per-transfer report. `create-payment.py` puts its *decisions* on **stdout** — the
+  duplicate `SKIP` block behind `exit 3`, including the `--register-only` remedy, and the
+  `FAILED (HTTP …)` body behind `exit 1` — because those are results to read, not
+  transport trouble; stderr carries the warnings and the not-signable notice, and every
+  `NOTE:` — including the two that say a guard did not run (`--force`, and no
+  `--invoice-id`) and the ones that say the schedule was overridden to ASAP.
+  **So: read create's stdout.** Discarding it and keeping stderr alone loses the reason
+  the run stopped.
+- **`tzdata`** (Python 3.9+ ships `zoneinfo`; slim containers often omit the tz database).
+  Scheduling is done in Europe/Vilnius, because that day boundary decides whether a
+  transfer is signable in the mobile app. Without tzdata the tool falls back to a built-in
+  EET/EEST rule and prints a note — correct under current EU DST rules, but install tzdata
+  if you want the authoritative zone.
+
+## Token
+
+- Stored at `~/.config/paysera-payments/token`, mode **`0600`**, local to your machine.
+  The scripts **refuse to run** if that file is readable by group or other and tell you to
+  `chmod 600` it — a token in a world-readable file is exposed to every local user of the
+  machine, permanently. Create it with a tight umask (see below), not with a plain `>`
+  redirect, which leaves mode `0644` under the usual `umask 022`.
+- Never passed on a command line. The scripts hand it to curl through stdin, because
+  command arguments are readable by any local user (`ps auxww`, `/proc/<pid>/cmdline`).
+- `jti` for revocation is in `~/.config/paysera-payments/jti.txt`.
+- Created against the public Personal Access Token API, authenticated with a
+  `bank.paysera.com` session bearer token (`$AUTH`):
+
+  The session token goes in on stdin, not in the command line (see "Checking a transfer
+  afterwards" for why):
+
+  ```bash
+  printf 'header = "Authorization: Bearer %s"\n' "$AUTH" |
+  curl -sS -K - -X POST \
+    "https://auth-api.paysera.com/personal-access-token/rest/v1/personal-access-tokens" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "name": "paysera-payments",
+      "resources": [
+        {"type": "accounts",  "scopes": [{"key": "read"}],   "context": {"account_number": "EVP0000000000001"}},
+        {"type": "transfers", "scopes": [{"key": "read"}, {"key": "create"}, {"key": "cancel"}],
+         "context": {"account_number": "EVP0000000000001"}}
+      ]
+    }'
+  ```
+
+  Save the returned token to `~/.config/paysera-payments/token` and the `jti` to
+  `~/.config/paysera-payments/jti.txt`. **The token value is not retrievable again** —
+  if lost, revoke it (see "Revoking the token") and create a new one.
+
+  Create the directory and the file with the right modes from the start — a `>` redirect
+  under the default `umask 022` produces a world-readable token, and tightening it
+  afterwards does not un-expose what was already readable:
+
+  ```bash
+  mkdir -p -m 700 ~/.config/paysera-payments
+  # (umask, not a bare `>`: the file must never exist at 0644 even momentarily)
+  ( umask 077 && cat > ~/.config/paysera-payments/token )   # paste the token, then Ctrl-D
+  chmod 700 ~/.config/paysera-payments
+  chmod 600 ~/.config/paysera-payments/token
+  ```
+
+  The scripts also keep `~/.config/paysera-payments/` itself at `0700` (it holds the
+  ledger, which lists IBANs, amounts and invoice numbers). Every run that reads the token
+  tightens it — a dry run too — but none of them *creates* it, so the `mkdir` above is
+  still yours to do.
+- Do **not** grant `transfers:sign`. Without it the skill physically cannot move money.
+
+## Scoped accounts (payer must be one of these)
+
+The PAT is scoped to a fixed set of accounts. Configure them in `create-payment.py` →
+`ALLOWED_ACCOUNTS` (the `EVP…` account_number, NOT the IBAN). **The label is the payer
+name the beneficiary sees on the transfer**, so replace the placeholder text too — the
+tool refuses to send a label still containing "example" or "replace me". Example:
+
+| account_number     | label                          |
+|--------------------|--------------------------------|
+| `EVP0000000000001` | Company A (example — replace)  |
+| `EVP0000000000002` | Company B (example — replace)  |
+
+The token rejects any payer account not in that map (a safety guard).
+
+## Usage
+
+Gather inputs (the invoice BUYER, beneficiary name, beneficiary IBAN, amount,
+currency, purpose), then run the helper. It is **dry-run by default** — it prints the
+payload and sends nothing until you add `--confirm`.
+
+```bash
+python3 ${CLAUDE_PLUGIN_ROOT}/skills/paysera-payments/scripts/create-payment.py \
+  --buyer-code 123456789 --buyer-name "Your Company, UAB" \
+  --beneficiary-name "UAB Example Supplier" \
+  --iban "LT000000000000000000" \
+  --amount "2830.00" --currency EUR \
+  --purpose "Pagal PVM sąskaitą faktūrą EX 000123" \
+  --invoice-id "EX000123" --invoice-date 2026-06-15
+# review the printed payload, then add --confirm to register the draft.
+# NOTE: the --purpose above is the FALLBACK form (that invoice gave no purpose
+# instruction). If an invoice/email DOES say what to write in the purpose, quote it
+# verbatim instead — that is BINDING. See "Payment purpose" below.
+```
+
+On success it prints the transfer `id` (transferHash) and `status`, registers it for
+signing (`registered: yes`), and reminds you to sign it in the Paysera app.
+
+- **The payment purpose is dictated by the invoice — see "Payment purpose" below.** If
+  the invoice (or its covering email) states what to put in the purpose, quote that
+  EXACTLY; only compose a descriptive purpose when no such instruction exists anywhere.
+- **Write the purpose in proper Lithuanian** (ą, č, ę, ė, į, š, ų, ū, ž). The tool sends
+  it verbatim with `details_options.preserve=true`, so diacritics are kept (it does NOT
+  strip them — earlier ASCII-only examples were a habit, not a requirement). Use
+  `--no-preserve` only if you want Paysera to transliterate to the bare SEPA charset.
+- **Schedule is context-aware by default** (re-verified live 2026-06-30):
+  - **WITHOUT `--invoice-id` (ad-hoc / personal payment) → defaults to TODAY** — `perform_at
+    = 23:00 Vilnius today`, so you get a same-day window AND the transfer shows in **both the
+    mobile app and the web bank**. This is the "pay today, sign on my phone now" case.
+  - **WITH `--invoice-id` (invoice / bulk) → defaults to +30d** — a long window signed at
+    your leisure in the **web bank** (a future date is NOT shown in mobile until that day).
+  - Override either: `--today` (force same-day, mobile-signable), `--perform-at +Nh|+Nd|YYYY-MM-DD`,
+    or `--advance` (ASAP, sign on the spot). See "Choosing the execution date" below.
+  - **Want to sign it on your phone? Use `--today`** (or just omit `--invoice-id`). A future
+    date only shows in the web bank — that is why a `+30d` draft "can't be signed" in mobile.
+- **Multiple beneficiary IBANs?** Pass them ALL, in invoice order (`--iban` = first
+  listed, `--also-iban` = the rest, repeatable). The tool then auto-selects which one to
+  pay — the Paysera IBAN if the invoice lists one, otherwise the first — see "Beneficiary
+  IBAN selection" below. (All listed IBANs also feed the duplicate check.)
+- `--amount` is a **decimal string** (e.g. `12.34`), not minor units.
+- Override the token path with `--token-file <path>` or `PAYSERA_PAT`.
+
+### Payment purpose (`--purpose`) — follow the invoice's instruction LITERALLY
+
+The payment purpose/reference is **not yours to compose freely**. Most invoices — and
+their covering emails — state **exactly** what the purpose must contain, e.g.
+*"Mokėjimo paskirtyje prašome nurodyti dokumento seriją ir numerį ESO26N005482"*,
+*"please quote reference INV-2026-001"*, *"paskirtyje nurodykite kliento kodą 123456"*.
+The payee reconciles incoming payments (very often **automated / RPA**) by matching on
+**precisely that string**, so any extra word can leave the payment unmatched.
+
+**Decision rule for `--purpose` — apply every time, before you build the command:**
+
+1. **Scan BOTH the invoice body AND the covering email** for a purpose/reference
+   instruction. Trigger phrases: *paskirtyje, paskirtyje nurodyti / nurodykite, mokėjimo
+   paskirtis, prašome nurodyti, būtina nurodyti, reference, payment reference / details,
+   please indicate / quote / state*.
+2. **If an instruction exists → `--purpose` = EXACTLY the value it tells you to quote, and
+   NOTHING else.** Quote only the token(s) the instruction names — normally the bare
+   document/reference number (`ESO26N005482`). Do **NOT** wrap it in prose: no *"Pagal
+   sąskaitą …"*, no *"PVM sąskaita faktūra …"*, no *"Mokėjimas už …"*, no *"Dokumento
+   Nr. …"*, no label words at all. If the instruction lists several elements (e.g.
+   "client code and invoice number"), include exactly those, in the order given.
+3. **Only if NO purpose instruction appears anywhere** → fall back to a short descriptive
+   purpose: `--purpose "Pagal sąskaitą <invoice-id>"` (or `"Pagal PVM sąskaitą faktūrą
+   <invoice-id>"`).
+
+**Mandatory self-check before you run (even in dry-run):** re-read the invoice's purpose
+sentence, then look at your `--purpose`. Does it contain **only** what the invoice asked
+for? If you added a single word the invoice did not request, remove it and re-check.
+
+| Invoice / email says | Correct `--purpose` | Wrong |
+|----------------------|---------------------|-------|
+| "paskirtyje nurodyti dokumento numerį ESO26N005482" | `ESO26N005482` | `Pagal PVM sąskaitą faktūrą ESO26N005482` |
+| "please quote reference INV-2026-001" | `INV-2026-001` | `Payment for invoice INV-2026-001` |
+| (no purpose instruction), invoice id `VPV178051` | `Pagal PVM sąskaitą faktūrą VPV178051` | — |
+
+### Beneficiary IBAN selection (multi-IBAN invoices)
+
+An invoice often prints **several** beneficiary IBANs (e.g. a SEB *and* a Luminor
+account). Pass **every** one — `--iban` for the first listed, `--also-iban` (repeatable)
+for the rest, **in the order printed on the invoice**. The tool then decides where the
+money actually goes:
+
+1. **If any listed IBAN is a Paysera account** — Lithuanian IBAN with bank code `35000`,
+   i.e. `LTkk35000…` — it **always pays to that Paysera IBAN**, even if you passed it as
+   `--also-iban` (Paysera→Paysera transfers are instant and free).
+2. **If none is a Paysera IBAN** — it pays to the **first** IBAN you passed (`--iban`),
+   which must be the first one listed on the invoice. So always pass them in invoice order.
+
+Either way, all listed IBANs still feed the duplicate check. The tool prints a
+`Beneficiary IBAN: … (reason)` line whenever more than one IBAN was given, so you can see
+which it chose and why. Selection is enforced in the script (`select_beneficiary_iban`),
+so it holds regardless of the order you pass the IBANs.
+
+### Choosing the payer account (don't pay from the wrong account)
+
+The payer must be the scoped account that belongs to the **invoice's BUYER (pirkėjas)**,
+never an arbitrary one. Pass `--buyer-code <registration code>` and the tool **resolves
+the correct payer** from `BUYER_CODE_TO_ACCOUNT` in the script. Rules:
+
+- `--buyer-code` known → payer auto-resolved. If you ALSO pass `--payer` and it differs,
+  the tool **refuses** (hard error) — this is the guard against wrong-account mistakes.
+- `--buyer-code` unknown → the tool refuses to guess; add the **verified** code to
+  `BUYER_CODE_TO_ACCOUNT` (never fabricate a code) or pass `--payer` explicitly.
+- No buyer info → falls back to explicit `--payer` (legacy behaviour).
+
+If the registration code is missing (some documents print only the seller's code), the
+tool consults `BUYER_NAME_TO_ACCOUNT`, an **exact-match** (never fuzzy) buyer-name fallback
+that also starts empty — add only your own, unambiguous entities.
+
+Both the `BUYER_CODE_TO_ACCOUNT` and `BUYER_NAME_TO_ACCOUNT` maps start empty — add entries
+as real invoices confirm each buyer's registration code/name (never fabricate one), or
+always pass `--payer` explicitly.
+
+### `charge_type` — REQUIRED for the mobile app to show the transfer
+
+The tool always sends **`charge_type` (default `sha`)**. This is *optional* per the official
+API (paysera/lib-wallet-transfer-rest-client: nullable, values `SHA`/`OUR` only — no `ben`),
+BUT omitting it leaves the transfer's charge type unset, and the **Paysera mobile app then
+filters the transfer out of its sign list** (web shows it; mobile does not). Verified
+2026-06-15 by diffing an API-made transfer against a hand-made web one — the only meaningful
+diff was `charge_type` (unset vs `sha`). Override with `--charge-type OUR`
+if the payer should bear all bank fees (rare for SEPA). Without `sha`, expect the
+"shows in web, not in mobile" bug.
+
+### Priority — SEPA Instant by default for EUR
+
+`--priority auto` (default) sends **`urgency: urgent`** for **EUR**, normal otherwise. Force
+with `--priority urgent|normal`. Per the docs, `urgent` routes via Paysera's IBAN and uses
+**SEPA Instant** when the beneficiary bank supports it (reaches the beneficiary in ~1 min).
+"Instant" describes the **rail speed at execution**, not *when* execution happens: an ASAP
+(`--advance`) transfer executes when signed; a **future-dated** (`--perform-at`/`--due-date`)
+transfer executes **on its scheduled day** (money leaves that day, not at signing).
+
+### Choosing the execution date (today vs future vs ASAP)
+
+Priority: `--perform-at` (manual) > `--advance` > `--today` > `--due-date` > **context-aware
+default** (`--invoice-id` present → `+30d`; absent → today).
+
+`perform_at` sets the signing deadline (`max_execution_time`). Three regimes — pick by **how
+soon you'll sign** and **where** (mobile vs web):
+
+- **`--today` (or default when no `--invoice-id`) — "pay today, sign on my phone".**
+  `perform_at = 23:00 Vilnius today` → a same-day window (until tonight), and because
+  `operation_date = today` the transfer shows in **BOTH the mobile app AND the web bank**.
+  ✅ This is the fix for the old "can't sign it on my phone" problem. Same-day `--perform-at
+  +Nh` / today's `YYYY-MM-DD` behave the same.
+- **`--perform-at +Nd` / a future `YYYY-MM-DD` (default for invoices, with `--invoice-id`)** —
+  a real multi-day window, but a **future** `operation_date` renders **only in the web bank,
+  not mobile**, until that day. Sign it in the web bank. Use for "I'll sign sometime this week".
+  Rejected beyond **366 days ahead**, whichever spelling you use: `perform_at` is the signing
+  deadline, so a value that far out is a mistyped timestamp rather than a plan. (`epoch
+  seconds` is accepted too, and an extra digit is the usual way to get one wrong — that is
+  what the bound is for.)
+- **`--due-date YYYY-MM-DD`** — after-fact invoice → `perform_at = due date − 1 day`. A
+  today/past `due − 1` falls back to ASAP (announced on stderr). The 366-day bound applies
+  here too — it is checked on the resolved `perform_at`, so a mistyped invoice year
+  (`2926` for `2026`) is refused rather than booked as a signing deadline centuries out.
+- **`--advance`** — *sign-right-now* ASAP (*Išankstinis*) → **`perform_at` omitted**. ⚠️ The
+  deadline is **immediate**: with `urgent` (EUR SEPA-Instant default) `max_execution_time ≈
+  creation instant` (~0 s); with `normal` it's ~30 min. Mobile-visible, but you must sign on
+  the spot. **For a same-day payment you'll sign within hours, prefer `--today`.**
+
+**Deadline mechanic (measured live; re-verified 2026-06-30).** Read the API field
+**`max_execution_time`** on the transfer to know the truth:
+- **same-day** `perform_at` (`--today`, `+Nh`, today's date) → `max_execution_time` = **that
+  exact timestamp** (e.g. tonight 23:00). ✅ verified live. `operation_date = today` → mobile.
+- **future-day** `perform_at` → `max_execution_time` ≈ **Vilnius midnight at the start of
+  perform_at** (an ~N-day window). ✅ verified live. Web bank only until then.
+- **ASAP** (`--advance`) → `max_execution_time` ≈ **creation instant** with `urgent` (~0 s);
+  ~30-min with `normal`.
+
+**No more "can't have both".** A *same-day* `perform_at` gives a usable window AND mobile
+visibility simultaneously — the earlier "long window OR mobile, not both" note was wrong; it
+only compared ASAP vs a future DAY and never tested a same-day future timestamp. (The
+constraint that remains: a *future-day* transfer is web-only until that day.) A failed/
+timed-out transfer is terminal and cannot be deleted (`DELETE` → 409); harmless.
+
+> **Where to sign.** `--today` / same-day & ASAP transfers (with `charge_type=sha`) show in
+> **both the mobile app and the web bank** — sign on your phone (2FA). A **future-dated**
+> transfer is signed only in the **web bank** (bank.paysera.com → account → awaiting signature)
+> until its scheduled day.
+
+### Cross-border transfers
+
+A beneficiary outside Lithuania needs `--beneficiary-type`, which declares them on the
+regulated payment message as either a company (`legal`) or a private person (`natural`).
+The tool does **not** guess it — an invoice from a company must not go out declaring that
+company as a private individual. The chosen value is printed before the payload.
+
+Outside the SEPA zone entirely (UA, AM, GE, …) the API also requires
+`--beneficiary-bic`, `--beneficiary-address` and `--beneficiary-city`. The tool checks for
+them **before** sending, so you get a plain message instead of a `mapper_*_not_set`
+rejection after the fact.
+
+All of that turns on the beneficiary's country, which is read from the BIC (characters
+5-6) or the IBAN prefix. A **national account number that is not an IBAN** — the Armenian
+`2050…` format, for example — yields neither, so **`--beneficiary-bic` is required** for
+one. Without it the country would be unknown, and an unknown country is not treated as
+domestic: the tool refuses rather than skipping the cross-border checks and picking the
+SEPA-Instant rail for an account the instant rail cannot reach.
+
+The SEPA country list includes the members added in 2023-2024 (AL, MD, MK, ME); it is
+in `SEPA_COUNTRIES` in `create-payment.py`, with the date it was last checked.
+
+## Idempotency — avoid double-paying an invoice
+
+Pass `--invoice-id <id>` when creating, and **pass `--invoice-date YYYY-MM-DD` too**
+whenever you have it. It is optional but not merely cosmetic: it sets the window the live
+cross-check scans, so it must be ISO — a day-first `15/06/2026` is **refused**, not
+guessed at, because a date the operator typed is a date they expect to be used, and a
+scan narrower than the one reported is worse than a stop. A date in the **future** is
+refused for the same reason: the window would start after today, hold nothing, and then
+report "no prior payments" — an all-clear from a check that never ran. "Future" is judged
+on the **Vilnius calendar**, like every other date decision here, so today's date is
+accepted at any hour — including the small hours, when the UTC date is still yesterday.
+Without it the tool scans the
+**last 90 days**, and in that window a
+prior transfer to the same account for the **same amount** blocks even when its purpose names
+a different invoice — which is exactly what a supplier billed the same sum every month
+looks like. The `SKIP` output says which rule matched, so an amount-only match is
+distinguishable from a purpose that actually quotes the invoice id. When it is amount-only,
+narrow the window with `--invoice-date` rather than reaching for `--force`; `--force`
+switches the duplicate check off completely, ledger included.
+
+Before posting, the tool reads a local ledger (`~/.config/paysera-payments/ledger.json`),
+finds prior transfers it created for that invoice, checks each one's **live** status,
+and **refuses** (`exit 3`, `SKIP`) if any is still alive or already succeeded — i.e.
+anything outside `NONBLOCKING_STATES` in `create-payment.py` (currently `failed`,
+`rejected`, `canceled`/`cancelled`, `expired`, `declined`). A previously failed/canceled
+attempt does NOT block (you can retry). Override with `--force`.
+
+### Unconfirmed attempts (`UNCONFIRMED create attempt`)
+
+The ledger row is written **before** the POST, not after. If the request is sent but no
+answer comes back — a timeout, a killed process, a dropped connection — the transfer may
+well have been created, and `GET /transfers` **cannot** tell you: it does not list unsigned
+drafts. The row stays in state `unknown` and **blocks further runs for that invoice**, and
+the tool tells you to go and look.
+
+When you hit `SKIP — ... UNCONFIRMED create attempt`:
+
+1. Open the Paysera app and look for a draft matching that beneficiary and amount.
+2. If a draft exists — sign it or cancel it. Do not re-run.
+3. If no draft exists — re-run with `--force`, which proceeds and says loudly that the
+   duplicate check was skipped.
+
+A definite API refusal (HTTP 4xx) is recorded as `failed` instead and never blocks a retry.
+
+### One payment run at a time
+
+A run that will actually send (`--confirm` with an `--invoice-id`) takes an exclusive lock
+on `~/.config/paysera-payments/.lock` **before** the duplicate check and holds it until the
+attempt is recorded. Two runs that overlap — a cron job firing alongside a manual run, or
+two agent sessions — would otherwise each pass their own duplicate check, and the second
+ledger write would erase the first one's row. That row is the only record of an unsigned
+draft, so losing it lets a later run create a second signable draft for the same invoice.
+A run that finds the lock held exits with an error telling you to wait; dry runs never take
+it and are never blocked by it.
+
+```bash
+python3 ${CLAUDE_PLUGIN_ROOT}/skills/paysera-payments/scripts/create-payment.py \
+  --payer EVP0000000000001 --beneficiary-name "Acme UAB" \
+  --iban LT...primary --also-iban LT...second-bank \
+  --amount 123.45 --purpose "Pagal sąskaitą INV-2026-001" \
+  --invoice-id INV-2026-001 --invoice-date 2026-06-15 --confirm
+```
+
+The dedup checks **two** sources: (1) the local ledger of tool-created transfers, and
+(2) the payer account's **actual** transfers via the `GET /transfers` list filter
+(shipped 2026-06-18). For (2) it scans **all of the beneficiary's accounts** — `--iban`
+plus every `--also-iban` — over the whole period **from (invoice issue date − 1 day) to
+today**, because an invoice can name several accounts (e.g. Luminor *and* SEB) and a
+prior payment to **any** of them means the invoice is already paid. "Account", not
+"IBAN": a national account number that is not an IBAN is scanned exactly the same way,
+under whichever key the API returns it. It **prints every payment it finds to those
+accounts in the period** (amount + purpose) for you to eyeball,
+and **blocks** (`exit 3`, `SKIP`) on any whose **amount matches OR whose purpose quotes
+the invoice id** — so a duplicate made **manually in the Paysera app, to either bank**,
+is caught. Blocking ignores terminal transfers (`NONBLOCKING_STATES`, above — a prior
+failed attempt does NOT block; retry freely). Override with `--force`. The live-list
+check is best-effort: if the list call fails the tool **prints a warning to stderr** and
+falls back to the ledger, which remains the guaranteed guard against e.g. an hourly cron
+firing twice. Take that warning seriously — with only the ledger, a duplicate made by
+hand in the Paysera app is invisible.
+
+The scan also stops after 5000 transfers (50 pages of 100), which a busy payer account can
+exceed over a long window. **That, too, warns on stderr**, naming how many rows were read;
+narrow the window with `--invoice-date` if you see it.
+
+The third way is an answer the tool cannot read: a page that returns `200` in a shape with
+no list of rows under `items`, `transfers` or `data`. That means the API changed, so the
+scan stops and warns rather than treating an answer it does not understand as "no
+transfers". An answer whose own `_metadata` reports `total: 0` is **not** that case — it is
+an ordinary empty result for a quiet account, and passes without a word. One that reports
+rows it does not show is the dangerous case, and warns.
+
+All three — a failed page, an unreadable shape, the page cap — say so on stderr, and this
+list is complete. A partial scan that reports as complete is worse than one that fails
+outright.
+
+Whichever way it comes back incomplete, **stdout says so as well**: a
+`LIVE SCAN INCOMPLETE` line is printed **above** the rest of the summary, every time the
+scan fell short — whether it found nothing or found rows. If a found-list follows it, that
+list is a **partial** view of the period, not the whole of it; `No prior payments to those
+accounts in the period.` is printed only by a scan that read the whole window. "Nothing
+found" and "could not look" are different answers, and this is the line a log, a pipeline
+or an agent reads when stderr has been dropped.
+
+> **Pass all the invoice's accounts.** The check is only as complete as the accounts you
+> give it. If the invoice lists two banks, `--also-iban` the second one — otherwise a
+> prior payment to that other account would be missed. (`--iban`/`--also-iban` take a
+> national account number just as readily as an IBAN; the flags are named for the common
+> case, not for what they accept.)
+>
+> Paste them however the invoice prints them. Spaces, hyphens and dots are stripped from
+> every listed IBAN before anything compares or chooses between them, and the tool says
+> on stderr what it changed. That normalisation is shared by all three decisions that
+> read an IBAN — which one gets paid, which count as duplicates, and de-duplication of
+> the list itself — so no spelling can be visible to one and invisible to another.
+
+## Cancel / delete a transfer
+
+One operation removes a transfer: `DELETE /transfers/{hash}` (scope
+`transfers:cancel`). It **deletes a live draft** and **cancels a pending transfer** —
+same call; the effect depends on the transfer's state. Only live, unsigned transfers are
+removable — the authoritative list is `CANCELABLE_STATES` in `cancel-payment.py`
+(currently `new`, `reserved`, `registered`, `waiting_funds`, `signing`). Terminal states
+(`failed`, `done`, `rejected`, already `canceled`) return `409 invalid_state` and are
+skipped.
+
+Dry-run by default; add `--confirm` to actually remove. Accepts multiple hashes.
+
+```bash
+# preview
+python3 ${CLAUDE_PLUGIN_ROOT}/skills/paysera-payments/scripts/cancel-payment.py <transferHash> [<transferHash> ...]
+# actually cancel/delete
+python3 ${CLAUDE_PLUGIN_ROOT}/skills/paysera-payments/scripts/cancel-payment.py <transferHash> --confirm
+```
+
+(`--cancel` and `--delete` are accepted spellings but optional — the script always
+does the one DELETE operation.)
+
+## Checking a transfer afterwards
+
+The token also has `transfers:read` and `accounts:read`:
+
+**Pass the token on stdin, never in the command.** `-H "Authorization: Bearer $PAT"` puts
+your token in the process arguments, where any local user can read it with `ps auxww` or
+from `/proc/<pid>/cmdline`. curl reads a config file from stdin with `-K -`; a helper
+keeps that out of your way:
+
+```bash
+# Define once (add it to your shell profile if you use these often).
+pcurl() {  # pcurl <url> [curl args...] — sends the PAT via stdin, not argv
+  printf 'header = "Authorization: Bearer %s"\n' "$(cat ~/.config/paysera-payments/token)" |
+    curl -sS -K - "$@"
+}
+# `printf` must be the SHELL BUILTIN — it is in bash, dash and zsh. The token is an
+# argument to it, so if it resolved to /usr/bin/printf a real process would be started
+# with the token in its argv, which is the exact exposure this avoids. Do not substitute
+# /usr/bin/printf, and do not put the token in a `curl` argument.
+
+# read one transfer (status moves to e.g. "signed"/"done" after you sign in the app)
+pcurl "https://api.paysera.com/public/transfer/rest/v1/transfers/{transferHash}"
+
+# list transfers with filters — ACCOUNTING semantics (verified 2026-07-08):
+#   credit_account_number = account is the PAYER (outgoing transfers)
+#   debit_account_number  = account is the BENEFICIARY (incoming transfers)
+# dates are Unix timestamps; also: created_date_to, status (status is ignored in practice)
+pcurl "https://api.paysera.com/public/transfer/rest/v1/transfers?credit_account_number={accountNumber}&created_date_from=1780261200"
+
+# account balance
+pcurl "https://api.paysera.com/public/account/rest/v1/accounts/{accountNumber}/full-balance"
+```
+
+## Revoking the token
+
+```bash
+JTI=$(cat ~/.config/paysera-payments/jti.txt)
+# Needs a fresh bank.paysera.com session bearer token in $AUTH. That session token is
+# MORE powerful than the PAT (it is not scope-limited), so keeping it out of argv matters
+# even more here.
+printf 'header = "Authorization: Bearer %s"\n' "$AUTH" |
+  curl -sS -K - -X DELETE \
+    "https://auth-api.paysera.com/personal-access-token/rest/v1/personal-access-tokens/$JTI"
+```
+
+## Notes / gotchas
+
+- The public API is behind a CDN, so **PAT IP-restrictions may not match your real
+  client IP**. If you hit unexpected `403`s, create the token without an IP restriction —
+  the risk is bounded by: create-only (no sign), account scoping, and revocability.
+- `GET /transfers` list **is** available (since 2026-06-18) with filters
+  `credit_account_number` (= account is PAYER → outgoing), `debit_account_number`
+  (= account is BENEFICIARY → incoming; accounting semantics, verified empirically
+  2026-07-08), `created_date_from`/`_to` (Unix timestamps), `status` (ignored in
+  practice). Also read a single transfer by hash.
+- A freshly created transfer must be **registered** (`PUT /transfers/{hash}/register`)
+  to be visible for signing; create-payment.py does this automatically.
+- `account_number` is the Paysera `EVP…` number, **not** the IBAN.
