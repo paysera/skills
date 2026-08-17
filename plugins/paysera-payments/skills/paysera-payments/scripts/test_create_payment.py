@@ -506,6 +506,27 @@ class TestComputeSchedule(unittest.TestCase):
                 )
                 self.assertTrue(option, "the bound was given no option name to report")
 
+    def test_the_comments_point_at_where_the_bound_actually_lives(self):
+        # 1.8.13 moved the rule into reject_too_far/compute_schedule and left two comments
+        # behind: the one above MAX_PERFORM_AT_DAYS still sent the reader to
+        # parse_perform_at "for the bound test", and the one above the call there still
+        # said it covered two of the four spellings. A reader adding a schedule option
+        # follows those and never reaches the function that would bound it — which is the
+        # exact mistake --due-date was.
+        source = (SCRIPTS / "create-payment.py").read_text(encoding="utf-8")
+        constant = source[: source.index("MAX_PERFORM_AT_DAYS = ")]
+        constant = constant[constant.rindex("\n\n") :]
+        self.assertIn("compute_schedule", constant, "the constant's comment must name the "
+                      "place the rule is applied")
+        self.assertNotIn("See the bound test in parse_perform_at", constant)
+
+        call = source[: source.index('reject_too_far("--perform-at"')]
+        call = call[call.rindex("if epoch <= now + 60:") :]
+        self.assertNotIn("this covers the other two", call, "the call below covers all "
+                         "four spellings")
+        self.assertIn("compute_schedule", call, "the comment must say where the rule for "
+                      "every schedule option now lives, and why this call is kept")
+
     def test_the_due_date_help_states_the_bound_too(self):
         # The half of the 1.8.12 fix that was missed here as well: --due-date's help named
         # no bound at all. A check the words around it do not mention is the defect this
@@ -1899,6 +1920,61 @@ class TestCommandLineValidation(ScriptHarness, unittest.TestCase):
             os.path.exists(os.path.join(self.tmp, "calls.log")),
             "no request should be made before a known-bad configuration is rejected",
         )
+
+    def test_a_bad_schedule_argument_is_reported_before_any_request(self):
+        # The schedule was resolved AFTER the duplicate check, so every way it can be
+        # refused — malformed, past, beyond the 366-day bound — cost a full paged scan
+        # first, printed that scan's summary for a payment then abandoned, and with
+        # --confirm --invoice-id held the exclusive ledger lock for its duration. Nothing
+        # in it needs the network, so it belongs with the other configuration checks.
+        for bad in (
+            ("--perform-at", "next-tuesday"),
+            ("--perform-at", "2020-01-01"),
+            ("--due-date", "15/06/2026"),
+            ("--due-date", "2926-08-20"),
+        ):
+            with self.subTest(bad=bad):
+                calls = os.path.join(self.tmp, "calls.log")
+                if os.path.exists(calls):
+                    os.remove(calls)
+                self.write_stub('echo "$@" >> %s/calls.log; printf \'{"items":[]}\\nHTTP:200\''
+                                % self.tmp)
+                out = self.run_script("--amount", "50.00", "--invoice-id", "INV-SCHED", *bad)
+                self.assertNotEqual(out.returncode, 0)
+                self.assertIn("ERROR", out.stdout + out.stderr)
+                self.assertFalse(
+                    os.path.exists(calls),
+                    "the duplicate check ran before a schedule argument the process "
+                    "could refuse without a socket",
+                )
+                self.assertNotIn("Dup-check: scanned", out.stdout, "a scan summary was "
+                                 "printed for a payment that is then abandoned")
+
+    def test_a_bad_schedule_argument_never_takes_the_ledger_lock(self):
+        # The third cost, and the one "no request was made" does not cover: with --confirm
+        # --invoice-id the exclusive lock is taken BEFORE the duplicate check, so a
+        # schedule resolved anywhere after it still blocks a concurrent genuine payment
+        # for the length of the doomed run. The lock file is created when the lock is
+        # taken, so its absence is the evidence.
+        lock = os.path.join(self.tmp, ".config", "paysera-payments", ".lock")
+        self.write_stub('printf \'{"items":[]}\\nHTTP:200\'')
+        out = self.run_script(
+            "--amount", "50.00", "--invoice-id", "INV-LOCK", "--confirm",
+            "--due-date", "2926-08-20",
+        )
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("366 days ahead", out.stdout + out.stderr)
+        self.assertFalse(os.path.exists(lock), "the ledger lock was taken for a run that "
+                         "a configuration check could have ended first")
+
+    def test_the_lock_file_is_what_a_taken_lock_leaves_behind(self):
+        # Guards the guard above: if the lock stopped creating that file, the assertion
+        # would pass for a reason unrelated to what it claims.
+        lock = os.path.join(self.tmp, ".config", "paysera-payments", ".lock")
+        self.write_stub('printf \'{"id":"HASH123","status":"new"}\\nHTTP:201\'')
+        out = self.run_script("--amount", "50.00", "--invoice-id", "INV-LOCK-OK", "--confirm")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertTrue(os.path.exists(lock))
 
     def test_force_announces_that_the_duplicate_check_was_skipped(self):
         out = self.run_script("--amount", "12.34", "--invoice-id", "INV-X", "--force")

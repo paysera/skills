@@ -260,9 +260,11 @@ LEDGER_FILE = os.path.expanduser("~/.config/paysera-payments/ledger.json")
 # this set (new, reserved, signed, processing, done, ...) blocks a duplicate.
 NONBLOCKING_STATES = {"failed", "rejected", "canceled", "cancelled", "expired", "declined"}
 
-# Upper bound for --perform-at. It is a SIGNING DEADLINE, not a reminder: a draft sits
-# unsigned until then and auto-cancels after, so a year is already generous and anything
-# beyond it is a typo. See the bound test in parse_perform_at.
+# Upper bound for a resolved perform_at, whichever schedule option produced it. It is a
+# SIGNING DEADLINE, not a reminder: a draft sits unsigned until then and auto-cancels
+# after, so a year is already generous and anything beyond it is a typo. The rule lives in
+# reject_too_far() and is applied in compute_schedule(), where every spelling meets — a new
+# schedule option is bounded by being returned from there, with nothing to remember to add.
 MAX_PERFORM_AT_DAYS = 366
 
 
@@ -1322,8 +1324,12 @@ def parse_perform_at(spec):
     # a pasted timestamp. Unbounded, the value either crashed the schedule printout with a
     # ValueError/OverflowError out of datetime — a traceback where every other bad argument
     # in this tool gets one sentence — or, one digit lower, was accepted in silence as a
-    # signing deadline centuries away. YYYY-MM-DD is already bounded by strptime, and +Nh by
-    # the midnight clamp above; this covers the other two.
+    # signing deadline centuries away. It covers all four spellings, +Nh included, though
+    # that one is already held inside today by the midnight clamp above.
+    #
+    # Redundant with compute_schedule's gate, which is where the rule for every schedule
+    # option now lives, and kept anyway: this function is called and tested directly, and a
+    # helper handing an unbounded epoch back to a direct caller is the hole 1.8.13 closed.
     reject_too_far("--perform-at", spec, epoch)
     return epoch
 
@@ -1781,6 +1787,15 @@ def _main(guard):
     if date_error:
         sys.exit(date_error)
 
+    # The schedule belongs in this block for the reason stated at the top of it: every way
+    # it can be refused — a malformed --perform-at/--due-date, a past date, the 366-day
+    # bound — is knowable without a network call. Resolved after the duplicate check, a
+    # typo in a cron job's --due-date cost a full paged scan, printed the summary of a scan
+    # belonging to a payment that was then abandoned, and (with --confirm --invoice-id)
+    # held the exclusive ledger lock for the length of it, refusing a concurrent genuine
+    # payment. It reads only `args`, so nothing the duplicate check produces moves with it.
+    perform_at, mode = compute_schedule(args)
+
     # A national account number that is not an IBAN (e.g. the Armenian "2050…" format,
     # supported further down) starts with digits, so neither the IBAN prefix nor an
     # absent BIC yields a country. beneficiary_country() then returns None, and an
@@ -1930,8 +1945,6 @@ def _main(guard):
             f"consulted. If this invoice was already paid, this will pay it again.",
             file=sys.stderr,
         )
-
-    perform_at, mode = compute_schedule(args)
 
     # A real IBAN goes in bank_account.iban; a non-IBAN national account number (e.g.
     # Armenia "2050…") goes in bank_account_number (the API rejects it as iban).

@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.8.14 (2026-08-17)
+
+Twenty-sixth review round. Two findings, both about where something sits rather than what
+it does.
+
+- **Every schedule-argument error was raised after the duplicate check had run.**
+  `_main()` groups the checks that need no network and runs them first, with the reason
+  written beside them — a missing `--beneficiary-type` must not cost a full round of
+  duplicate-check requests before failing on something known up front. The schedule did not
+  obey that rule: `compute_schedule()` was called after `find_blocking()` and after the
+  ledger lock was taken, so a malformed `--perform-at`, a past date, a malformed
+  `--due-date` and the 366-day bound all fired late. The costs were a paged
+  `GET /transfers` scan spent on a value the process could refuse without a socket; a
+  `Dup-check: scanned …` summary printed for a payment that is then abandoned; and, with
+  `--confirm --invoice-id`, the exclusive ledger lock held for the length of that scan, so a
+  cron job with a typo in `--due-date` refused a concurrent genuine payment on every run.
+  The schedule is now resolved with the other configuration checks. It reads only `args`,
+  so nothing moved with it, and a test walks four bad schedule arguments asserting no
+  request is made and no scan summary is printed.
+- **Two comments described the 366-day bound as narrower than it is, or pointed where it no
+  longer lives.** The comment above `MAX_PERFORM_AT_DAYS` still sent the reader to
+  `parse_perform_at` for "the bound test", and the comment above the call there still said
+  it covered two of the four spellings. 1.8.13 moved the rule to `reject_too_far()`, applied
+  in `compute_schedule()`. Both now say where the rule is, and why the call in
+  `parse_perform_at()` is kept despite being redundant: the helper is called and tested
+  directly, and one that hands an unbounded epoch back to a direct caller is the hole 1.8.13
+  closed. No behaviour change.
+
 ## 1.8.13 (2026-08-17)
 
 Twenty-fifth review round. Three findings, one of them the other half of the defect 1.8.12
