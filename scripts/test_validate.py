@@ -425,7 +425,27 @@ class TestOtherRuntimeManifests(ValidatorFixture, unittest.TestCase):
         path = self.root / ".agents/plugins/marketplace.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("[]", encoding="utf-8")
-        self.assertTrue(any("expected an object with a plugins list" in e for e in validate.validate()))
+        self.assertTrue(any("top level is not a JSON object" in e for e in validate.validate()))
+
+    def test_null_catalogue_is_reported(self):
+        path = self.root / ".cursor-plugin/marketplace.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("null", encoding="utf-8")
+        self.assertTrue(any("top level is not a JSON object" in e for e in validate.validate()))
+
+    def test_null_marketplace_is_reported(self):
+        (self.root / ".claude-plugin/marketplace.json").write_text("null", encoding="utf-8")
+        self.assertTrue(any("top level is not a JSON object" in e for e in validate.validate()))
+
+    def test_null_plugin_manifest_is_reported(self):
+        (self.plugin_dir / ".claude-plugin/plugin.json").write_text("null", encoding="utf-8")
+        self.assertTrue(any("top level is not a JSON object" in e for e in validate.validate()))
+
+    def test_catalogue_plugins_not_a_list_is_reported(self):
+        self.catalogue(".cursor-plugin/marketplace.json", {})
+        path = self.root / ".cursor-plugin/marketplace.json"
+        path.write_text('{"plugins": {}}', encoding="utf-8")
+        self.assertTrue(any("plugins is not a list" in e for e in validate.validate()))
 
     def test_unparsable_catalogue_reports_only_the_parse_error(self):
         path = self.root / ".agents/plugins/marketplace.json"
@@ -433,7 +453,7 @@ class TestOtherRuntimeManifests(ValidatorFixture, unittest.TestCase):
         path.write_text("{", encoding="utf-8")
         errors = validate.validate()
         self.assertTrue(any("cannot be read as JSON" in e for e in errors))
-        self.assertFalse(any("expected an object with a plugins list" in e for e in errors))
+        self.assertEqual(len([e for e in errors if "marketplace.json" in e and ".agents" in e]), 1)
 
     def test_portable_version_drift_is_reported(self):
         self.portable(version="2.0.0")

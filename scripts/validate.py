@@ -127,16 +127,20 @@ NON_TICKET_PREFIXES = frozenset(
 
 def load_json(path: Path, errors: list):
     """Parse a manifest, reporting a syntax error the way every other failure here is
-    reported. Returns None when it could not be parsed.
+    reported. Returns None when it could not be parsed or is not a JSON object.
 
     Same rule as the missing-key check below: this runs as a CI gate, and a
     JSONDecodeError traceback tells a contributor nothing about which file to fix.
     """
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as e:
         errors.append(f"{path.relative_to(ROOT)}: cannot be read as JSON — {e}")
         return None
+    if not isinstance(data, dict):
+        errors.append(f"{path.relative_to(ROOT)}: top level is not a JSON object")
+        return None
+    return data
 
 
 def read_frontmatter(skill_file: Path) -> dict:
@@ -281,8 +285,8 @@ def validate_other_runtimes(claude_manifests):
         data = load_json(path, errors)
         if data is None:
             continue
-        if not isinstance(data, dict) or not isinstance(data.get("plugins", []), list):
-            errors.append(f"{catalogue}: expected an object with a plugins list")
+        if not isinstance(data.get("plugins", []), list):
+            errors.append(f"{catalogue}: plugins is not a list")
             continue
         for index, entry in enumerate(data.get("plugins", [])):
             label = f"{catalogue} plugins[{index}]"
