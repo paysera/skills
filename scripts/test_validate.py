@@ -427,6 +427,14 @@ class TestOtherRuntimeManifests(ValidatorFixture, unittest.TestCase):
         path.write_text("[]", encoding="utf-8")
         self.assertTrue(any("expected an object with a plugins list" in e for e in validate.validate()))
 
+    def test_unparsable_catalogue_reports_only_the_parse_error(self):
+        path = self.root / ".agents/plugins/marketplace.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{", encoding="utf-8")
+        errors = validate.validate()
+        self.assertTrue(any("cannot be read as JSON" in e for e in errors))
+        self.assertFalse(any("expected an object with a plugins list" in e for e in errors))
+
     def test_portable_version_drift_is_reported(self):
         self.portable(version="2.0.0")
         self.assertTrue(any("plugin.json: version" in e for e in validate.validate()))

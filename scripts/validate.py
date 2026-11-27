@@ -279,6 +279,8 @@ def validate_other_runtimes(claude_manifests):
         if not path.is_file():
             continue
         data = load_json(path, errors)
+        if data is None:
+            continue
         if not isinstance(data, dict) or not isinstance(data.get("plugins", []), list):
             errors.append(f"{catalogue}: expected an object with a plugins list")
             continue
