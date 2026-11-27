@@ -166,6 +166,7 @@ def validate() -> list:
         return errors + scan_published_content()
 
     listed = set()
+    claude_manifests = {}
     for index, entry in enumerate(marketplace.get("plugins", [])):
         # A missing key is a manifest error to report, not a traceback: this runs as a CI
         # gate, and a KeyError tells a contributor nothing useful.
@@ -194,6 +195,7 @@ def validate() -> list:
             errors.append(f"{name}: plugin.json missing {', '.join(manifest_missing)}")
             continue
 
+        claude_manifests[name] = (source, manifest)
         if manifest["name"] != name:
             errors.append(f"{name}: plugin.json name is {manifest['name']!r}")
         if manifest["version"] != entry["version"]:
@@ -228,12 +230,71 @@ def validate() -> list:
             if not fields.get("description"):
                 errors.append(f"{rel_skill}: frontmatter has no description")
 
+    errors.extend(validate_other_runtimes(claude_manifests))
+
     plugins_root = ROOT / "plugins"
     for plugin_dir in sorted(plugins_root.iterdir()) if plugins_root.is_dir() else []:
         if plugin_dir.is_dir() and plugin_dir.name not in listed:
             errors.append(f"{plugin_dir.name}: present in plugins/ but not in marketplace.json")
 
     errors.extend(scan_published_content())
+    return errors
+
+
+OTHER_RUNTIME_CATALOGUES = (".agents/plugins/marketplace.json", ".cursor-plugin/marketplace.json")
+
+
+def catalogue_source(entry):
+    source = entry.get("source")
+    return source.get("path") if isinstance(source, dict) else source
+
+
+def compare_with_claude(label, data, claude_manifest, errors):
+    for key in ("version", "description"):
+        if key in data and data[key] != claude_manifest[key]:
+            errors.append(f"{label}: {key} differs from .claude-plugin/plugin.json")
+
+
+def validate_portable_manifest(name, source, claude_manifest, errors):
+    path = source / "plugin.json"
+    if not path.is_file():
+        return
+    manifest = load_json(path, errors)
+    if manifest is None:
+        return
+    label = str(path.relative_to(ROOT))
+    if manifest.get("name") != name:
+        errors.append(f"{label}: name is {manifest.get('name')!r}, expected {name!r}")
+    if "version" not in manifest:
+        errors.append(f"{label}: missing version")
+    compare_with_claude(label, manifest, claude_manifest, errors)
+
+
+def validate_other_runtimes(claude_manifests):
+    errors = []
+    for name, (source, manifest) in sorted(claude_manifests.items()):
+        validate_portable_manifest(name, source, manifest, errors)
+    for catalogue in OTHER_RUNTIME_CATALOGUES:
+        path = ROOT / catalogue
+        if not path.is_file():
+            continue
+        data = load_json(path, errors)
+        if data is None:
+            continue
+        for index, entry in enumerate(data.get("plugins", [])):
+            label = f"{catalogue} plugins[{index}]"
+            name, source = entry.get("name"), catalogue_source(entry)
+            if name not in claude_manifests:
+                errors.append(f"{label}: {name!r} is not in .claude-plugin/marketplace.json")
+                continue
+            if not isinstance(source, str) or not source.startswith("./") or not (ROOT / source).is_dir():
+                errors.append(f"{label}: source {source!r} is not an existing ./-relative directory")
+                continue
+            if (ROOT / source).resolve() != claude_manifests[name][0].resolve():
+                errors.append(f"{label}: source {source!r} is not the plugin's directory")
+            if not (ROOT / source / "plugin.json").is_file():
+                errors.append(f"{label}: {source}/plugin.json is missing")
+            compare_with_claude(label, entry, claude_manifests[name][1], errors)
     return errors
 
 

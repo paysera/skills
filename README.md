@@ -11,10 +11,23 @@ The skills follow the open [Agent Skills](https://agentskills.io) format, so the
 
 ## Install
 
+Claude Code:
+
 ```bash
 claude plugin marketplace add paysera/skills
 claude plugin install paysera-payments@paysera-skills
+claude plugin install paysera-checkout@paysera-skills
 ```
+
+Codex (`paysera-checkout` only):
+
+```bash
+codex plugin marketplace add paysera/skills
+```
+
+Then install `paysera-checkout` from the `paysera-skills` marketplace in the Codex plugin
+browser. Cursor reads the same repository through `.cursor-plugin/marketplace.json` and the
+plugin's Agent Plugins manifest (`plugins/paysera-checkout/plugin.json`).
 
 To update later:
 
@@ -33,6 +46,7 @@ Then use it from Claude Code:
 | Skill | What it does |
 |-------|--------------|
 | [`paysera-payments`](plugins/paysera-payments) | Creates **draft** Paysera transfers from an invoice or a plain-language request, and cancels/deletes unsigned drafts, via the public Transfer API. |
+| [`paysera-checkout`](plugins/paysera-checkout) | Helps a coding agent build a merchant's **Paysera Checkout** integration: payments, verified webhooks, refunds, payment links and Test Mode, with PHP SDK and REST examples. |
 
 ## Before you use `paysera-payments`
 
@@ -50,10 +64,17 @@ Two properties are deliberate and worth stating up front:
 
 Never grant an agent a token with `transfers:sign`.
 
+## Before you use `paysera-checkout`
+
+The skill only guides the code your agent writes. It holds no credentials, calls no API and
+never asks for your `client_secret`. Your integration reads that secret from your server's
+environment; the secret also signs Paysera's webhooks, so keep it out of code, repositories, logs and
+the browser. Test with your Checkout project in Test Mode before you switch it to Live.
+
 ## Security
 
-Skills published here call public Paysera APIs from your own machine, using credentials you
-create on your own account. They never ship credentials. The token lives only on your
+Skills published here never ship credentials. `paysera-payments` calls public Paysera APIs
+from your own machine, using credentials you create on your own account. Its token lives only on your
 machine (`~/.config/paysera-payments/token`, mode `0600`) and is sent only to Paysera API
 hosts. That mode is enforced, not just documented: the scripts refuse to run if the token
 file is readable by group or other.

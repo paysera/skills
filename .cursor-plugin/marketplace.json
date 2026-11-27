@@ -1,0 +1,19 @@
+{
+  "name": "paysera-skills",
+  "owner": {
+    "name": "Paysera",
+    "url": "https://www.paysera.com"
+  },
+  "plugins": [
+    {
+      "name": "paysera-checkout",
+      "source": "./plugins/paysera-checkout",
+      "description": "Build a Paysera Checkout integration: Checkout Modern payments with the PHP SDK or REST, verified webhooks, safe refunds with Idempotency-Key, payment links and Test Mode. Writes the merchant's code; holds no credentials and calls no API itself.",
+      "version": "1.0.0",
+      "author": {
+        "name": "Paysera",
+        "url": "https://www.paysera.com"
+      }
+    }
+  ]
+}
