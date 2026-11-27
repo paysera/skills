@@ -16,6 +16,9 @@ jobs:
       - name: Validate manifests and scan published content
         run: python3 scripts/validate.py
 
+      - name: Check Checkout API names in the paysera-checkout skill
+        run: python3 scripts/checkout_names.py check
+
   tests:
     # 3.8 is the minimum the skill claims to support, and the one configuration where
     # the built-in timezone fallback actually runs (no zoneinfo). 3.11 is the modern

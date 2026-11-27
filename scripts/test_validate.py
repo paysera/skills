@@ -392,6 +392,101 @@ class TestManifestValidation(ValidatorFixture, unittest.TestCase):
         self.assertTrue(any("frontmatter name" in e for e in validate.validate()))
 
 
+class TestOtherRuntimeManifests(ValidatorFixture, unittest.TestCase):
+    def portable(self, **over):
+        base = {"name": "demo", "version": "1.0.0", "description": "A demo skill."}
+        base.update(over)
+        (self.plugin_dir / "plugin.json").write_text(json.dumps(base), encoding="utf-8")
+
+    def catalogue(self, relative, entry):
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"name": "m", "plugins": [entry]}), encoding="utf-8")
+
+    def codex_entry(self, path="./plugins/demo", name="demo"):
+        return {"name": name, "source": {"source": "local", "path": path}, "category": "Finance"}
+
+    def setUp(self):
+        super().setUp()
+        self.write(self.entry(), self.manifest())
+
+    def test_consistent_manifests_are_valid(self):
+        self.portable()
+        self.catalogue(".agents/plugins/marketplace.json", self.codex_entry())
+        self.catalogue(".cursor-plugin/marketplace.json", {"name": "demo", "source": "./plugins/demo", "version": "1.0.0"})
+        self.assertEqual(validate.validate(), [])
+
+    def test_non_object_catalogue_entry_is_reported(self):
+        self.portable()
+        self.catalogue(".cursor-plugin/marketplace.json", "demo")
+        self.assertTrue(any("entry is not a JSON object" in e for e in validate.validate()))
+
+    def test_non_object_catalogue_is_reported(self):
+        path = self.root / ".agents/plugins/marketplace.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("[]", encoding="utf-8")
+        self.assertTrue(any("top level is not a JSON object" in e for e in validate.validate()))
+
+    def test_null_catalogue_is_reported(self):
+        path = self.root / ".cursor-plugin/marketplace.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("null", encoding="utf-8")
+        self.assertTrue(any("top level is not a JSON object" in e for e in validate.validate()))
+
+    def test_null_marketplace_is_reported(self):
+        (self.root / ".claude-plugin/marketplace.json").write_text("null", encoding="utf-8")
+        self.assertTrue(any("top level is not a JSON object" in e for e in validate.validate()))
+
+    def test_null_plugin_manifest_is_reported(self):
+        (self.plugin_dir / ".claude-plugin/plugin.json").write_text("null", encoding="utf-8")
+        self.assertTrue(any("top level is not a JSON object" in e for e in validate.validate()))
+
+    def test_catalogue_plugins_not_a_list_is_reported(self):
+        self.catalogue(".cursor-plugin/marketplace.json", {})
+        path = self.root / ".cursor-plugin/marketplace.json"
+        path.write_text('{"plugins": {}}', encoding="utf-8")
+        self.assertTrue(any("plugins is not a list" in e for e in validate.validate()))
+
+    def test_unparsable_catalogue_reports_only_the_parse_error(self):
+        path = self.root / ".agents/plugins/marketplace.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{", encoding="utf-8")
+        errors = validate.validate()
+        self.assertTrue(any("cannot be read as JSON" in e for e in errors))
+        self.assertEqual(len([e for e in errors if "marketplace.json" in e and ".agents" in e]), 1)
+
+    def test_portable_version_drift_is_reported(self):
+        self.portable(version="2.0.0")
+        self.assertTrue(any("plugin.json: version" in e for e in validate.validate()))
+
+    def test_portable_description_drift_is_reported(self):
+        self.portable(description="Other.")
+        self.assertTrue(any("description differs" in e for e in validate.validate()))
+
+    def test_portable_name_mismatch_is_reported(self):
+        self.portable(name="other")
+        self.assertTrue(any("expected 'demo'" in e for e in validate.validate()))
+
+    def test_cursor_version_drift_is_reported(self):
+        self.portable()
+        self.catalogue(".cursor-plugin/marketplace.json", {"name": "demo", "source": "./plugins/demo", "version": "0.9.0"})
+        self.assertTrue(any(".cursor-plugin" in e and "version" in e for e in validate.validate()))
+
+    def test_codex_missing_directory_is_reported(self):
+        self.portable()
+        self.catalogue(".agents/plugins/marketplace.json", self.codex_entry(path="./plugins/nowhere"))
+        self.assertTrue(any("not an existing" in e for e in validate.validate()))
+
+    def test_codex_entry_without_portable_manifest_is_reported(self):
+        self.catalogue(".agents/plugins/marketplace.json", self.codex_entry())
+        self.assertTrue(any("plugin.json is missing" in e for e in validate.validate()))
+
+    def test_unknown_plugin_name_is_reported(self):
+        self.portable()
+        self.catalogue(".agents/plugins/marketplace.json", self.codex_entry(name="ghost"))
+        self.assertTrue(any("'ghost'" in e for e in validate.validate()))
+
+
 class TestMalformedInputIsReported(ValidatorFixture, unittest.TestCase):
     """A CI gate must name the file to fix.
 

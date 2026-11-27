@@ -1,0 +1,20 @@
+{
+  "name": "paysera-checkout",
+  "version": "1.0.0",
+  "description": "Build a Paysera Checkout integration: Checkout Modern payments with the PHP SDK or REST, verified webhooks, safe refunds with Idempotency-Key, payment links and Test Mode. Writes the merchant's code; holds no credentials and calls no API itself.",
+  "author": {
+    "name": "Paysera",
+    "url": "https://www.paysera.com"
+  },
+  "homepage": "https://github.com/paysera/skills",
+  "repository": "https://github.com/paysera/skills",
+  "license": "MIT",
+  "keywords": [
+    "payments",
+    "checkout",
+    "webhooks",
+    "refunds",
+    "php",
+    "paysera"
+  ]
+}

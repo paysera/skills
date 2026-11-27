@@ -19,7 +19,9 @@ Only client-facing skills. A skill qualifies when all of the following hold:
 - It contains **no credentials, tokens, real account numbers, real IBANs, or personal data**
   — examples must use obvious placeholders (`EVP0000000000001`, `LT000000000000000000`).
 - Any operation that moves money is **gated**: dry-run by default, explicit `--confirm`, and
-  no `transfers:sign` scope.
+  no `transfers:sign` scope. A skill that only teaches an agent to write code, and ships no
+  script that calls an API, meets this by telling the agent not to call money-moving
+  endpoints itself and to test only against a test project (see `paysera-checkout`).
 
 ### What the automated check does and does not cover
 
@@ -94,10 +96,14 @@ skills are added here deliberately, one at a time.
      `description`)
    - `commands/<name>.md` — optional slash command
    - `CHANGELOG.md`
+   - `plugin.json` at the plugin root — optional Agent Plugins manifest, read by Codex and
+     Cursor
 2. Register it in `.claude-plugin/marketplace.json` under `plugins`, with a `version`
-   matching `plugin.json`.
-3. Bump the version in **both** `plugin.json` and `marketplace.json`, and add a
-   `CHANGELOG.md` entry.
+   matching `plugin.json`. A plugin with a root `plugin.json` may also be listed in
+   `.agents/plugins/marketplace.json` (Codex) and `.cursor-plugin/marketplace.json` (Cursor),
+   pointing at the same directory.
+3. Bump the version in **every** manifest and catalogue entry that carries one, and add a
+   `CHANGELOG.md` entry. `validate.py` fails when a version or description differs.
 4. Run the checks below, open a pull request, and get a review from a code owner. The
    review must explicitly confirm the "What may be published here" checklist.
 
@@ -107,6 +113,7 @@ The same commands CI runs on every pull request:
 
 ```bash
 python3 scripts/validate.py             # manifests, frontmatter, published-content scan
+python3 scripts/checkout_names.py check # every Checkout API name in paysera-checkout exists
 python3 -m pytest plugins scripts -q -p no:randomly   # skill tests AND the gate's own
 ```
 
@@ -165,6 +172,35 @@ what each captures for restoring, and what each full-cycle test asserts.
 
 The tests inside a plugin never read a file outside it: `claude plugin install` copies the
 plugin directory alone, so anything a shipped test reaches for must be shipped with it.
+
+### Checkout name check
+
+`paysera-checkout` teaches API names, and a wrong name fails silently in a merchant's code.
+`scripts/checkout_names.py` checks them against `scripts/checkout-names.json`, a snapshot of
+the public Checkout OpenAPI, the Checkout guides on developers.paysera.com and the PHP SDK
+version the skill targets.
+
+- `check` (CI, offline) reads every code span and code block in the skill: REST paths, webhook
+  events, `X-Paysera-*` headers, JSON keys, SDK classes, methods and constants, and the SDK
+  version stated in `SKILL.md`. Write every API name in backticks or a code block, or the check
+  cannot see it. A `json` block needs a line above it naming what it shows:
+  `<!-- names: request POST /path -->`, `<!-- names: response GET /path -->` or
+  `<!-- names: webhook type:name -->`. A few names that do not exist are listed in the snapshot
+  (`known_wrong`); prose may name one only in a sentence that says it does not exist.
+- `refresh` rebuilds the snapshot. It needs the OpenAPI (the public URL by default), the SDK
+  source as Packagist ships it (`--sdk`, `--sdk-version`, `--dist-reference`) and the Checkout
+  guide markdown (`--guides`), and PyYAML.
+- `drift` (weekly workflow `checkout-drift`) compares the snapshot with the public OpenAPI,
+  Packagist and the public guide pages, and opens or updates the issue "Checkout skill drift".
+  GitHub pauses scheduled workflows after 60 days without repository activity; re-enable it in
+  the Actions tab when that happens.
+
+To move the skill to a newer SDK: refresh the snapshot against that version, update the
+version in `SKILL.md`, adapt the content until `check` passes, and bump the plugin version.
+
+`scripts/test_checkout_snippets.py` runs the webhook verification snippets marked
+`<!-- snippet: … -->` in `references/callbacks.md`: Python always, Node.js and PHP when they
+are installed.
 
 ### What is not scanned
 
