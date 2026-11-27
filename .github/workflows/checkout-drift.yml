@@ -17,10 +17,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      - run: pip install pyyaml==6.0.2
       - name: Compare the name snapshot with the public OpenAPI, Packagist and guides
         id: drift
         run: |
-          pip install pyyaml==6.0.2
           python3 scripts/checkout_names.py drift 2> drift.txt || { cat drift.txt; exit 1; }
       - name: Open or update the drift issue
         if: failure() && steps.drift.outcome == 'failure'
@@ -29,7 +29,7 @@ jobs:
         run: |
           title="Checkout skill drift"
           body="$(printf 'The weekly name check found differences between scripts/checkout-names.json and the public sources.\n\n%s\n\nRun: %s' "$(cat drift.txt)" "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}")"
-          number="$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number')"
+          number="$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number // empty')"
           if [ -n "$number" ]; then
             gh issue comment "$number" --body "$body"
           else

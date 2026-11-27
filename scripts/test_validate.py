@@ -416,6 +416,17 @@ class TestOtherRuntimeManifests(ValidatorFixture, unittest.TestCase):
         self.catalogue(".cursor-plugin/marketplace.json", {"name": "demo", "source": "./plugins/demo", "version": "1.0.0"})
         self.assertEqual(validate.validate(), [])
 
+    def test_non_object_catalogue_entry_is_reported(self):
+        self.portable()
+        self.catalogue(".cursor-plugin/marketplace.json", "demo")
+        self.assertTrue(any("entry is not a JSON object" in e for e in validate.validate()))
+
+    def test_non_object_catalogue_is_reported(self):
+        path = self.root / ".agents/plugins/marketplace.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("[]", encoding="utf-8")
+        self.assertTrue(any("expected an object with a plugins list" in e for e in validate.validate()))
+
     def test_portable_version_drift_is_reported(self):
         self.portable(version="2.0.0")
         self.assertTrue(any("plugin.json: version" in e for e in validate.validate()))

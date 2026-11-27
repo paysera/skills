@@ -279,10 +279,14 @@ def validate_other_runtimes(claude_manifests):
         if not path.is_file():
             continue
         data = load_json(path, errors)
-        if data is None:
+        if not isinstance(data, dict) or not isinstance(data.get("plugins", []), list):
+            errors.append(f"{catalogue}: expected an object with a plugins list")
             continue
         for index, entry in enumerate(data.get("plugins", [])):
             label = f"{catalogue} plugins[{index}]"
+            if not isinstance(entry, dict):
+                errors.append(f"{label}: entry is not a JSON object")
+                continue
             name, source = entry.get("name"), catalogue_source(entry)
             if name not in claude_manifests:
                 errors.append(f"{label}: {name!r} is not in .claude-plugin/marketplace.json")

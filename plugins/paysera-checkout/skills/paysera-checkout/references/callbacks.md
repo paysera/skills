@@ -134,7 +134,8 @@ def verify_paysera_signature(raw_body: bytes, signature_header: str) -> bool:
     if not secret:
         raise RuntimeError("PAYSERA_CLIENT_SECRET is not set")
     expected = hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, (signature_header or "").strip().lower())
+    received = (signature_header or "").strip().lower().encode("utf-8")
+    return hmac.compare_digest(expected.encode("ascii"), received)
 ```
 
 ## When an order is paid
@@ -288,6 +289,7 @@ function handlePayseraWebhook(ServerRequestInterface $request, ResponseInterface
     }
     $sdk = (new SdkFacadeBuilder())->setPaymentApiCredentialsRepository($credentials)->build();
 
+    $rawBody = (string) $request->getBody();
     try {
         $callback = $sdk->getCallbacksFacade()->processCallback($request);
     } catch (CallbackVerificationIntegrationException $exception) {
@@ -304,7 +306,7 @@ function handlePayseraWebhook(ServerRequestInterface $request, ResponseInterface
             fulfil($info->getMerchantOrderId());
         }
     } elseif ($event === 'payment:status_updated' || $event === 'refund:status_updated') {
-        $payload = json_decode((string) $request->getBody(), true);
+        $payload = json_decode($rawBody, true);
         recordStatus($event, $payload);
     }
 

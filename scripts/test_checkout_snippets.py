@@ -33,6 +33,7 @@ CASES = [
     ("tampered body", BODY.replace(b"paid", b"pending"), sign(BODY), False),
     ("wrong length", BODY, sign(BODY)[:-2], False),
     ("empty header", BODY, "", False),
+    ("non-ASCII header", BODY, "\u00e9" * 64, False),
 ]
 
 
